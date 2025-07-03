@@ -100,4 +100,25 @@ void DecodeCMD(struct UNERBUSHandle *aBus, uint8_t iStartData) {
 
 ## 8. Referencias
 - Ver archivos `UNERBUS.h` y `UNERBUS.c` para detalles de implementación.
-- Ver integración con ESP01 en `ESP01.h` y `ESP01.c` para la capa WiFi. 
+- Ver integración con ESP01 en `ESP01.h` y `ESP01.c` para la capa WiFi.
+
+# Configuración recomendada en .ioc para MPU6050 (I2C + DMA)
+
+1. **Habilitar I2C2** (o el I2C que vayas a usar):
+   - Modo: I2C
+   - Velocidad sugerida: 400 kHz (Fast Mode)
+   - Pines: Configura SCL y SDA como Alternate Function Open Drain
+
+2. **Habilitar DMA para I2C RX**:
+   - Asigna un canal DMA a I2C2_RX (por ejemplo, DMA1 Channel 5 para STM32F1xx)
+   - Modo: Normal
+   - Prioridad: Alta o Media
+
+3. **No es necesario habilitar interrupciones de I2C para DMA**
+
+4. **Conexión física**:
+   - Asegúrate de tener resistencias pull-up externas (2.2kΩ–4.7kΩ) en SCL y SDA
+
+5. **Guardar y regenerar código** antes de compilar
+
+Con esto, el driver MPU6050 funcionará correctamente con lecturas no bloqueantes por DMA. 

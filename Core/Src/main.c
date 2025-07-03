@@ -25,6 +25,7 @@
 #include "usbd_cdc_if.h"
 #include "ESP01.h"
 #include "UNERBUS.h"
+#include "MPU6050.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -86,6 +87,7 @@ ADC_HandleTypeDef hadc1;
 DMA_HandleTypeDef hdma_adc1;
 
 I2C_HandleTypeDef hi2c2;
+DMA_HandleTypeDef hdma_i2c2_rx;
 
 TIM_HandleTypeDef htim1;
 TIM_HandleTypeDef htim4;
@@ -111,6 +113,10 @@ uint8_t rxUSBData, newData;
 
 uint16_t bufADC[SIZEBUFADC][8];
 uint8_t iwBufADC, irBufADC;
+
+// ===== MPU6050 =====
+MPU6050_Handle_t hmpu;
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -162,7 +168,12 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart){
 		HAL_UART_Receive_IT(&huart1, &dataRXESP01, 1);
 	}
 }
-//.
+
+void HAL_I2C_MemRxCpltCallback(I2C_HandleTypeDef *hi2c) {
+    if (hi2c == hmpu.hi2c) {
+        MPU6050_DMA_Complete_Callback(&hmpu);
+    }
+}
 
 void ESP01DoCHPD(uint8_t value){
 	HAL_GPIO_WritePin(CH_EN_GPIO_Port, CH_EN_Pin, value);
@@ -212,6 +223,25 @@ void DecodeCMD(struct UNERBUSHandle *aBus, uint8_t iStartData){
 		UNERBUS_WriteByte(aBus, 0x0D);
 		length = 2;
 		break;
+	case 0xA2: // SOLICITUD DE DATOS MPU6050
+	{
+		uint8_t buf[12];
+		buf[0] = hmpu.data.accel_x & 0xFF;
+		buf[1] = (hmpu.data.accel_x >> 8) & 0xFF;
+		buf[2] = hmpu.data.accel_y & 0xFF;
+		buf[3] = (hmpu.data.accel_y >> 8) & 0xFF;
+		buf[4] = hmpu.data.accel_z & 0xFF;
+		buf[5] = (hmpu.data.accel_z >> 8) & 0xFF;
+		buf[6] = hmpu.data.gyro_x & 0xFF;
+		buf[7] = (hmpu.data.gyro_x >> 8) & 0xFF;
+		buf[8] = hmpu.data.gyro_y & 0xFF;
+		buf[9] = (hmpu.data.gyro_y >> 8) & 0xFF;
+		buf[10] = hmpu.data.gyro_z & 0xFF;
+		buf[11] = (hmpu.data.gyro_z >> 8) & 0xFF;
+		UNERBUS_Write(aBus, buf, 12);
+		length = 13;
+		break;
+	}
 	}
 
 	if(length){
@@ -228,6 +258,9 @@ void Do10ms(){
 	ESP01_Timeout10ms();
 	UNERBUS_Timeout(&unerbusESP01);
 	UNERBUS_Timeout(&unerbusPC);
+  if (!hmpu.ready) {
+    MPU6050_Read_DMA(&hmpu);
+  }
 }
 
 void Do100ms(){
@@ -337,6 +370,14 @@ int main(void)
 
   HAL_UART_Receive_IT(&huart1, &dataRXESP01, 1);
 
+  // ===== MPU6050 =====
+  HAL_Delay(3000);
+
+
+  MPU6050_Init(&hmpu, &hi2c2);
+
+
+  HAL_Delay(3000);
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -745,6 +786,9 @@ static void MX_DMA_Init(void)
   /* DMA1_Channel1_IRQn interrupt configuration */
   HAL_NVIC_SetPriority(DMA1_Channel1_IRQn, 0, 0);
   HAL_NVIC_EnableIRQ(DMA1_Channel1_IRQn);
+  /* DMA1_Channel5_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA1_Channel5_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA1_Channel5_IRQn);
 
 }
 
