@@ -1,41 +1,75 @@
 #include "MPU6050.h"
 
-/**
- * @brief Inicializa el MPU6050: saca del sleep y configura rangos por defecto.
- */
-HAL_StatusTypeDef MPU6050_Init(MPU6050_Handle_t *hmpu, I2C_HandleTypeDef *hi2c) {
-    hmpu->hi2c = hi2c;
-    hmpu->ready = 0;
+#define MPU6050_I2C_ADDR         (0x68 << 1)
+#define MPU6050_REG_PWR_MGMT_1   0x6B
+#define MPU6050_REG_ACCEL_XOUT_H 0x3B
+#define MPU6050_REG_SMPLRT_DIV   0x19
+#define MPU6050_REG_CONFIG       0x1A
+#define MPU6050_REG_GYRO_CONFIG  0x1B
+#define MPU6050_REG_ACCEL_CONFIG 0x1C
+
+// --- Inicialización avanzada para micromouse ---
+int MPU6050_Init(MPU6050_t *dev) {
+    if (!dev || !dev->iface.i2c_write) return -1;
+    uint8_t data;
+    int res = 0;
+
     // Wake up (PWR_MGMT_1 = 0)
-    uint8_t data = 0;
-    if (HAL_I2C_Mem_Write(hi2c, MPU6050_I2C_ADDR, MPU6050_REG_PWR_MGMT_1, 1, &data, 1, 100) != HAL_OK)
-        return HAL_ERROR;
-    // Configuración de sample rate, filtros y rangos (opcional, default)
-    // Aquí puedes agregar configuraciones avanzadas si lo deseas
-    return HAL_OK;
+    data = 0x00;
+    res |= dev->iface.i2c_write(MPU6050_I2C_ADDR, MPU6050_REG_PWR_MGMT_1, &data, 1, dev->iface.user_ctx);
+
+    // Sample Rate Divider (SMPLRT_DIV = 9) -> 100Hz
+    data = 0x09;
+    res |= dev->iface.i2c_write(MPU6050_I2C_ADDR, MPU6050_REG_SMPLRT_DIV, &data, 1, dev->iface.user_ctx);
+
+    // DLPF Config (CONFIG = 0x04) -> 20Hz
+    data = 0x04;
+    res |= dev->iface.i2c_write(MPU6050_I2C_ADDR, MPU6050_REG_CONFIG, &data, 1, dev->iface.user_ctx);
+
+    // Gyro config (GYRO_CONFIG = 0x08) -> ±500 °/s
+    data = 0x08;
+    res |= dev->iface.i2c_write(MPU6050_I2C_ADDR, MPU6050_REG_GYRO_CONFIG, &data, 1, dev->iface.user_ctx);
+
+    // Accel config (ACCEL_CONFIG = 0x08) -> ±4g
+    data = 0x08;
+    res |= dev->iface.i2c_write(MPU6050_I2C_ADDR, MPU6050_REG_ACCEL_CONFIG, &data, 1, dev->iface.user_ctx);
+
+    dev->ready = 1;
+    return res;
 }
 
-/**
- * @brief Inicia la lectura de 14 bytes (acelerómetro + temp + giroscopio) por DMA.
- * El callback debe ser llamado en HAL_I2C_MemRxCpltCallback.
- */
-HAL_StatusTypeDef MPU6050_Read_DMA(MPU6050_Handle_t *hmpu) {
-    hmpu->ready = 0;
-    return HAL_I2C_Mem_Read_DMA(hmpu->hi2c, MPU6050_I2C_ADDR, MPU6050_REG_ACCEL_XOUT_H, 1, hmpu->raw, 14);
+// Procesamiento centralizado de datos RAW
+static void MPU6050_ProcessRaw(MPU6050_t *dev) {
+    dev->accel_x = (int16_t)(dev->raw[0] << 8 | dev->raw[1]);
+    dev->accel_y = (int16_t)(dev->raw[2] << 8 | dev->raw[3]);
+    dev->accel_z = (int16_t)(dev->raw[4] << 8 | dev->raw[5]);
+    dev->gyro_x  = (int16_t)(dev->raw[8] << 8 | dev->raw[9]);
+    dev->gyro_y  = (int16_t)(dev->raw[10] << 8 | dev->raw[11]);
+    dev->gyro_z  = (int16_t)(dev->raw[12] << 8 | dev->raw[13]);
 }
 
-/**
- * @brief Procesa los datos RAW y los almacena en la estructura de datos.
- * Llamar en HAL_I2C_MemRxCpltCallback.
- */
-void MPU6050_DMA_Complete_Callback(MPU6050_Handle_t *hmpu) {
-    // Acelerómetro
-    hmpu->data.accel_x = (int16_t)(hmpu->raw[0] << 8 | hmpu->raw[1]);
-    hmpu->data.accel_y = (int16_t)(hmpu->raw[2] << 8 | hmpu->raw[3]);
-    hmpu->data.accel_z = (int16_t)(hmpu->raw[4] << 8 | hmpu->raw[5]);
-    // Giroscopio
-    hmpu->data.gyro_x = (int16_t)(hmpu->raw[8] << 8 | hmpu->raw[9]);
-    hmpu->data.gyro_y = (int16_t)(hmpu->raw[10] << 8 | hmpu->raw[11]);
-    hmpu->data.gyro_z = (int16_t)(hmpu->raw[12] << 8 | hmpu->raw[13]);
-    hmpu->ready = 1;
+// --- Lectura síncrona (bloqueante) ---
+int MPU6050_ReadAll(MPU6050_t *dev) {
+    if (!dev || !dev->iface.i2c_read) return -1;
+    if (dev->iface.i2c_read(MPU6050_I2C_ADDR, MPU6050_REG_ACCEL_XOUT_H, dev->raw, 14, dev->iface.user_ctx) != 0)
+        return -1;
+    MPU6050_ProcessRaw(dev);
+    dev->ready = 1;
+    return 0;
+}
+
+// --- Lectura asíncrona (DMA/interrupción) ---
+int MPU6050_ReadAll_Async(MPU6050_t *dev, void (*cb)(MPU6050_t *dev)) {
+    if (!dev || !dev->iface.i2c_read_async) return -1;
+    dev->ready = 0;
+    dev->user_cb = cb;
+    return dev->iface.i2c_read_async(MPU6050_I2C_ADDR, MPU6050_REG_ACCEL_XOUT_H, dev->raw, 14, dev->iface.user_ctx, (void (*)(void *))MPU6050_OnDataReady, dev);
+}
+
+// --- Procesa los datos RAW y notifica al usuario ---
+void MPU6050_OnDataReady(MPU6050_t *dev) {
+    if (!dev) return;
+    MPU6050_ProcessRaw(dev);
+    dev->ready = 1;
+    if (dev->user_cb) dev->user_cb(dev);
 } 

@@ -22,10 +22,15 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include <stdio.h> // Para sprintf
 #include "usbd_cdc_if.h"
 #include "ESP01.h"
 #include "UNERBUS.h"
 #include "MPU6050.h"
+#include "ssd1306.h"
+#include "ssd1306_font_small.h"
+#include "ssd1306_font_title.h"
+
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -52,6 +57,16 @@ typedef union{
 	uint32_t	u32;
 	int32_t		i32;
 } _uWork;
+
+/**
+ * @brief Contexto asíncrono genérico para operaciones I2C no bloqueantes.
+ *        Permite manejar múltiples dispositivos en el mismo bus.
+ */
+typedef struct {
+  void *i2c_handle; // Handler específico de la plataforma (ej: HAL_I2C_HandleTypeDef*)
+  void (*cb)(void *cb_ctx); // Callback a llamar al finalizar la transferencia
+  void *cb_ctx; // Contexto del callback (ej: puntero al driver o datos)
+} I2C_Async_Context_t;
 
 /* USER CODE END PTD */
 
@@ -88,6 +103,7 @@ DMA_HandleTypeDef hdma_adc1;
 
 I2C_HandleTypeDef hi2c2;
 DMA_HandleTypeDef hdma_i2c2_rx;
+DMA_HandleTypeDef hdma_i2c2_tx;
 
 TIM_HandleTypeDef htim1;
 TIM_HandleTypeDef htim4;
@@ -107,7 +123,7 @@ uint8_t bufRXPC[SIZEBUFRXPC], bufTXPC[SIZEBUFTXPC];
 uint8_t bufRXESP01[SIZEBUFRXESP01], bufTXESP01[SIZEBUFTXESP01], dataRXESP01;
 
 uint32_t heartbeat, heartbeatmask;
-uint8_t time10ms, time100ms, timeOutAliveUDP;
+uint8_t time10ms, time100ms, timeOutAliveUDP, timeOutGetMpuData;
 
 uint8_t rxUSBData, newData;
 
@@ -115,7 +131,21 @@ uint16_t bufADC[SIZEBUFADC][8];
 uint8_t iwBufADC, irBufADC;
 
 // ===== MPU6050 =====
-MPU6050_Handle_t hmpu;
+MPU6050_t mpu;
+volatile uint8_t mpu_data_ready = 0;
+
+// ===== SSD1306 =====
+SSD1306_t ssd;
+
+// ===== I2C =====
+// --- Contextos independientes para cada dispositivo ---
+I2C_Async_Context_t mpu_ctx = {0};
+I2C_Async_Context_t ssd_ctx = {0};
+
+// --- Uso en el loop principal ---
+// Para iniciar una lectura asíncrona de MPU6050:
+// MPU6050_ReadAll_Async(&mpu, mpu_user_callback);
+// Para SSD1306, usa la función correspondiente de tu driver.
 
 /* USER CODE END PV */
 
@@ -144,6 +174,33 @@ void USBReceive(uint8_t *buf, uint16_t len);
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 //CALLBACKS
+
+// --- Funciones de bajo nivel I2C genéricas para drivers portables ---
+int i2cdev_write(uint8_t dev_addr, uint8_t reg, const uint8_t *data, uint16_t len, void *user_ctx) {
+  I2C_HandleTypeDef *hi2c = (I2C_HandleTypeDef *)((I2C_Async_Context_t *)user_ctx)->i2c_handle;
+  return (HAL_I2C_Mem_Write(hi2c, dev_addr, reg, 1, (uint8_t *)data, len, 100) == HAL_OK) ? 0 : -1;
+}
+int i2cdev_read(uint8_t dev_addr, uint8_t reg, uint8_t *data, uint16_t len, void *user_ctx) {
+  I2C_HandleTypeDef *hi2c = (I2C_HandleTypeDef *)((I2C_Async_Context_t *)user_ctx)->i2c_handle;
+  return (HAL_I2C_Mem_Read(hi2c, dev_addr, reg, 1, data, len, 100) == HAL_OK) ? 0 : -1;
+}
+int i2cdev_read_async(uint8_t dev_addr, uint8_t reg, uint8_t *data, uint16_t len, void *user_ctx, void (*cb)(void *cb_ctx), void *cb_ctx)
+{
+    I2C_Async_Context_t *ctx = (I2C_Async_Context_t *)user_ctx;
+    ctx->cb = cb;
+    ctx->cb_ctx = cb_ctx; // El driver pasa dev aquí automáticamente
+    I2C_HandleTypeDef *hi2c = (I2C_HandleTypeDef *)ctx->i2c_handle;
+    return (HAL_I2C_Mem_Read_DMA(hi2c, dev_addr, reg, 1, data, len) == HAL_OK) ? 0 : -1;
+}
+int i2cdev_write_async(uint8_t dev_addr, uint8_t reg, const uint8_t *data, uint16_t len, void *user_ctx, void (*cb)(void *cb_ctx), void *cb_ctx)
+{
+    I2C_Async_Context_t *ctx = (I2C_Async_Context_t *)user_ctx;
+    ctx->cb = cb;
+    ctx->cb_ctx = cb_ctx;
+    I2C_HandleTypeDef *hi2c = (I2C_HandleTypeDef *)ctx->i2c_handle;
+    return (HAL_I2C_Mem_Write_DMA(hi2c, dev_addr, reg, 1, (uint8_t *)data, len) == HAL_OK) ? 0 : -1;
+}
+
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim){
 	if(htim->Instance == TIM1){
 		time10ms--;
@@ -156,6 +213,29 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim){
 	}
 }
 
+void HAL_I2C_MemRxCpltCallback(I2C_HandleTypeDef *hi2c) {
+    if (mpu_ctx.i2c_handle == hi2c && mpu_ctx.cb) {
+        mpu_ctx.cb(mpu_ctx.cb_ctx); // cb_ctx es el puntero a mpu
+    }
+}
+
+void HAL_I2C_MemTxCpltCallback(I2C_HandleTypeDef *hi2c) {
+    if (ssd_ctx.i2c_handle == hi2c && ssd_ctx.cb) {
+        ssd_ctx.cb(ssd_ctx.cb_ctx); // cb_ctx es el puntero a ssd
+    }
+}
+
+// Callback de usuario para la lectura asíncrona del MPU6050
+void mpu_user_callback(MPU6050_t *dev) {
+  mpu_data_ready = 1;
+  // Ejemplo: procesar los datos leídos
+  // Los valores ya están en dev->accel_x, dev->gyro_x, etc.
+  // Puedes copiar los datos a variables globales, activar flags, etc.
+  // Por ejemplo:
+  // mpu_data_ready = 1;
+  // memcpy(&last_mpu_data, dev, sizeof(MPU6050_t));
+  // O simplemente dejarlo vacío si solo usas dev->ready
+}
 
 void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc){
 	iwBufADC++;
@@ -169,10 +249,25 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart){
 	}
 }
 
-void HAL_I2C_MemRxCpltCallback(I2C_HandleTypeDef *hi2c) {
-    if (hi2c == hmpu.hi2c) {
-        MPU6050_DMA_Complete_Callback(&hmpu);
-    }
+void setup_i2c_devices() {
+  extern I2C_HandleTypeDef hi2c2; // Handler generado por CubeMX
+  
+  mpu_ctx.i2c_handle = &hi2c2;
+  ssd_ctx.i2c_handle = &hi2c2;
+
+  // --- MPU6050 ---
+  mpu.iface.i2c_write = i2cdev_write;
+  mpu.iface.i2c_read = i2cdev_read;
+  mpu.iface.i2c_read_async = i2cdev_read_async;
+  mpu.iface.user_ctx = &mpu_ctx;
+  MPU6050_Init(&mpu);
+
+  // --- SSD1306 --- (usa el mismo bus y funciones de bajo nivel)
+  ssd.iface.i2c_write = i2cdev_write;
+  ssd.iface.i2c_read = i2cdev_read;
+  ssd.iface.i2c_write_async = i2cdev_write_async;
+  ssd.iface.user_ctx = &ssd_ctx;
+  SSD1306_Init(&ssd);
 }
 
 void ESP01DoCHPD(uint8_t value){
@@ -208,7 +303,6 @@ void ESP01ChangeState(_eESP01STATUS esp01State){
 	}
 }
 
-
 void DecodeCMD(struct UNERBUSHandle *aBus, uint8_t iStartData){
 	uint8_t id;
 	uint8_t length = 0;
@@ -225,21 +319,22 @@ void DecodeCMD(struct UNERBUSHandle *aBus, uint8_t iStartData){
 		break;
 	case 0xA2: // SOLICITUD DE DATOS MPU6050
 	{
-		uint8_t buf[12];
-		buf[0] = hmpu.data.accel_x & 0xFF;
-		buf[1] = (hmpu.data.accel_x >> 8) & 0xFF;
-		buf[2] = hmpu.data.accel_y & 0xFF;
-		buf[3] = (hmpu.data.accel_y >> 8) & 0xFF;
-		buf[4] = hmpu.data.accel_z & 0xFF;
-		buf[5] = (hmpu.data.accel_z >> 8) & 0xFF;
-		buf[6] = hmpu.data.gyro_x & 0xFF;
-		buf[7] = (hmpu.data.gyro_x >> 8) & 0xFF;
-		buf[8] = hmpu.data.gyro_y & 0xFF;
-		buf[9] = (hmpu.data.gyro_y >> 8) & 0xFF;
-		buf[10] = hmpu.data.gyro_z & 0xFF;
-		buf[11] = (hmpu.data.gyro_z >> 8) & 0xFF;
-		UNERBUS_Write(aBus, buf, 12);
-		length = 13;
+    uint8_t buf[12];
+    buf[0] = mpu.accel_x & 0xFF;
+    buf[1] = (mpu.accel_x >> 8) & 0xFF;
+    buf[2] = mpu.accel_y & 0xFF;
+    buf[3] = (mpu.accel_y >> 8) & 0xFF;
+    buf[4] = mpu.accel_z & 0xFF;
+    buf[5] = (mpu.accel_z >> 8) & 0xFF;
+    buf[6] = mpu.gyro_x & 0xFF;
+    buf[7] = (mpu.gyro_x >> 8) & 0xFF;
+    buf[8] = mpu.gyro_y & 0xFF;
+    buf[9] = (mpu.gyro_y >> 8) & 0xFF;
+    buf[10] = mpu.gyro_z & 0xFF;
+    buf[11] = (mpu.gyro_z >> 8) & 0xFF;
+    UNERBUS_Write(aBus, buf, 12);
+    length = 13; // 1 (CMD) + 12 (payload)
+    break;
 		break;
 	}
 	}
@@ -255,28 +350,63 @@ void Do10ms(){
 	if(time100ms)
 		time100ms--;
 
+  if(timeOutGetMpuData)
+    timeOutGetMpuData--;
+
 	ESP01_Timeout10ms();
 	UNERBUS_Timeout(&unerbusESP01);
 	UNERBUS_Timeout(&unerbusPC);
-  if (!hmpu.ready) {
-    MPU6050_Read_DMA(&hmpu);
-  }
 }
 
 void Do100ms(){
-	time100ms = 10;
+  static uint8_t time_mpu_data = 1;
+  time100ms = 10;
 
-	if(heartbeatmask & heartbeat)
-		HAL_GPIO_WritePin(LED_GPIO_Port, LED_Pin, GPIO_PIN_RESET);
-	else
-		HAL_GPIO_WritePin(LED_GPIO_Port, LED_Pin, GPIO_PIN_SET);
+  if(heartbeatmask & heartbeat)
+    HAL_GPIO_WritePin(LED_GPIO_Port, LED_Pin, GPIO_PIN_RESET);
+  else
+    HAL_GPIO_WritePin(LED_GPIO_Port, LED_Pin, GPIO_PIN_SET);
 
-	heartbeatmask >>= 1;
-	if(!heartbeatmask)
-		heartbeatmask = 0x80000000;
+  heartbeatmask >>= 1;//
+  if(!heartbeatmask)
+    heartbeatmask = 0x80000000;
 
-	if(timeOutAliveUDP)
-		timeOutAliveUDP--;
+  if(timeOutAliveUDP)
+    timeOutAliveUDP--;
+
+  // Enviar datos del MPU6050 cada 300ms si hay datos nuevos
+  time_mpu_data--;
+  if (mpu_data_ready && !time_mpu_data) {
+    time_mpu_data = 1;
+    mpu_data_ready = 0; // Limpia el flag
+
+    char buf[64];
+    snprintf(buf, sizeof(buf),
+         "A:%d,%d,%d G:%d,%d,%d\r\n",
+         mpu.accel_x, mpu.accel_y, mpu.accel_z,
+         mpu.gyro_x, mpu.gyro_y, mpu.gyro_z);
+
+    // Por USB (PC)
+    UNERBUS_Write(&unerbusPC, (uint8_t*)buf, strlen(buf));
+    UNERBUS_Send(&unerbusPC, 0xA2, strlen(buf) + 1);
+
+    // O por WiFi (ESP01)
+    // UNERBUS_Write(&unerbusESP01, buf, 12);
+    // UNERBUS_Send(&unerbusESP01, 0xA2, 13);
+
+    // --- Mostrar en display SSD1306 ---
+    SSD1306_Clear(&ssd);
+    snprintf(buf, sizeof(buf), "AX:%d AY:%d", mpu.accel_x, mpu.accel_y);
+    SSD1306_DrawString(&ssd, 0, 0, buf, &SSD1306_Font_Small, 1);
+    snprintf(buf, sizeof(buf), "AZ:%d", mpu.accel_z);
+    SSD1306_DrawString(&ssd, 0, 10, buf, &SSD1306_Font_Small, 1);
+    snprintf(buf, sizeof(buf), "GX:%d", mpu.gyro_x);
+    SSD1306_DrawString(&ssd, 0, 20, buf, &SSD1306_Font_Small, 1);
+    snprintf(buf, sizeof(buf), "GY:%d", mpu.gyro_y);
+    SSD1306_DrawString(&ssd, 0, 30, buf, &SSD1306_Font_Small, 1);
+    snprintf(buf, sizeof(buf), "GZ:%d", mpu.gyro_z);
+    SSD1306_DrawString(&ssd, 0, 40, buf, &SSD1306_Font_Small, 1);
+  }
 }
 
 
@@ -300,6 +430,7 @@ int main(void)
 	time10ms = 40;
 	time100ms = 10;
 	timeOutAliveUDP = 50;
+  timeOutGetMpuData = 2;
 
 	iwBufADC = 0;
 	irBufADC = 0;
@@ -350,6 +481,7 @@ int main(void)
   MX_TIM4_Init();
   MX_USART1_UART_Init();
   /* USER CODE BEGIN 2 */
+
   CDC_AttachRxData(USBReceive);
 
   HAL_TIM_Base_Start_IT(&htim1);
@@ -370,12 +502,9 @@ int main(void)
 
   HAL_UART_Receive_IT(&huart1, &dataRXESP01, 1);
 
-  // ===== MPU6050 =====
   HAL_Delay(3000);
 
-
-  MPU6050_Init(&hmpu, &hi2c2);
-
+  setup_i2c_devices();
 
   HAL_Delay(3000);
   /* USER CODE END 2 */
@@ -388,12 +517,12 @@ int main(void)
 
     /* USER CODE BEGIN 3 */
 	  if(!timeOutAliveUDP){
-		  timeOutAliveUDP = 50;
+/* 		  timeOutAliveUDP = 50;
 		  UNERBUS_WriteByte(&unerbusESP01, 0x0D);
 		  UNERBUS_Send(&unerbusESP01, 0xF0, 2);
 
 		  UNERBUS_WriteConstString(&unerbusPC, "UNER\x03:\xF0\x0D\xC8", 0);
-		  UNERBUS_WriteConstString(&unerbusPC, " El ALIVE", 1);
+		  UNERBUS_WriteConstString(&unerbusPC, " El ALIVE", 1); */
 	  }
 
 
@@ -421,6 +550,18 @@ int main(void)
 			  unerbusPC.tx.iRead &= unerbusPC.tx.maxIndexRingBuf;
 		  }
 	  }
+
+    // --- Actualización eficiente del display SSD1306 solo si hubo cambios ---
+    if (ssd.dirty && ssd.ready && HAL_I2C_GetState(&hi2c2) == HAL_I2C_STATE_READY) {
+      SSD1306_UpdateScreen_Async(&ssd, NULL); // NULL = no callback
+      // El flag se limpia automáticamente en la función
+    }
+
+    if (mpu.ready && /*!mpu_data_ready &&*/ HAL_I2C_GetState(&hi2c2) == HAL_I2C_STATE_READY && !timeOutGetMpuData) { // En un futuro aumentar el tiempo de lectura para no forzar tanto el bus I2C
+      timeOutGetMpuData = 2;
+      // mpu.ready = 0; se hace dentro de ReadAll_Async
+      MPU6050_ReadAll_Async(&mpu, mpu_user_callback);
+    }
 
 	  ESP01_Task();
 
@@ -786,6 +927,9 @@ static void MX_DMA_Init(void)
   /* DMA1_Channel1_IRQn interrupt configuration */
   HAL_NVIC_SetPriority(DMA1_Channel1_IRQn, 0, 0);
   HAL_NVIC_EnableIRQ(DMA1_Channel1_IRQn);
+  /* DMA1_Channel4_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA1_Channel4_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA1_Channel4_IRQn);
   /* DMA1_Channel5_IRQn interrupt configuration */
   HAL_NVIC_SetPriority(DMA1_Channel5_IRQn, 0, 0);
   HAL_NVIC_EnableIRQ(DMA1_Channel5_IRQn);
