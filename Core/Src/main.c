@@ -133,6 +133,16 @@ uint8_t iwBufADC, irBufADC;
 // ===== MPU6050 =====
 MPU6050_t mpu;
 volatile uint8_t mpu_data_ready = 0;
+volatile uint8_t mpu_reconfig_request = 0; // Flag para solicitar reconfiguración segura
+
+static MPU6050_Config_t mpu_config = {
+    .accel_range = MPU6050_ACCEL_RANGE_4G,
+    .gyro_range = MPU6050_GYRO_RANGE_500_DPS,
+    .dlpf_bandwidth = MPU6050_DLPF_BW_20HZ,
+    .sample_rate_divider = 9,
+    .enable_calibration = 1,      // Habilitar calibración automática
+    .calibration_samples = 1000   // 1000 muestras para calibración
+};
 
 // ===== SSD1306 =====
 SSD1306_t ssd;
@@ -176,29 +186,46 @@ void USBReceive(uint8_t *buf, uint16_t len);
 //CALLBACKS
 
 // --- Funciones de bajo nivel I2C genéricas para drivers portables ---
-int i2cdev_write(uint8_t dev_addr, uint8_t reg, const uint8_t *data, uint16_t len, void *user_ctx) {
+int8_t i2cdev_write(uint8_t dev_addr, uint8_t reg, const uint8_t *data, uint16_t len, void *user_ctx) {
   I2C_HandleTypeDef *hi2c = (I2C_HandleTypeDef *)((I2C_Async_Context_t *)user_ctx)->i2c_handle;
-  return (HAL_I2C_Mem_Write(hi2c, dev_addr, reg, 1, (uint8_t *)data, len, 100) == HAL_OK) ? 0 : -1;
+  if (!hi2c || !data) return -1;
+  HAL_StatusTypeDef status = HAL_I2C_Mem_Write(hi2c, dev_addr, reg, 1, (uint8_t *)data, len, 1000);
+  return (status == HAL_OK) ? 0 : -1;
 }
-int i2cdev_read(uint8_t dev_addr, uint8_t reg, uint8_t *data, uint16_t len, void *user_ctx) {
+
+int8_t i2cdev_read(uint8_t dev_addr, uint8_t reg, uint8_t *data, uint16_t len, void *user_ctx) {
   I2C_HandleTypeDef *hi2c = (I2C_HandleTypeDef *)((I2C_Async_Context_t *)user_ctx)->i2c_handle;
-  return (HAL_I2C_Mem_Read(hi2c, dev_addr, reg, 1, data, len, 100) == HAL_OK) ? 0 : -1;
+  if (!hi2c || !data) return -1;
+  HAL_StatusTypeDef status = HAL_I2C_Mem_Read(hi2c, dev_addr, reg, 1, data, len, 1000);
+  return (status == HAL_OK) ? 0 : -1;
 }
-int i2cdev_read_async(uint8_t dev_addr, uint8_t reg, uint8_t *data, uint16_t len, void *user_ctx, void (*cb)(void *cb_ctx), void *cb_ctx)
+
+int8_t i2cdev_read_async(uint8_t dev_addr, uint8_t reg, uint8_t *data, uint16_t len, void *user_ctx, void (*cb)(void *cb_ctx), void *cb_ctx)
 {
     I2C_Async_Context_t *ctx = (I2C_Async_Context_t *)user_ctx;
+    if (!ctx || !data || !cb) return -1;
+    
     ctx->cb = cb;
     ctx->cb_ctx = cb_ctx; // El driver pasa dev aquí automáticamente
     I2C_HandleTypeDef *hi2c = (I2C_HandleTypeDef *)ctx->i2c_handle;
-    return (HAL_I2C_Mem_Read_DMA(hi2c, dev_addr, reg, 1, data, len) == HAL_OK) ? 0 : -1;
+    if (!hi2c) return -1;
+    
+    HAL_StatusTypeDef status = HAL_I2C_Mem_Read_DMA(hi2c, dev_addr, reg, 1, data, len);
+    return (status == HAL_OK) ? 0 : -1;
 }
-int i2cdev_write_async(uint8_t dev_addr, uint8_t reg, const uint8_t *data, uint16_t len, void *user_ctx, void (*cb)(void *cb_ctx), void *cb_ctx)
+
+int8_t i2cdev_write_async(uint8_t dev_addr, uint8_t reg, const uint8_t *data, uint16_t len, void *user_ctx, void (*cb)(void *cb_ctx), void *cb_ctx)
 {
     I2C_Async_Context_t *ctx = (I2C_Async_Context_t *)user_ctx;
+    if (!ctx || !data || !cb) return -1;
+    
     ctx->cb = cb;
     ctx->cb_ctx = cb_ctx;
     I2C_HandleTypeDef *hi2c = (I2C_HandleTypeDef *)ctx->i2c_handle;
-    return (HAL_I2C_Mem_Write_DMA(hi2c, dev_addr, reg, 1, (uint8_t *)data, len) == HAL_OK) ? 0 : -1;
+    if (!hi2c) return -1;
+    
+    HAL_StatusTypeDef status = HAL_I2C_Mem_Write_DMA(hi2c, dev_addr, reg, 1, (uint8_t *)data, len);
+    return (status == HAL_OK) ? 0 : -1;
 }
 
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim){
@@ -213,10 +240,11 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim){
 	}
 }
 
-void HAL_I2C_MemRxCpltCallback(I2C_HandleTypeDef *hi2c) {
-    if (mpu_ctx.i2c_handle == hi2c && mpu_ctx.cb) {
-        mpu_ctx.cb(mpu_ctx.cb_ctx); // cb_ctx es el puntero a mpu
-    }
+void HAL_I2C_MemRxCpltCallback(I2C_HandleTypeDef *hi2c)
+{
+  if (mpu_ctx.i2c_handle == hi2c && mpu_ctx.cb){
+      mpu_ctx.cb(mpu_ctx.cb_ctx);          // procesa datos
+  }
 }
 
 void HAL_I2C_MemTxCpltCallback(I2C_HandleTypeDef *hi2c) {
@@ -228,13 +256,6 @@ void HAL_I2C_MemTxCpltCallback(I2C_HandleTypeDef *hi2c) {
 // Callback de usuario para la lectura asíncrona del MPU6050
 void mpu_user_callback(MPU6050_t *dev) {
   mpu_data_ready = 1;
-  // Ejemplo: procesar los datos leídos
-  // Los valores ya están en dev->accel_x, dev->gyro_x, etc.
-  // Puedes copiar los datos a variables globales, activar flags, etc.
-  // Por ejemplo:
-  // mpu_data_ready = 1;
-  // memcpy(&last_mpu_data, dev, sizeof(MPU6050_t));
-  // O simplemente dejarlo vacío si solo usas dev->ready
 }
 
 void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc){
@@ -260,14 +281,37 @@ void setup_i2c_devices() {
   mpu.iface.i2c_read = i2cdev_read;
   mpu.iface.i2c_read_async = i2cdev_read_async;
   mpu.iface.user_ctx = &mpu_ctx;
-  MPU6050_Init(&mpu);
+  
+  int8_t mpu_result = MPU6050_Init(&mpu, &mpu_config);
+  if (mpu_result != 0) {
+    // Indicar error MPU6050 con parpadeo rápido del LED
+    for (int i = 0; i < 10; i++) {
+      HAL_GPIO_TogglePin(LED_GPIO_Port, LED_Pin);
+      HAL_Delay(100);
+    }
+    // Error_Handler(); // Comentar para continuar con SSD1306
+  }
 
   // --- SSD1306 --- (usa el mismo bus y funciones de bajo nivel)
   ssd.iface.i2c_write = i2cdev_write;
   ssd.iface.i2c_read = i2cdev_read;
   ssd.iface.i2c_write_async = i2cdev_write_async;
   ssd.iface.user_ctx = &ssd_ctx;
-  SSD1306_Init(&ssd);
+  
+  int8_t ssd_result = SSD1306_Init(&ssd);
+  if (ssd_result != 0) {
+    // Indicar error SSD1306 con parpadeo lento del LED
+    for (int i = 0; i < 5; i++) {
+      HAL_GPIO_TogglePin(LED_GPIO_Port, LED_Pin);
+      HAL_Delay(300);
+    }
+    // Error_Handler(); // Comentar para no bloquear el sistema
+  }
+  
+  // Si ambos fallan, llamar Error_Handler
+  if (mpu_result != 0 && ssd_result != 0) {
+    Error_Handler();
+  }
 }
 
 void ESP01DoCHPD(uint8_t value){
@@ -309,34 +353,128 @@ void DecodeCMD(struct UNERBUSHandle *aBus, uint8_t iStartData){
 
 	id = UNERBUS_GetUInt8(aBus);
 	switch(id){
-	case 0xE0://GET LOCAL IP
-		UNERBUS_Write(aBus, (uint8_t *)ESP01_GetLocalIP(), 16);
-		length = 17;
-		break;
-	case 0xF0://ALIVE
-		UNERBUS_WriteByte(aBus, 0x0D);
-		length = 2;
-		break;
-	case 0xA2: // SOLICITUD DE DATOS MPU6050
-	{
-    uint8_t buf[12];
-    buf[0] = mpu.accel_x & 0xFF;
-    buf[1] = (mpu.accel_x >> 8) & 0xFF;
-    buf[2] = mpu.accel_y & 0xFF;
-    buf[3] = (mpu.accel_y >> 8) & 0xFF;
-    buf[4] = mpu.accel_z & 0xFF;
-    buf[5] = (mpu.accel_z >> 8) & 0xFF;
-    buf[6] = mpu.gyro_x & 0xFF;
-    buf[7] = (mpu.gyro_x >> 8) & 0xFF;
-    buf[8] = mpu.gyro_y & 0xFF;
-    buf[9] = (mpu.gyro_y >> 8) & 0xFF;
-    buf[10] = mpu.gyro_z & 0xFF;
-    buf[11] = (mpu.gyro_z >> 8) & 0xFF;
-    UNERBUS_Write(aBus, buf, 12);
-    length = 13; // 1 (CMD) + 12 (payload)
-    break;
-		break;
-	}
+    case 0xE0://GET LOCAL IP
+      UNERBUS_Write(aBus, (uint8_t *)ESP01_GetLocalIP(), 16);
+      length = 17;
+      break;
+    case 0xF0://ALIVE
+      UNERBUS_WriteByte(aBus, 0x0D);
+      length = 2;
+      break;
+    case 0xA2: // SOLICITUD DE DATOS MPU6050
+    {
+      uint8_t buf[12];
+      buf[0] = mpu.accel_x & 0xFF;
+      buf[1] = (mpu.accel_x >> 8) & 0xFF;
+      buf[2] = mpu.accel_y & 0xFF;
+      buf[3] = (mpu.accel_y >> 8) & 0xFF;
+      buf[4] = mpu.accel_z & 0xFF;
+      buf[5] = (mpu.accel_z >> 8) & 0xFF;
+      buf[6] = mpu.gyro_x & 0xFF;
+      buf[7] = (mpu.gyro_x >> 8) & 0xFF;
+      buf[8] = mpu.gyro_y & 0xFF;
+      buf[9] = (mpu.gyro_y >> 8) & 0xFF;
+      buf[10] = mpu.gyro_z & 0xFF;
+      buf[11] = (mpu.gyro_z >> 8) & 0xFF;
+      UNERBUS_Write(aBus, buf, 12);
+      length = 13; // 1 (CMD) + 12 (payload)
+      break;
+    }
+    case 0xB0: // NUEVO COMANDO: RECONFIGURAR MPU6050
+    {
+      // Siempre intentar leer 4 bytes de configuración
+      uint8_t received_config[4];
+
+      // Leer la configuracion del buffer
+      received_config[0] = UNERBUS_GetUInt8(aBus);
+      received_config[1] = UNERBUS_GetUInt8(aBus);
+      received_config[2] = UNERBUS_GetUInt8(aBus);
+      received_config[3] = UNERBUS_GetUInt8(aBus);
+      
+      // Asignar la configuración leída
+      mpu_config.accel_range = received_config[0];
+      mpu_config.gyro_range = received_config[1];
+      mpu_config.dlpf_bandwidth = received_config[2];
+      mpu_config.sample_rate_divider = received_config[3];
+
+      // Solicitar reconfiguración
+      mpu_reconfig_request = 1;
+
+      // Enviar ACK
+      UNERBUS_WriteByte(aBus, 0x0D);
+      length = 2;
+      break;
+    }
+    case 0xB1: // CALIBRAR MPU6050 MANUALMENTE
+    {
+      // Leer número de muestras (2 bytes)
+      uint16_t samples = UNERBUS_GetUInt8(aBus) | (UNERBUS_GetUInt8(aBus) << 8);
+      if (samples == 0) samples = 1000; // Valor por defecto
+      
+      // Realizar calibración manual
+      int8_t result = MPU6050_Calibrate(&mpu, samples);
+      
+      // Enviar resultado
+      UNERBUS_WriteByte(aBus, result == 0 ? 0x0D : 0x0E); // 0x0D=OK, 0x0E=ERROR
+      length = 2;
+      break;
+    }
+    case 0xB2: // OBTENER DATOS DE CALIBRACIÓN
+    {
+      uint8_t cal_data[15];
+      cal_data[0] = mpu.calibration.accel_offset_x & 0xFF;
+      cal_data[1] = (mpu.calibration.accel_offset_x >> 8) & 0xFF;
+      cal_data[2] = mpu.calibration.accel_offset_y & 0xFF;
+      cal_data[3] = (mpu.calibration.accel_offset_y >> 8) & 0xFF;
+      cal_data[4] = mpu.calibration.accel_offset_z & 0xFF;
+      cal_data[5] = (mpu.calibration.accel_offset_z >> 8) & 0xFF;
+      cal_data[6] = mpu.calibration.gyro_offset_x & 0xFF;
+      cal_data[7] = (mpu.calibration.gyro_offset_x >> 8) & 0xFF;
+      cal_data[8] = mpu.calibration.gyro_offset_y & 0xFF;
+      cal_data[9] = (mpu.calibration.gyro_offset_y >> 8) & 0xFF;
+      cal_data[10] = mpu.calibration.gyro_offset_z & 0xFF;
+      cal_data[11] = (mpu.calibration.gyro_offset_z >> 8) & 0xFF;
+      cal_data[12] = mpu.calibration.is_calibrated;
+      cal_data[13] = 0; // Reservado
+      cal_data[14] = 0; // Reservado
+      
+      UNERBUS_Write(aBus, cal_data, 15);
+      length = 16; // 1 (CMD) + 15 (payload)
+      break;
+    }
+    case 0xB3: // OBTENER DATOS RAW (SIN CALIBRAR)
+    {
+      int16_t accel_raw[3], gyro_raw[3];
+      MPU6050_GetRawData(&mpu, accel_raw, gyro_raw);
+      
+      uint8_t raw_data[12];
+      raw_data[0] = accel_raw[0] & 0xFF;
+      raw_data[1] = (accel_raw[0] >> 8) & 0xFF;
+      raw_data[2] = accel_raw[1] & 0xFF;
+      raw_data[3] = (accel_raw[1] >> 8) & 0xFF;
+      raw_data[4] = accel_raw[2] & 0xFF;
+      raw_data[5] = (accel_raw[2] >> 8) & 0xFF;
+      raw_data[6] = gyro_raw[0] & 0xFF;
+      raw_data[7] = (gyro_raw[0] >> 8) & 0xFF;
+      raw_data[8] = gyro_raw[1] & 0xFF;
+      raw_data[9] = (gyro_raw[1] >> 8) & 0xFF;
+      raw_data[10] = gyro_raw[2] & 0xFF;
+      raw_data[11] = (gyro_raw[2] >> 8) & 0xFF;
+      
+      UNERBUS_Write(aBus, raw_data, 12);
+      length = 13; // 1 (CMD) + 12 (payload)
+      break;
+    }
+    case 0xB4: // HABILITAR/DESHABILITAR CALIBRACIÓN
+    {
+      uint8_t enable = UNERBUS_GetUInt8(aBus);
+      MPU6050_SetCalibrationEnabled(&mpu, enable);
+      
+      // Enviar ACK
+      UNERBUS_WriteByte(aBus, 0x0D);
+      length = 2;
+      break;
+    }
 	}
 
 	if(length){
@@ -381,14 +519,14 @@ void Do100ms(){
     mpu_data_ready = 0; // Limpia el flag
 
     char buf[64];
-    snprintf(buf, sizeof(buf),
+/*     snprintf(buf, sizeof(buf),
          "A:%d,%d,%d G:%d,%d,%d\r\n",
          mpu.accel_x, mpu.accel_y, mpu.accel_z,
          mpu.gyro_x, mpu.gyro_y, mpu.gyro_z);
 
     // Por USB (PC)
     UNERBUS_Write(&unerbusPC, (uint8_t*)buf, strlen(buf));
-    UNERBUS_Send(&unerbusPC, 0xA2, strlen(buf) + 1);
+    UNERBUS_Send(&unerbusPC, 0xA2, strlen(buf) + 1); */
 
     // O por WiFi (ESP01)
     // UNERBUS_Write(&unerbusESP01, buf, 12);
@@ -396,16 +534,22 @@ void Do100ms(){
 
     // --- Mostrar en display SSD1306 ---
     SSD1306_Clear(&ssd);
+    
+    // Mostrar estado de calibración
+    snprintf(buf, sizeof(buf), "MPU6050 %s", mpu.calibration.is_calibrated ? "CAL" : "RAW");
+    SSD1306_DrawString(&ssd, 0, 0, (const uint8_t *)buf, &SSD1306_Font_Small, 1);
+    
+    // Mostrar datos calibrados
     snprintf(buf, sizeof(buf), "AX:%d AY:%d", mpu.accel_x, mpu.accel_y);
-    SSD1306_DrawString(&ssd, 0, 0, buf, &SSD1306_Font_Small, 1);
+    SSD1306_DrawString(&ssd, 0, 10, (const uint8_t *)buf, &SSD1306_Font_Small, 1);
     snprintf(buf, sizeof(buf), "AZ:%d", mpu.accel_z);
-    SSD1306_DrawString(&ssd, 0, 10, buf, &SSD1306_Font_Small, 1);
+    SSD1306_DrawString(&ssd, 0, 20, (const uint8_t *)buf, &SSD1306_Font_Small, 1);
     snprintf(buf, sizeof(buf), "GX:%d", mpu.gyro_x);
-    SSD1306_DrawString(&ssd, 0, 20, buf, &SSD1306_Font_Small, 1);
+    SSD1306_DrawString(&ssd, 0, 30, (const uint8_t *)buf, &SSD1306_Font_Small, 1);
     snprintf(buf, sizeof(buf), "GY:%d", mpu.gyro_y);
-    SSD1306_DrawString(&ssd, 0, 30, buf, &SSD1306_Font_Small, 1);
+    SSD1306_DrawString(&ssd, 0, 40, (const uint8_t *)buf, &SSD1306_Font_Small, 1);
     snprintf(buf, sizeof(buf), "GZ:%d", mpu.gyro_z);
-    SSD1306_DrawString(&ssd, 0, 40, buf, &SSD1306_Font_Small, 1);
+    SSD1306_DrawString(&ssd, 0, 50, (const uint8_t *)buf, &SSD1306_Font_Small, 1);
   }
 }
 
@@ -504,7 +648,32 @@ int main(void)
 
   HAL_Delay(3000);
 
+  // Diagnostics de I2C antes de inicializar dispositivos
+  if (HAL_I2C_GetState(&hi2c2) != HAL_I2C_STATE_READY) {
+    // Indicar problema I2C con parpadeo muy rápido
+    for (int i = 0; i < 20; i++) {
+      HAL_GPIO_TogglePin(LED_GPIO_Port, LED_Pin);
+      HAL_Delay(50);
+    }
+  }
+
   setup_i2c_devices();
+
+  // Debug: Mostrar estado básico en SSD1306 si está disponible
+  if (ssd.ready) {
+    SSD1306_Clear(&ssd);
+    SSD1306_DrawString(&ssd, 0, 0, (const uint8_t *)"INIT COMPLETE", &SSD1306_Font_Small, 1);
+    
+    if (mpu.ready && mpu.calibration.is_calibrated) {
+      SSD1306_DrawString(&ssd, 0, 10, (const uint8_t *)"MPU: OK + CAL", &SSD1306_Font_Small, 1);
+    } else if (mpu.ready) {
+      SSD1306_DrawString(&ssd, 0, 10, (const uint8_t *)"MPU: OK", &SSD1306_Font_Small, 1);
+    } else {
+      SSD1306_DrawString(&ssd, 0, 10, (const uint8_t *)"MPU: FAIL", &SSD1306_Font_Small, 1);
+    }
+    
+    SSD1306_UpdateScreen(&ssd);
+  }
 
   HAL_Delay(3000);
   /* USER CODE END 2 */
@@ -516,21 +685,33 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-	  if(!timeOutAliveUDP){
-/* 		  timeOutAliveUDP = 50;
-		  UNERBUS_WriteByte(&unerbusESP01, 0x0D);
-		  UNERBUS_Send(&unerbusESP01, 0xF0, 2);
-
-		  UNERBUS_WriteConstString(&unerbusPC, "UNER\x03:\xF0\x0D\xC8", 0);
-		  UNERBUS_WriteConstString(&unerbusPC, " El ALIVE", 1); */
-	  }
-
 
 	  if(!time100ms)
 		  Do100ms();
 
 	  if(flag1.bit.ON10MS)
 		  Do10ms();
+
+    /* –– RECONFIGURACIÓN SEGURA –– */
+    if (mpu_reconfig_request && HAL_I2C_GetState(&hi2c2) == HAL_I2C_STATE_READY) {
+      mpu_reconfig_request = 0;
+      if (MPU6050_Init(&mpu, &mpu_config) == 0) {
+          for (int i = 0; i < 6; ++i) { HAL_GPIO_TogglePin(LED_GPIO_Port, LED_Pin); HAL_Delay(50); }
+      } else {
+          for (int i = 0; i < 4; ++i) { HAL_GPIO_TogglePin(LED_GPIO_Port, LED_Pin); HAL_Delay(250); }
+      }
+    }
+
+    // --- Actualización eficiente del display SSD1306 solo si hubo cambios ---
+    if (!mpu_reconfig_request && ssd.dirty && ssd.ready && HAL_I2C_GetState(&hi2c2) == HAL_I2C_STATE_READY) {
+      int8_t update_result = SSD1306_UpdateScreen_Async(&ssd, NULL); // NULL = no callback
+    }
+
+    if (!mpu_reconfig_request && mpu.ready && /*!mpu_data_ready &&*/ HAL_I2C_GetState(&hi2c2) == HAL_I2C_STATE_READY && !timeOutGetMpuData) {
+      timeOutGetMpuData = 2;
+      // mpu.ready = 0; se hace dentro de ReadAll_Async
+      MPU6050_ReadAll_Async(&mpu, mpu_user_callback);
+    }
 
 	  if(unerbusESP01.tx.iRead != unerbusESP01.tx.iWrite){
 		  w.u8[0] = unerbusESP01.tx.iWrite - unerbusESP01.tx.iRead;
@@ -551,23 +732,19 @@ int main(void)
 		  }
 	  }
 
-    // --- Actualización eficiente del display SSD1306 solo si hubo cambios ---
-    if (ssd.dirty && ssd.ready && HAL_I2C_GetState(&hi2c2) == HAL_I2C_STATE_READY) {
-      SSD1306_UpdateScreen_Async(&ssd, NULL); // NULL = no callback
-      // El flag se limpia automáticamente en la función
-    }
-
-    if (mpu.ready && /*!mpu_data_ready &&*/ HAL_I2C_GetState(&hi2c2) == HAL_I2C_STATE_READY && !timeOutGetMpuData) { // En un futuro aumentar el tiempo de lectura para no forzar tanto el bus I2C
-      timeOutGetMpuData = 2;
-      // mpu.ready = 0; se hace dentro de ReadAll_Async
-      MPU6050_ReadAll_Async(&mpu, mpu_user_callback);
-    }
-
 	  ESP01_Task();
 
 	  UNERBUS_Task(&unerbusESP01);
 
 	  UNERBUS_Task(&unerbusPC);
+
+    if(!timeOutAliveUDP){
+		  timeOutAliveUDP = 50;
+      UNERBUS_WriteByte(&unerbusESP01, 0x0D);
+      UNERBUS_Send(&unerbusESP01, 0xF0, 2);
+/*       UNERBUS_WriteConstString(&unerbusPC, "UNER\x03:\xF0\x0D\xC8", 0);
+      UNERBUS_WriteConstString(&unerbusPC, " El ALIVE", 1); */
+    }
 
   }
   /* USER CODE END 3 */

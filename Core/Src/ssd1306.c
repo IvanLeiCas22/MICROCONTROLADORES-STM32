@@ -26,7 +26,7 @@
 #define SSD1306_CMD_SET_COM_PINS         0xDA
 
 // --- Función interna para enviar un comando ---
-static int ssd1306_write_cmd(SSD1306_t *dev, uint8_t cmd) {
+static int8_t ssd1306_write_cmd(SSD1306_t *dev, uint8_t cmd) {
     uint8_t data[2] = {0x00, cmd}; // 0x00 = Co=0, D/C#=0 (comando)
     return dev->iface.i2c_write(SSD1306_I2C_ADDR, data[0], &data[1], 1, dev->iface.user_ctx);
 }
@@ -40,7 +40,7 @@ static void ssd1306_async_cb(void *ctx) {
 
 // --- Implementación de funciones principales ---
 
-int SSD1306_Init(SSD1306_t *dev) {
+int8_t SSD1306_Init(SSD1306_t *dev) {
     if (!dev || !dev->iface.i2c_write) return -1;
     dev->width = SSD1306_WIDTH;
     dev->height = SSD1306_HEIGHT;
@@ -48,7 +48,7 @@ int SSD1306_Init(SSD1306_t *dev) {
     SSD1306_Clear(dev);
 
     // Secuencia de inicialización recomendada (modo 128x64, addressing horizontal)
-    int res = 0;
+    int8_t res = 0;
     res |= ssd1306_write_cmd(dev, SSD1306_CMD_DISPLAY_OFF);
     res |= ssd1306_write_cmd(dev, SSD1306_CMD_SET_DISPLAY_CLOCK); res |= ssd1306_write_cmd(dev, 0x80);
     res |= ssd1306_write_cmd(dev, SSD1306_CMD_SET_MULTIPLEX);     res |= ssd1306_write_cmd(dev, 0x3F);
@@ -71,19 +71,19 @@ int SSD1306_Init(SSD1306_t *dev) {
     return res;
 }
 
-int SSD1306_DisplayOn(SSD1306_t *dev) {
+int8_t SSD1306_DisplayOn(SSD1306_t *dev) {
     if (!dev) return -1;
     return ssd1306_write_cmd(dev, SSD1306_CMD_DISPLAY_ON);
 }
 
-int SSD1306_DisplayOff(SSD1306_t *dev) {
+int8_t SSD1306_DisplayOff(SSD1306_t *dev) {
     if (!dev) return -1;
     return ssd1306_write_cmd(dev, SSD1306_CMD_DISPLAY_OFF);
 }
 
-int SSD1306_UpdateScreen(SSD1306_t *dev) {
+int8_t SSD1306_UpdateScreen(SSD1306_t *dev) {
     if (!dev || !dev->iface.i2c_write) return -1;
-    int res = 0;
+    int8_t res = 0;
     // Set column and page addresses
     res |= ssd1306_write_cmd(dev, 0x21); // Set column address
     res |= ssd1306_write_cmd(dev, 0x00); // Start
@@ -105,7 +105,7 @@ int SSD1306_UpdateScreen(SSD1306_t *dev) {
 }
 
 // --- Actualiza la pantalla (asíncrono) ---
-int SSD1306_UpdateScreen_Async(SSD1306_t *dev, void (*cb)(SSD1306_t *dev)) {
+int8_t SSD1306_UpdateScreen_Async(SSD1306_t *dev, void (*cb)(SSD1306_t *dev)) {
     if (!dev || !dev->iface.i2c_write_async) return -1;
     dev->user_cb = cb;
     // Solo soporta envío en un solo bloque (puede ampliarse a chunking si es necesario)
@@ -114,7 +114,7 @@ int SSD1306_UpdateScreen_Async(SSD1306_t *dev, void (*cb)(SSD1306_t *dev)) {
     data[0] = 0x40;
     memcpy(&data[1], dev->buffer, SSD1306_BUF_SIZE);
     // Set column and page addresses (sincrónico, previo al envío)
-    int res = 0;
+    int8_t res = 0;
     res |= ssd1306_write_cmd(dev, 0x21); // Set column address
     res |= ssd1306_write_cmd(dev, 0x00); // Start
     res |= ssd1306_write_cmd(dev, dev->width - 1); // End
@@ -145,11 +145,11 @@ void SSD1306_DrawPixel(SSD1306_t *dev, uint8_t x, uint8_t y, uint8_t color) {
     dev->dirty = 1;
 }
 
-void SSD1306_DrawChar(SSD1306_t *dev, uint8_t x, uint8_t y, char c, const SSD1306_Font_t *font, uint8_t color) {
+void SSD1306_DrawChar(SSD1306_t *dev, uint8_t x, uint8_t y, uint8_t c, const SSD1306_Font_t *font, uint8_t color) {
     if (!dev || !font) return;
     if (x >= dev->width || y >= dev->height) return;
-    if ((uint8_t)c < font->first_char || (uint8_t)c > font->last_char) c = ' '; // Sustituir fuera de rango por espacio
-    uint8_t char_index = (uint8_t)c - font->first_char;
+    if (c < font->first_char || c > font->last_char) c = ' '; // Sustituir fuera de rango por espacio
+    uint8_t char_index = c - font->first_char;
     uint16_t bytes_per_char = font->width * ((font->height + 7) / 8);
     const uint8_t *char_data = &font->data[char_index * bytes_per_char];
     for (uint8_t col = 0; col < font->width; col++) {
@@ -166,7 +166,7 @@ void SSD1306_DrawChar(SSD1306_t *dev, uint8_t x, uint8_t y, char c, const SSD130
     dev->dirty = 1;
 }
 
-void SSD1306_DrawString(SSD1306_t *dev, uint8_t x, uint8_t y, const char *str, const SSD1306_Font_t *font, uint8_t color) {
+void SSD1306_DrawString(SSD1306_t *dev, uint8_t x, uint8_t y, const uint8_t *str, const SSD1306_Font_t *font, uint8_t color) {
     if (!dev || !font || !str) return;
     uint8_t orig_x = x;
     while (*str) {
