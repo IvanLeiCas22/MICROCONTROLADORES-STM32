@@ -1,0 +1,82 @@
+// Direcciones de registros
+#define MPU6050_ADDR    (0x68 << 1)
+#define MPU6050_WHO_AM_I_ADDR        0x75
+#define MPU6050_PWR_MGMT_1_ADDR      0x6B  
+#define MPU6050_ACCEL_CONFIG_ADDR    0x1C
+#define MPU6050_GYRO_CONFIG_ADDR     0x1B
+#define MPU6050_CONFIG_ADDR          0x1A
+#define MPU6050_ACCEL_XOUT_H_ADDR    0x3B
+
+typedef enum
+{
+    MPU6050_ACCEL_RANGE_2G = 0x00,    // ±2g
+    MPU6050_ACCEL_RANGE_4G = 0x08,    // ±4g  
+    MPU6050_ACCEL_RANGE_8G = 0x10,    // ±8g
+    MPU6050_ACCEL_RANGE_16G = 0x18    // ±16g
+} MPU6050_AccelRangeTypeDef;
+
+typedef enum
+{
+    MPU6050_GYRO_RANGE_250DPS = 0x00,   // ±250°/s
+    MPU6050_GYRO_RANGE_500DPS = 0x08,   // ±500°/s
+    MPU6050_GYRO_RANGE_1000DPS = 0x10,  // ±1000°/s
+    MPU6050_GYRO_RANGE_2000DPS = 0x18   // ±2000°/s
+} MPU6050_GyroRangeTypeDef;
+
+typedef enum
+{
+    MPU6050_DLPF_260HZ = 0x00,    // 260Hz, 256Hz
+    MPU6050_DLPF_184HZ = 0x01,    // 184Hz, 188Hz
+    MPU6050_DLPF_94HZ = 0x02,     // 94Hz, 98Hz
+    MPU6050_DLPF_44HZ = 0x03,     // 44Hz, 42Hz
+    MPU6050_DLPF_21HZ = 0x04,     // 21Hz, 20Hz
+    MPU6050_DLPF_10HZ = 0x05,     // 10Hz, 10Hz
+    MPU6050_DLPF_5HZ = 0x06       // 5Hz, 5Hz
+} MPU6050_DLPFTypeDef;
+
+typedef struct
+{
+    int16_t accel_x_raw;
+    int16_t accel_y_raw;
+    int16_t accel_z_raw;
+    int16_t gyro_x_raw;
+    int16_t gyro_y_raw;
+    int16_t gyro_z_raw;
+    int16_t temp_raw;
+} MPU6050_RawDataTypeDef;
+
+typedef struct
+{
+    // Configuraciones
+    MPU6050_AccelRangeTypeDef accel_range;
+    MPU6050_GyroRangeTypeDef gyro_range;
+    MPU6050_DLPFTypeDef dlpf_config;
+    
+    // Datos raw
+    MPU6050_RawDataTypeDef raw_data;
+    uint8_t dma_buffer[14];
+    
+    // Estado
+    uint8_t is_initialized;
+    uint8_t is_connected;
+    uint8_t dma_busy;
+    
+    // Punteros a funciones I2C (desacoplamiento)
+    int8_t (*i2c_write_blocking)(uint8_t device_addr, uint8_t reg_addr, uint8_t *data, uint16_t data_len, void *context);
+    int8_t (*i2c_read_blocking)(uint8_t device_addr, uint8_t reg_addr, uint8_t *data, uint16_t data_len, void *context);
+    int8_t (*i2c_write_dma)(uint8_t device_addr, uint8_t reg_addr, uint8_t *data, uint16_t data_len, void *context);
+    int8_t (*i2c_read_dma)(uint8_t device_addr, uint8_t reg_addr, uint8_t *data, uint16_t data_len, void *context);
+    
+    // Contexto I2C
+    void *i2c_context;
+
+    // Puntero a función de retardo
+    void (*delay_ms)(uint32_t ms);
+    
+    // Dirección del dispositivo
+    uint8_t device_address;
+    
+} MPU6050_HandleTypeDef;
+
+int8_t MPU6050_Init(MPU6050_HandleTypeDef *hmpu);
+int8_t MPU6050_ReadRawDataDMA(MPU6050_HandleTypeDef *hmpu);

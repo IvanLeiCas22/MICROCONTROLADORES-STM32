@@ -22,9 +22,12 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include <stdlib.h>
+
 #include "usbd_cdc_if.h"
 #include "ESP01.h"
 #include "UNERBUS.h"
+#include "MPU6050.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -64,9 +67,13 @@ typedef enum{
   CMD_LAST_ADC = 0xA0,
   CMD_TEST_MOTORES = 0xA1,
   CMD_VELOCIDAD_MOTORES = 0xA4,
+  CMD_SET_PWM_MOTORES = 0xA5,
+  CMD_GET_PWM_MOTORES = 0xA6,
+  CMD_TEST_MOTORES_50 = 0xA7,
+  CMD_GET_LOCAL_IP = 0xE0,
+  CMD_UART_BYPASS_CONTROL = 0xDD,
   CMD_OTHERS
 } CommandIdTypeDef;
-
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
@@ -75,6 +82,7 @@ typedef enum{
 /* Flags */
 #define ON10MS                flags0.bit.b0
 #define UART_BYPASS           flags0.bit.b1
+#define MPU_READ_REQUEST      flags0.bit.b2
 
 /* ADC Buffer Sizes */
 #define ADC_BUFFER_SIZE				48
@@ -136,6 +144,13 @@ uint8_t rx_usb_data, new_data;
 
 uint16_t buf_adc[ADC_BUFFER_SIZE][8];
 uint8_t adc_buf_write_idx, adc_buf_read_idx;
+
+/* MPU6050 */
+static MPU6050_HandleTypeDef hmpu;
+
+/* Motores */
+uint16_t motor_pwm_values[4] = {0, 0, 0, 0};  // Valores PWM para los 4 canales
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -158,11 +173,20 @@ void DecodeCMD(struct UNERBUSHandle *aBus, uint8_t iStartData);
 void Do10ms();
 
 void USB_ReceiveData(uint8_t *buf, uint16_t len);
+
+static void ManageTransmission(void);
+
+/* I2C */
+static int8_t I2C_WriteBlocking(uint8_t device_addr, uint8_t reg_addr, uint8_t *data, uint16_t data_len, void *context);
+static int8_t I2C_WriteDMA(uint8_t device_addr, uint8_t reg_addr, uint8_t *data, uint16_t data_len, void *context);
+static int8_t I2C_ReadBlocking(uint8_t device_addr, uint8_t reg_addr, uint8_t *data, uint16_t data_len, void *context);
+static int8_t I2C_ReadDMA(uint8_t device_addr, uint8_t reg_addr, uint8_t *data, uint16_t data_len, void *context);
+
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-//CALLBACKS
+/* CALLBACKS */
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim){
 	if(htim->Instance == TIM1){
 		time_10ms--;
@@ -170,7 +194,6 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim){
 			ON10MS = 1;
 			time_10ms = 40;
 		}
-
 		HAL_ADC_Start_DMA(&hadc1, (uint32_t *)&buf_adc[adc_buf_write_idx], 8);
 	}
 }
@@ -178,7 +201,7 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim){
 
 void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc){
 	adc_buf_write_idx++;
-	adc_buf_write_idx &= (ADC_BUFFER_SIZE-1);
+	adc_buf_write_idx %= ADC_BUFFER_SIZE;
 }
 
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart){
@@ -191,7 +214,33 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart){
       HAL_UART_Receive_IT(&huart1, &data_rx_esp01, 1);
   }
 }
-//.
+
+void HAL_I2C_MemTxCpltCallback(I2C_HandleTypeDef *hi2c)
+{
+    // Escritura DMA completada
+    if (hi2c == &hi2c2) {
+        // Manejar finalización para I2C2
+        // Por ejemplo: activar flag, procesar siguiente operación, etc.
+    }
+}
+
+void HAL_I2C_MemRxCpltCallback(I2C_HandleTypeDef *hi2c)
+{
+  if (hi2c == &hi2c2) {
+    // Convertir datos del buffer DMA a la estructura
+    hmpu.raw_data.accel_x_raw = (int16_t)((hmpu.dma_buffer[0] << 8) | hmpu.dma_buffer[1]);
+    hmpu.raw_data.accel_y_raw = (int16_t)((hmpu.dma_buffer[2] << 8) | hmpu.dma_buffer[3]);
+    hmpu.raw_data.accel_z_raw = (int16_t)((hmpu.dma_buffer[4] << 8) | hmpu.dma_buffer[5]);
+    hmpu.raw_data.temp_raw = (int16_t)((hmpu.dma_buffer[6] << 8) | hmpu.dma_buffer[7]);
+    hmpu.raw_data.gyro_x_raw = (int16_t)((hmpu.dma_buffer[8] << 8) | hmpu.dma_buffer[9]);
+    hmpu.raw_data.gyro_y_raw = (int16_t)((hmpu.dma_buffer[10] << 8) | hmpu.dma_buffer[11]);
+    hmpu.raw_data.gyro_z_raw = (int16_t)((hmpu.dma_buffer[12] << 8) | hmpu.dma_buffer[13]);
+    
+    hmpu.dma_busy = 0;  // Liberar DMA
+  }
+}
+
+/* Fin CALLBACKS */
 
 void ESP01_SetChipEnable(uint8_t value){
 	HAL_GPIO_WritePin(CH_EN_GPIO_Port, CH_EN_Pin, value);
@@ -230,34 +279,118 @@ void ESP01_ChangeState(_eESP01STATUS esp01State){
 void DecodeCMD(struct UNERBUSHandle *aBus, uint8_t iStartData){
 	uint8_t id;
 	uint8_t length = 0;
+  uint8_t idx = 0;
 
 	id = UNERBUS_GetUInt8(aBus);
-	switch(id){
-    case 0xE0://GET LOCAL IP
+	switch((CommandIdTypeDef)id){
+    case CMD_GET_LOCAL_IP://GET LOCAL IP
       UNERBUS_Write(aBus, (uint8_t *)ESP01_GetLocalIP(), 16);
       length = 17;
       break;
-    case 0xF0://ALIVE
-      UNERBUS_WriteByte(aBus, 0x0D);
-      length = 2;
+    case CMD_GET_ALIVE://ALIVE
+      UNERBUS_WriteByte(aBus, CMD_ACK);
+      length = 2;//
       break;
-    case 0xA0://LAST_ADC - Enviar datos del ADC - 55 4E 45 52 02 3A A0 94
+    case CMD_LAST_ADC://LAST_ADC - Enviar datos del ADC - 55 4E 45 52 02 3A A0 94
       uint8_t adc_buffer[16]; // Buffer temporal para los datos del ADC
-      uint8_t idx = 0;
       
+      // Leer del último buffer de ADC completado y seguro
+      uint8_t last_adc_idx = (adc_buf_write_idx == 0) ? (ADC_BUFFER_SIZE - 1) : (adc_buf_write_idx - 1);
+
       // Convertir los 8 canales uint16_t a bytes (Little Endian)
       for(uint8_t i = 0; i < 8; i++){
-        adc_buffer[idx++] = (uint8_t)(buf_adc[adc_buf_write_idx][i] & 0xFF);        // Byte bajo
-        adc_buffer[idx++] = (uint8_t)((buf_adc[adc_buf_write_idx][i] >> 8) & 0xFF); // Byte alto
+        adc_buffer[idx++] = (uint8_t)(buf_adc[last_adc_idx][i] & 0xFF);        // Byte bajo
+        adc_buffer[idx++] = (uint8_t)((buf_adc[last_adc_idx][i] >> 8) & 0xFF); // Byte alto
       }
       
       UNERBUS_Write(aBus, adc_buffer, 16);
       length = 17; // 1 (CMD) + 16 (datos)
       break;
-    case 0xDD://UART_BYPASS_CONTROL - Activar/desactivar bypass  
+    case CMD_UART_BYPASS_CONTROL://UART_BYPASS_CONTROL - Activar/desactivar bypass  
       UART_BYPASS = UNERBUS_GetUInt8(aBus);  // 0 o 1
       UNERBUS_WriteByte(aBus, UART_BYPASS);   // Confirmar estado
       length = 2;
+      break;
+    case CMD_MPU: // Enviar datos del MPU6050 55 4E 45 52 02 3A A2 96
+      uint8_t mpu_buffer[14]; // Buffer para datos del MPU
+      
+      // Convertir datos raw a bytes (Little Endian)
+      mpu_buffer[idx++] = (uint8_t)(hmpu.raw_data.accel_x_raw & 0xFF);
+      mpu_buffer[idx++] = (uint8_t)((hmpu.raw_data.accel_x_raw >> 8) & 0xFF);
+      mpu_buffer[idx++] = (uint8_t)(hmpu.raw_data.accel_y_raw & 0xFF);
+      mpu_buffer[idx++] = (uint8_t)((hmpu.raw_data.accel_y_raw >> 8) & 0xFF);
+      mpu_buffer[idx++] = (uint8_t)(hmpu.raw_data.accel_z_raw & 0xFF);
+      mpu_buffer[idx++] = (uint8_t)((hmpu.raw_data.accel_z_raw >> 8) & 0xFF);
+      mpu_buffer[idx++] = (uint8_t)(hmpu.raw_data.temp_raw & 0xFF);
+      mpu_buffer[idx++] = (uint8_t)((hmpu.raw_data.temp_raw >> 8) & 0xFF);
+      mpu_buffer[idx++] = (uint8_t)(hmpu.raw_data.gyro_x_raw & 0xFF);
+      mpu_buffer[idx++] = (uint8_t)((hmpu.raw_data.gyro_x_raw >> 8) & 0xFF);
+      mpu_buffer[idx++] = (uint8_t)(hmpu.raw_data.gyro_y_raw & 0xFF);
+      mpu_buffer[idx++] = (uint8_t)((hmpu.raw_data.gyro_y_raw >> 8) & 0xFF);
+      mpu_buffer[idx++] = (uint8_t)(hmpu.raw_data.gyro_z_raw & 0xFF);
+      mpu_buffer[idx++] = (uint8_t)((hmpu.raw_data.gyro_z_raw >> 8) & 0xFF);
+      
+      UNERBUS_Write(aBus, mpu_buffer, 14);
+      length = 15; // 1 (CMD) + 14 (datos)
+      break;
+    case CMD_SET_PWM_MOTORES: // Control de PWM de motores
+      // Recibir 4 valores uint16_t (8 bytes) para los 4 canales PWM
+      uint8_t pwm_response[9]; // Buffer para respuesta (1 byte status + 8 bytes valores actuales)
+      
+      // Extraer y validar valores PWM
+      for(uint8_t i = 0; i < 4; i++){
+        uint16_t pwm_val = UNERBUS_GetUInt16(aBus);
+        if(pwm_val > 9999) pwm_val = 9999; // Limitar a máximo
+        motor_pwm_values[i] = pwm_val;
+      }
+      
+      // Aplicar los valores PWM a los canales del TIM4
+      __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_1, motor_pwm_values[0]);
+      __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_2, motor_pwm_values[1]);
+      __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_3, motor_pwm_values[2]);
+      __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_4, motor_pwm_values[3]);
+      
+      // Preparar respuesta con estado de éxito y valores actuales
+      pwm_response[0] = CMD_ACK; // Status: OK
+      for(uint8_t i = 0; i < 4; i++){
+        pwm_response[1 + i*2] = (uint8_t)(motor_pwm_values[i] & 0xFF);        // Byte bajo
+        pwm_response[2 + i*2] = (uint8_t)((motor_pwm_values[i] >> 8) & 0xFF); // Byte alto
+      }
+      
+      UNERBUS_Write(aBus, pwm_response, 9);
+      length = 10; // 1 (CMD) + 9 (status + datos)
+      break;
+    case CMD_GET_PWM_MOTORES: // Obtener valores PWM actuales
+      uint8_t pwm_current_buffer[8]; // Buffer para valores actuales
+      
+      // Convertir valores actuales a bytes (Little Endian)
+      for(uint8_t i = 0; i < 4; i++){
+        pwm_current_buffer[i*2] = (uint8_t)(motor_pwm_values[i] & 0xFF);        // Byte bajo
+        pwm_current_buffer[i*2 + 1] = (uint8_t)((motor_pwm_values[i] >> 8) & 0xFF); // Byte alto
+      }
+      
+      UNERBUS_Write(aBus, pwm_current_buffer, 8);
+      length = 9; // 1 (CMD) + 8 (datos)
+      break;
+    case CMD_TEST_MOTORES_50: // Probar motores al 50% de velocidad
+      // Establecer movimiento hacia adelante al 50% (Motor 2 y Motor 4)
+      motor_pwm_values[0] = 0;    // Motor Der Atrás = 0
+      motor_pwm_values[1] = 5000; // Motor Der Adelante = 50%
+      motor_pwm_values[2] = 0;    // Motor Izq Atrás = 0
+      motor_pwm_values[3] = 5000; // Motor Izq Adelante = 50%
+      
+      // Aplicar los valores PWM a los canales del TIM4
+      __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_1, motor_pwm_values[0]);
+      __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_2, motor_pwm_values[1]);
+      __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_3, motor_pwm_values[2]);
+      __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_4, motor_pwm_values[3]);
+      
+      // Preparar respuesta con estado de éxito
+      uint8_t test_response[1];
+      test_response[0] = CMD_ACK; // Status: OK
+      
+      UNERBUS_Write(aBus, test_response, 1);
+      length = 2; // 1 (CMD) + 1 (status)
       break;
 	}
 
@@ -271,6 +404,8 @@ void Do10ms(){
 
 	if(time_100ms)
 		time_100ms--;
+
+  MPU_READ_REQUEST = 1;
 
 	ESP01_Timeout10ms();
 	UNERBUS_Timeout(&unerbus_esp01_handle);
@@ -305,6 +440,120 @@ uint8_t UART_TransmitByte(uint8_t value){
   }
   return 0;
 }
+
+/**
+  * @brief  Gestiona la transmisión de datos para los diferentes canales de comunicación (USB, ESP01, UART-Bypass).
+  * @retval None
+  */
+static void ManageTransmission(void)
+{
+    // TRANSMISIÓN ESP01 (solo si NO está en bypass)
+    if(!UART_BYPASS && (unerbus_esp01_handle.tx.iRead != unerbus_esp01_handle.tx.iWrite)){
+      work_data.u8[0] = (unerbus_esp01_handle.tx.iWrite - unerbus_esp01_handle.tx.iRead) & unerbus_esp01_handle.tx.maxIndexRingBuf;
+      if(ESP01_Send(unerbus_esp01_handle.tx.buf, unerbus_esp01_handle.tx.iRead, work_data.u8[0], unerbus_esp01_handle.tx.maxIndexRingBuf+1) == ESP01_SEND_READY)
+          unerbus_esp01_handle.tx.iRead = unerbus_esp01_handle.tx.iWrite;
+    }
+
+    // TRANSMISIÓN UART DIRECTO (si está en bypass)
+    if(UART_BYPASS && (unerbus_pc_handle.tx.iRead != unerbus_pc_handle.tx.iWrite)){
+      if(unerbus_pc_handle.tx.iRead < unerbus_pc_handle.tx.iWrite)
+          work_data.u8[0] = unerbus_pc_handle.tx.iWrite - unerbus_pc_handle.tx.iRead;
+      else
+          work_data.u8[0] = unerbus_pc_handle.tx.maxIndexRingBuf+1 - unerbus_pc_handle.tx.iRead;
+
+      // Enviar byte por byte por UART directo
+      for(uint8_t i = 0; i < work_data.u8[0]; i++){
+          if(UART_TransmitByte(unerbus_pc_handle.tx.buf[unerbus_pc_handle.tx.iRead])){
+              unerbus_pc_handle.tx.iRead = (unerbus_pc_handle.tx.iRead + 1) & unerbus_pc_handle.tx.maxIndexRingBuf;
+          } else {
+              break; // Si no puede transmitir, salir y reintentar en siguiente ciclo
+          }
+      }
+    }
+
+    if(!UART_BYPASS && (unerbus_pc_handle.tx.iRead != unerbus_pc_handle.tx.iWrite)){
+      if(unerbus_pc_handle.tx.iRead < unerbus_pc_handle.tx.iWrite)
+        work_data.u8[0] = unerbus_pc_handle.tx.iWrite - unerbus_pc_handle.tx.iRead;
+      else
+        work_data.u8[0] = unerbus_pc_handle.tx.maxIndexRingBuf+1 - unerbus_pc_handle.tx.iRead;
+
+      if(CDC_Transmit_FS(&unerbus_pc_handle.tx.buf[unerbus_pc_handle.tx.iRead], work_data.u8[0]) == USBD_OK){
+        unerbus_pc_handle.tx.iRead = (unerbus_pc_handle.tx.iRead + work_data.u8[0]) & unerbus_pc_handle.tx.maxIndexRingBuf;
+      }
+    }
+}
+
+/* I2C */
+int8_t I2C_DevicesInit(void)
+{
+  int8_t verificacion = 0;
+  
+  hmpu.i2c_write_blocking = I2C_WriteBlocking;
+  hmpu.i2c_write_dma = I2C_WriteDMA;
+  hmpu.i2c_read_blocking = I2C_ReadBlocking;
+  hmpu.i2c_read_dma = I2C_ReadDMA;
+  hmpu.delay_ms = HAL_Delay;
+  hmpu.accel_range = MPU6050_ACCEL_RANGE_2G;
+  hmpu.gyro_range = MPU6050_GYRO_RANGE_250DPS;
+  hmpu.dlpf_config = MPU6050_DLPF_44HZ;
+  hmpu.i2c_context = &hi2c2;
+  hmpu.device_address = MPU6050_ADDR;
+  hmpu.is_initialized = 0;
+  hmpu.is_connected = 0;
+  hmpu.dma_busy = 0;
+
+  verificacion = MPU6050_Init(&hmpu);
+  if(verificacion != 1) {
+    verificacion = verificacion * (-1);
+    for (uint8_t i = 0; i < verificacion; i++) {
+      HAL_GPIO_WritePin(LED_GPIO_Port, LED_Pin, GPIO_PIN_SET);
+      HAL_Delay(800);
+      HAL_GPIO_WritePin(LED_GPIO_Port, LED_Pin, GPIO_PIN_RESET);
+      HAL_Delay(800);
+    }
+    Error_Handler();
+  }
+
+  return 1;
+}
+
+int8_t I2C_WriteBlocking(uint8_t device_addr, uint8_t reg_addr, uint8_t *data, uint16_t data_len, void *context)
+{
+  I2C_HandleTypeDef *hi2c = (I2C_HandleTypeDef *)context;
+  HAL_StatusTypeDef status = HAL_I2C_Mem_Write(hi2c, device_addr, reg_addr, I2C_MEMADD_SIZE_8BIT, data, data_len, 1000);
+  if(status == HAL_OK)
+    return 1;
+  return -1;
+}
+
+int8_t I2C_WriteDMA(uint8_t device_addr, uint8_t reg_addr, uint8_t *data, uint16_t data_len, void *context)
+{
+  I2C_HandleTypeDef *hi2c = (I2C_HandleTypeDef *)context;
+  HAL_StatusTypeDef status = HAL_I2C_Mem_Write_DMA(hi2c, device_addr, reg_addr, I2C_MEMADD_SIZE_8BIT, data, data_len);
+  if(status == HAL_OK)
+    return 1;
+  return -1;
+}
+
+int8_t I2C_ReadBlocking(uint8_t device_addr, uint8_t reg_addr, uint8_t *data, uint16_t data_len, void *context)
+{
+  I2C_HandleTypeDef *hi2c = (I2C_HandleTypeDef *)context;
+  HAL_StatusTypeDef status = HAL_I2C_Mem_Read(hi2c, device_addr, reg_addr, I2C_MEMADD_SIZE_8BIT, data, data_len, 1000);
+  if(status == HAL_OK)
+    return 1;
+  return -1;
+}
+
+int8_t I2C_ReadDMA(uint8_t device_addr, uint8_t reg_addr, uint8_t *data, uint16_t data_len, void *context)
+{
+  I2C_HandleTypeDef *hi2c = (I2C_HandleTypeDef *)context;
+  HAL_StatusTypeDef status = HAL_I2C_Mem_Read_DMA(hi2c, device_addr, reg_addr, I2C_MEMADD_SIZE_8BIT, data, data_len);
+  if(status == HAL_OK)
+    return 1;
+  return -1;
+}
+
+/* Fin I2C */
 
 /* USER CODE END 0 */
 
@@ -381,6 +630,12 @@ int main(void)
   __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_3, 0);
   __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_4, 0);
   HAL_TIM_Base_Start(&htim4);
+  
+  // Iniciar los canales PWM
+  HAL_TIM_PWM_Start(&htim4, TIM_CHANNEL_1);
+  HAL_TIM_PWM_Start(&htim4, TIM_CHANNEL_2);
+  HAL_TIM_PWM_Start(&htim4, TIM_CHANNEL_3);
+  HAL_TIM_PWM_Start(&htim4, TIM_CHANNEL_4);
 
   ESP01_Init(&esp01_handle);
   UNERBUS_Init(&unerbus_esp01_handle);
@@ -390,11 +645,19 @@ int main(void)
   ESP01_SetWIFI(WIFI_SSID, WIFI_PASSWORD);
   ESP01_StartUDP(WIFI_UDP_REMOTE_IP, WIFI_UDP_REMOTE_PORT, WIFI_UDP_LOCAL_PORT);
 
+  /* I2C devices init */
+  HAL_Delay(1000);
+
+  I2C_DevicesInit();
+
   HAL_UART_Receive_IT(&huart1, &data_rx_esp01, 1);
 
+  HAL_Delay(1000);
+  
   /* Flags */
   ON10MS = 0;
   UART_BYPASS = 1;
+  MPU_READ_REQUEST = 0;
 
   /* USER CODE END 2 */
 
@@ -407,13 +670,38 @@ int main(void)
     /* USER CODE BEGIN 3 */
 	  if(!timeout_alive_udp && !UART_BYPASS){
 		  timeout_alive_udp = 50;
-		  UNERBUS_WriteByte(&unerbus_esp01_handle, 0x0D);
-		  UNERBUS_Send(&unerbus_esp01_handle, 0xF0, 2);
+		  UNERBUS_WriteByte(&unerbus_esp01_handle, CMD_ACK);
+		  UNERBUS_Send(&unerbus_esp01_handle, CMD_GET_ALIVE, 2);
 
 /* 		  UNERBUS_WriteConstString(&unerbusPC, "UNER\x03:\xF0\x0D\xC8", 0);
 		  UNERBUS_WriteConstString(&unerbusPC, " El ALIVE", 1); */
 	  }
 
+    if(MPU_READ_REQUEST){
+      if(!hmpu.dma_busy && HAL_I2C_GetState(&hi2c2) == HAL_I2C_STATE_READY){
+        MPU_READ_REQUEST = 0; // Limpiar la solicitud
+        if(MPU6050_ReadRawDataDMA(&hmpu) != 1){
+          HAL_GPIO_WritePin(LED_GPIO_Port, LED_Pin, GPIO_PIN_SET);
+          HAL_Delay(200);
+          HAL_GPIO_WritePin(LED_GPIO_Port, LED_Pin, GPIO_PIN_RESET);
+          HAL_Delay(200);
+          HAL_GPIO_WritePin(LED_GPIO_Port, LED_Pin, GPIO_PIN_SET);
+          HAL_Delay(200);
+          HAL_GPIO_WritePin(LED_GPIO_Port, LED_Pin, GPIO_PIN_RESET);
+          HAL_Delay(200);
+          HAL_GPIO_WritePin(LED_GPIO_Port, LED_Pin, GPIO_PIN_SET);
+          HAL_Delay(200);
+          HAL_GPIO_WritePin(LED_GPIO_Port, LED_Pin, GPIO_PIN_RESET);
+          HAL_Delay(200);
+          HAL_GPIO_WritePin(LED_GPIO_Port, LED_Pin, GPIO_PIN_SET);
+          HAL_Delay(200);
+          HAL_GPIO_WritePin(LED_GPIO_Port, LED_Pin, GPIO_PIN_RESET);
+          HAL_Delay(200);
+          HAL_GPIO_WritePin(LED_GPIO_Port, LED_Pin, GPIO_PIN_SET);
+          Error_Handler();
+        }
+      }
+    }
 
 	  if(!time_100ms)
 		  Do100ms();
@@ -421,43 +709,7 @@ int main(void)
 	  if(ON10MS)
 		  Do10ms();
 
-    // TRANSMISIÓN ESP01 (solo si NO está en bypass)
-    if(!UART_BYPASS && (unerbus_esp01_handle.tx.iRead != unerbus_esp01_handle.tx.iWrite)){
-      work_data.u8[0] = unerbus_esp01_handle.tx.iWrite - unerbus_esp01_handle.tx.iRead;
-      work_data.u8[0] &= unerbus_esp01_handle.tx.maxIndexRingBuf;
-      if(ESP01_Send(unerbus_esp01_handle.tx.buf, unerbus_esp01_handle.tx.iRead, work_data.u8[0], unerbus_esp01_handle.tx.maxIndexRingBuf+1) == ESP01_SEND_READY)
-          unerbus_esp01_handle.tx.iRead = unerbus_esp01_handle.tx.iWrite;
-    }
-
-    // TRANSMISIÓN UART DIRECTO (si está en bypass)
-    if(UART_BYPASS && (unerbus_pc_handle.tx.iRead != unerbus_pc_handle.tx.iWrite)){
-      if(unerbus_pc_handle.tx.iRead < unerbus_pc_handle.tx.iWrite)
-          work_data.u8[0] = unerbus_pc_handle.tx.iWrite - unerbus_pc_handle.tx.iRead;
-      else
-          work_data.u8[0] = unerbus_pc_handle.tx.maxIndexRingBuf+1 - unerbus_pc_handle.tx.iRead;
-
-      // Enviar byte por byte por UART directo
-      for(uint8_t i = 0; i < work_data.u8[0]; i++){
-          if(UART_TransmitByte(unerbus_pc_handle.tx.buf[unerbus_pc_handle.tx.iRead])){
-              unerbus_pc_handle.tx.iRead++;
-              unerbus_pc_handle.tx.iRead &= unerbus_pc_handle.tx.maxIndexRingBuf;
-          } else {
-              break; // Si no puede transmitir, salir y reintentar en siguiente ciclo
-          }
-      }
-    }
-
-	  if(!UART_BYPASS && (unerbus_pc_handle.tx.iRead != unerbus_pc_handle.tx.iWrite)){
-		  if(unerbus_pc_handle.tx.iRead < unerbus_pc_handle.tx.iWrite)
-			  work_data.u8[0] = unerbus_pc_handle.tx.iWrite - unerbus_pc_handle.tx.iRead;
-		  else
-			  work_data.u8[0] = unerbus_pc_handle.tx.maxIndexRingBuf+1 - unerbus_pc_handle.tx.iRead;
-
-		  if(CDC_Transmit_FS(&unerbus_pc_handle.tx.buf[unerbus_pc_handle.tx.iRead], work_data.u8[0]) == USBD_OK){
-			  unerbus_pc_handle.tx.iRead += work_data.u8[0];
-			  unerbus_pc_handle.tx.iRead &= unerbus_pc_handle.tx.maxIndexRingBuf;
-		  }
-	  }
+    ManageTransmission();
 
 	  ESP01_Task();
 
