@@ -3,14 +3,11 @@
 
 #include "BUTTONS.h"
 
-#define PRESSED 0
-#define RELEASED 1
-
 uint8_t Button_Init(Button_HandleTypeDef *hbutton, ButtonReadPinCallback read_pin_callback, void *context)
 {
     if (hbutton == NULL || read_pin_callback == NULL)
     {
-        return 0; // Error: Invalid parameters
+        return BUTTON_ERROR; // Error: Invalid parameters
     }
 
     hbutton->state = BUTTON_STATE_RELEASED;
@@ -19,10 +16,10 @@ uint8_t Button_Init(Button_HandleTypeDef *hbutton, ButtonReadPinCallback read_pi
     hbutton->context = context;
     hbutton->press_duration_ticks = 0;
     hbutton->debounce_counter_ticks = 0;
-    hbutton->debounce_threshold_ticks = 5;     // 5 ticks = 50 ms
-    hbutton->long_press_threshold_ticks = 100; // 100 ticks = 1000 ms
+    hbutton->debounce_threshold_ticks = DEBOUNCE_THRESHOLD_MS / 10;     // 5 ticks = 50 ms
+    hbutton->long_press_threshold_ticks = LONG_PRESS_THRESHOLD_MS / 10; // 100 ticks = 1000 ms
 
-    return 1; // Success
+    return BUTTON_SUCCESS; // Success
 }
 
 void Button_Tick(Button_HandleTypeDef *hbutton)

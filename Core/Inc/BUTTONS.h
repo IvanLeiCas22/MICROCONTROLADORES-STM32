@@ -1,5 +1,14 @@
 #include <stdint.h>
 
+#define PRESSED 0
+#define RELEASED 1
+
+#define BUTTON_ERROR 0
+#define BUTTON_SUCCESS 1
+
+#define DEBOUNCE_THRESHOLD_MS 50     // 50 ms
+#define LONG_PRESS_THRESHOLD_MS 1000 // 1000 ms
+
 typedef enum
 {
     BUTTON_STATE_RELEASED = 0,
