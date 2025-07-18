@@ -30,6 +30,8 @@
 #include "UNERBUS.h"
 #include "MPU6050.h"
 #include "BUTTONS.h"
+// ...existing code...
+#include "SSD1306.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -75,6 +77,7 @@ typedef enum
   CMD_TEST_MOTORES_50 = 0xA7,
   CMD_GET_LOCAL_IP = 0xE0,
   CMD_UART_BYPASS_CONTROL = 0xDD,
+  CMD_MPU_CALIBRATE = 0xA3,
   CMD_OTHERS
 } CommandIdTypeDef;
 
@@ -209,6 +212,9 @@ uint8_t adc_buf_write_idx, adc_buf_read_idx;
 /* MPU6050 */
 static MPU6050_HandleTypeDef hmpu;
 
+/* SSD1306*/
+static SSD1306_HandleTypeDef hssd;
+
 /* Motors */
 uint16_t motor_pwm_values[PWM_CHANNELS] = {0, 0, 0, 0}; // Valores PWM para los 4 canales
 
@@ -300,11 +306,16 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 
 void HAL_I2C_MemTxCpltCallback(I2C_HandleTypeDef *hi2c)
 {
-  // Escritura DMA completada
+  // Escritura DMA completada para SSD1306
   if (hi2c == &hi2c2)
   {
-    // Manejar finalización para I2C2
-    // Por ejemplo: activar flag, procesar siguiente operación, etc.
+    hssd.dma_busy = false;
+    // Call user callback if set
+    if (hssd.update_done_cb)
+    {
+      hssd.update_done_cb(&hssd);
+      hssd.update_done_cb = NULL;
+    }
   }
 }
 
@@ -383,8 +394,8 @@ void DecodeCMD(struct UNERBUSHandle *aBus, uint8_t iStartData)
     UNERBUS_WriteByte(aBus, CMD_ACK);
     length = UNERBUS_CMD_ID_SIZE + UNERBUS_ACK_SIZE; //
     break;
-  case CMD_LAST_ADC:                                // LAST_ADC - Enviar datos del ADC - 55 4E 45 52 02 3A A0 94
-    uint8_t adc_buffer[ADC_DATA_BYTES];             // Buffer temporal para los datos del ADC
+  case CMD_LAST_ADC:                    // LAST_ADC - Enviar datos del ADC - 55 4E 45 52 02 3A A0 94
+    uint8_t adc_buffer[ADC_DATA_BYTES]; // Buffer temporal para los datos del ADC
 
     // Leer del último buffer de ADC completado y seguro
     uint8_t last_adc_idx = (adc_buf_write_idx == 0) ? (ADC_BUFFER_SIZE - 1) : (adc_buf_write_idx - 1);
@@ -399,33 +410,41 @@ void DecodeCMD(struct UNERBUSHandle *aBus, uint8_t iStartData)
     UNERBUS_Write(aBus, adc_buffer, ADC_DATA_BYTES);
     length = UNERBUS_CMD_ID_SIZE + ADC_DATA_BYTES; // 1 (CMD) + 16 (datos)
     break;
+  case CMD_MPU_CALIBRATE:             // Calibrar el MPU6050
+    MPU6050_Calibrate(&hmpu, 200);    // Calibrar con 200 muestras (ajustable)
+    UNERBUS_WriteByte(aBus, CMD_ACK); // Confirmar calibración
+    length = UNERBUS_CMD_ID_SIZE + UNERBUS_ACK_SIZE;
+    break;
   case CMD_UART_BYPASS_CONTROL:           // UART_BYPASS_CONTROL - Activar/desactivar bypass
     UART_BYPASS = UNERBUS_GetUInt8(aBus); // 0 o 1
     UNERBUS_WriteByte(aBus, UART_BYPASS); // Confirmar estado
     length = UNERBUS_CMD_ID_SIZE + UNERBUS_BYPASS_STATUS_SIZE;
     break;
-  case CMD_MPU:             // Enviar datos del MPU6050 55 4E 45 52 02 3A A2 96
+  case CMD_MPU: // Enviar datos del MPU6050 calibrados
+  {
     uint8_t mpu_buffer[MPU_RAW_DATA_SIZE]; // Buffer para datos del MPU
+    int16_t ax, ay, az, gx, gy, gz;
+    MPU6050_GetCalibratedData(&hmpu, &ax, &ay, &az, &gx, &gy, &gz);
 
-    // Convertir datos raw a bytes (Little Endian)
-    mpu_buffer[idx++] = (uint8_t)(hmpu.raw_data.accel_x_raw & 0xFF);
-    mpu_buffer[idx++] = (uint8_t)((hmpu.raw_data.accel_x_raw >> 8) & 0xFF);
-    mpu_buffer[idx++] = (uint8_t)(hmpu.raw_data.accel_y_raw & 0xFF);
-    mpu_buffer[idx++] = (uint8_t)((hmpu.raw_data.accel_y_raw >> 8) & 0xFF);
-    mpu_buffer[idx++] = (uint8_t)(hmpu.raw_data.accel_z_raw & 0xFF);
-    mpu_buffer[idx++] = (uint8_t)((hmpu.raw_data.accel_z_raw >> 8) & 0xFF);
+    mpu_buffer[idx++] = (uint8_t)(ax & 0xFF);
+    mpu_buffer[idx++] = (uint8_t)((ax >> 8) & 0xFF);
+    mpu_buffer[idx++] = (uint8_t)(ay & 0xFF);
+    mpu_buffer[idx++] = (uint8_t)((ay >> 8) & 0xFF);
+    mpu_buffer[idx++] = (uint8_t)(az & 0xFF);
+    mpu_buffer[idx++] = (uint8_t)((az >> 8) & 0xFF);
     mpu_buffer[idx++] = (uint8_t)(hmpu.raw_data.temp_raw & 0xFF);
     mpu_buffer[idx++] = (uint8_t)((hmpu.raw_data.temp_raw >> 8) & 0xFF);
-    mpu_buffer[idx++] = (uint8_t)(hmpu.raw_data.gyro_x_raw & 0xFF);
-    mpu_buffer[idx++] = (uint8_t)((hmpu.raw_data.gyro_x_raw >> 8) & 0xFF);
-    mpu_buffer[idx++] = (uint8_t)(hmpu.raw_data.gyro_y_raw & 0xFF);
-    mpu_buffer[idx++] = (uint8_t)((hmpu.raw_data.gyro_y_raw >> 8) & 0xFF);
-    mpu_buffer[idx++] = (uint8_t)(hmpu.raw_data.gyro_z_raw & 0xFF);
-    mpu_buffer[idx++] = (uint8_t)((hmpu.raw_data.gyro_z_raw >> 8) & 0xFF);
+    mpu_buffer[idx++] = (uint8_t)(gx & 0xFF);
+    mpu_buffer[idx++] = (uint8_t)((gx >> 8) & 0xFF);
+    mpu_buffer[idx++] = (uint8_t)(gy & 0xFF);
+    mpu_buffer[idx++] = (uint8_t)((gy >> 8) & 0xFF);
+    mpu_buffer[idx++] = (uint8_t)(gz & 0xFF);
+    mpu_buffer[idx++] = (uint8_t)((gz >> 8) & 0xFF);
 
     UNERBUS_Write(aBus, mpu_buffer, MPU_RAW_DATA_SIZE);
     length = UNERBUS_CMD_ID_SIZE + MPU_RAW_DATA_SIZE; // 1 (CMD) + 14 (datos)
-    break;
+  }
+  break;
   case CMD_SET_PWM_MOTORES: // Control de PWM de motores
     // Recibir 4 valores uint16_t (8 bytes) para los 4 canales PWM
     uint8_t pwm_response[UNERBUS_PWM_RESPONSE_STATUS_SIZE + PWM_DATA_BYTES]; // Buffer para respuesta (1 byte status + 8 bytes valores actuales)
@@ -456,7 +475,7 @@ void DecodeCMD(struct UNERBUSHandle *aBus, uint8_t iStartData)
     UNERBUS_Write(aBus, pwm_response, UNERBUS_PWM_RESPONSE_STATUS_SIZE + PWM_DATA_BYTES);
     length = UNERBUS_CMD_ID_SIZE + UNERBUS_PWM_RESPONSE_STATUS_SIZE + PWM_DATA_BYTES; // 1 (CMD) + 9 (status + datos)
     break;
-  case CMD_GET_PWM_MOTORES:        // Obtener valores PWM actuales
+  case CMD_GET_PWM_MOTORES:                     // Obtener valores PWM actuales
     uint8_t pwm_current_buffer[PWM_DATA_BYTES]; // Buffer para valores actuales
 
     // Convertir valores actuales a bytes (Little Endian)
@@ -528,6 +547,24 @@ void Do100ms()
 
   if (timeout_alive_udp)
     timeout_alive_udp--;
+
+  /* Prueba SSD1306: mostrar texto variable */
+  static uint32_t test_counter = 1;
+  char test_str[16];
+
+  // Limpiar buffer
+  for (uint16_t i = 0; i < SSD1306_BUFFER_SIZE; i++)
+    hssd.buffer[i] = 0x00;
+
+  // Formatear texto: "TEST <contador>"
+  snprintf(test_str, sizeof(test_str), "TEST %lu", test_counter);
+  SSD1306_DrawText(&hssd, 10, 10, test_str);
+
+  // Incrementar contador
+  test_counter++;
+
+  // Solicitar actualización de pantalla (no bloqueante)
+  hssd.update = true;
 }
 
 void USB_ReceiveData(uint8_t *buf, uint16_t len)
@@ -620,6 +657,23 @@ int8_t I2C_DevicesInit(void)
   {
     verificacion = verificacion * (-1);
     IndicateError(verificacion, I2C_INIT_ERROR_BLINK_DELAY_MS);
+    Error_Handler();
+  }
+
+  // SSD1306: Set up function pointers and context
+  hssd.i2c_write_blocking = I2C_WriteBlocking;
+  hssd.i2c_write_dma = I2C_WriteDMA;
+  hssd.delay_ms = HAL_Delay;
+  hssd.i2c_context = &hi2c2;
+  hssd.device_address = 0x3C << 1; // Typical SSD1306 I2C address
+  hssd.is_initialized = false;
+  hssd.dma_busy = false;
+  hssd.update = false;
+
+  // SSD1306: Initialize display
+  if (SSD1306_Init(&hssd) != SSD1306_OK)
+  {
+    IndicateError(3, 500);
     Error_Handler();
   }
 
@@ -839,6 +893,8 @@ int main(void)
 
   I2C_DevicesInit();
 
+  SSD1306_UpdateScreen_DMA(&hssd, NULL);
+
   HAL_Delay(DEVICE_INIT_DELAY_MS);
 
   /* UART */
@@ -873,6 +929,19 @@ int main(void)
 
     ManageMpuReading();
 
+    if (hssd.update && HAL_I2C_GetState(&hi2c2) == HAL_I2C_STATE_READY && !hssd.dma_busy)
+    {
+      hssd.update = false; // Limpiar la solicitud de actualización
+
+      // Iniciar la actualización de pantalla SSD1306
+      if (SSD1306_UpdateScreen_DMA(&hssd, NULL) == SSD1306_ERROR)
+      {
+        // Error al iniciar la actualización de pantalla. Indicar error y detener.
+        IndicateError(5, 400);
+        Error_Handler();
+      }
+    }
+
     if (!time_100ms)
       Do100ms();
 
@@ -886,6 +955,7 @@ int main(void)
     UNERBUS_Task(&unerbus_esp01_handle);
 
     UNERBUS_Task(&unerbus_pc_handle);
+    // ...existing code...
   }
   /* USER CODE END 3 */
 }

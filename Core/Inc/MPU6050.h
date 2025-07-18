@@ -86,6 +86,14 @@ typedef struct
     uint8_t is_connected;
     uint8_t dma_busy;
 
+    // Offsets de calibración
+    int16_t accel_offset_x;
+    int16_t accel_offset_y;
+    int16_t accel_offset_z;
+    int16_t gyro_offset_x;
+    int16_t gyro_offset_y;
+    int16_t gyro_offset_z;
+
     // Punteros a funciones I2C (desacoplamiento)
     int8_t (*i2c_write_blocking)(uint8_t device_addr, uint8_t reg_addr, uint8_t *data, uint16_t data_len, void *context);
     int8_t (*i2c_read_blocking)(uint8_t device_addr, uint8_t reg_addr, uint8_t *data, uint16_t data_len, void *context);
@@ -105,3 +113,7 @@ typedef struct
 
 int8_t MPU6050_Init(MPU6050_HandleTypeDef *hmpu);
 int8_t MPU6050_ReadRawDataDMA(MPU6050_HandleTypeDef *hmpu);
+
+// Calibración y lectura calibrada
+void MPU6050_Calibrate(MPU6050_HandleTypeDef *hmpu, uint16_t samples);
+void MPU6050_GetCalibratedData(MPU6050_HandleTypeDef *hmpu, int16_t *ax, int16_t *ay, int16_t *az, int16_t *gx, int16_t *gy, int16_t *gz);

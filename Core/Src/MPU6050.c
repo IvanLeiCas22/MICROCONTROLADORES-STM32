@@ -91,3 +91,55 @@ int8_t MPU6050_ReadRawDataDMA(MPU6050_HandleTypeDef *hmpu)
 
     return MPU6050_OK;
 }
+
+// Calibración: promedia N lecturas en reposo y guarda los offsets
+void MPU6050_Calibrate(MPU6050_HandleTypeDef *hmpu, uint16_t samples)
+{
+    int32_t ax = 0, ay = 0, az = 0, gx = 0, gy = 0, gz = 0;
+    for (uint16_t i = 0; i < samples; i++)
+    {
+        // Leer datos crudos (blocking)
+        uint8_t buf[14];
+        if (hmpu->i2c_read_blocking(hmpu->device_address, MPU6050_ACCEL_XOUT_H_ADDR, buf, 14, hmpu->i2c_context) == MPU6050_OK)
+        {
+            int16_t accel_x = (int16_t)((buf[0] << 8) | buf[1]);
+            int16_t accel_y = (int16_t)((buf[2] << 8) | buf[3]);
+            int16_t accel_z = (int16_t)((buf[4] << 8) | buf[5]);
+            int16_t gyro_x = (int16_t)((buf[8] << 8) | buf[9]);
+            int16_t gyro_y = (int16_t)((buf[10] << 8) | buf[11]);
+            int16_t gyro_z = (int16_t)((buf[12] << 8) | buf[13]);
+            ax += accel_x;
+            ay += accel_y;
+            az += accel_z;
+            gx += gyro_x;
+            gy += gyro_y;
+            gz += gyro_z;
+        }
+        if (hmpu->delay_ms)
+            hmpu->delay_ms(2);
+    }
+    hmpu->accel_offset_x = (int16_t)(ax / samples);
+    hmpu->accel_offset_y = (int16_t)(ay / samples);
+    // Para Z, restar 1g (depende del rango, para 2g: 16384)
+    hmpu->accel_offset_z = (int16_t)((az / samples) - 16384);
+    hmpu->gyro_offset_x = (int16_t)(gx / samples);
+    hmpu->gyro_offset_y = (int16_t)(gy / samples);
+    hmpu->gyro_offset_z = (int16_t)(gz / samples);
+}
+
+// Devuelve los datos calibrados (resta los offsets)
+void MPU6050_GetCalibratedData(MPU6050_HandleTypeDef *hmpu, int16_t *ax, int16_t *ay, int16_t *az, int16_t *gx, int16_t *gy, int16_t *gz)
+{
+    if (ax)
+        *ax = hmpu->raw_data.accel_x_raw - hmpu->accel_offset_x;
+    if (ay)
+        *ay = hmpu->raw_data.accel_y_raw - hmpu->accel_offset_y;
+    if (az)
+        *az = hmpu->raw_data.accel_z_raw - hmpu->accel_offset_z;
+    if (gx)
+        *gx = hmpu->raw_data.gyro_x_raw - hmpu->gyro_offset_x;
+    if (gy)
+        *gy = hmpu->raw_data.gyro_y_raw - hmpu->gyro_offset_y;
+    if (gz)
+        *gz = hmpu->raw_data.gyro_z_raw - hmpu->gyro_offset_z;
+}
