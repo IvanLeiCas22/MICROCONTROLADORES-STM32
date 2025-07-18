@@ -30,7 +30,6 @@
 #include "UNERBUS.h"
 #include "MPU6050.h"
 #include "BUTTONS.h"
-// ...existing code...
 #include "SSD1306.h"
 /* USER CODE END Includes */
 
@@ -100,6 +99,7 @@ typedef union
 #define ON10MS flags0.bit.b0
 #define UART_BYPASS flags0.bit.b1
 #define MPU_READ_REQUEST flags0.bit.b2
+#define SSD_UPDATE_REQUEST flags0.bit.b3
 
 /* MPU6050 */
 #define MPU_DMA_BUFFER_SIZE 14
@@ -310,12 +310,7 @@ void HAL_I2C_MemTxCpltCallback(I2C_HandleTypeDef *hi2c)
   if (hi2c == &hi2c2)
   {
     hssd.dma_busy = false;
-    // Call user callback if set
-    if (hssd.update_done_cb)
-    {
-      hssd.update_done_cb(&hssd);
-      hssd.update_done_cb = NULL;
-    }
+    // Callback removed: nothing else to do
   }
 }
 
@@ -552,19 +547,15 @@ void Do100ms()
   static uint32_t test_counter = 1;
   char test_str[16];
 
-  // Limpiar buffer
-  for (uint16_t i = 0; i < SSD1306_BUFFER_SIZE; i++)
-    hssd.buffer[i] = 0x00;
-
   // Formatear texto: "TEST <contador>"
   snprintf(test_str, sizeof(test_str), "TEST %lu", test_counter);
-  SSD1306_DrawText(&hssd, 10, 10, test_str);
+  SSD1306_DrawText(&hssd, 10, 10, test_str, SSD1306_TEXT_ALIGN_LEFT);
 
   // Incrementar contador
   test_counter++;
 
   // Solicitar actualización de pantalla (no bloqueante)
-  hssd.update = true;
+  SSD_UPDATE_REQUEST = true;
 }
 
 void USB_ReceiveData(uint8_t *buf, uint16_t len)
@@ -651,6 +642,7 @@ int8_t I2C_DevicesInit(void)
   hmpu.is_initialized = false;
   hmpu.is_connected = false;
   hmpu.dma_busy = false;
+  MPU_READ_REQUEST = false;
 
   verificacion = MPU6050_Init(&hmpu);
   if (verificacion != 1)
@@ -668,7 +660,7 @@ int8_t I2C_DevicesInit(void)
   hssd.device_address = 0x3C << 1; // Typical SSD1306 I2C address
   hssd.is_initialized = false;
   hssd.dma_busy = false;
-  hssd.update = false;
+  SSD_UPDATE_REQUEST = false;
 
   // SSD1306: Initialize display
   if (SSD1306_Init(&hssd) != SSD1306_OK)
@@ -893,7 +885,7 @@ int main(void)
 
   I2C_DevicesInit();
 
-  SSD1306_UpdateScreen_DMA(&hssd, NULL);
+  SSD1306_UpdateScreen_DMA(&hssd);
 
   HAL_Delay(DEVICE_INIT_DELAY_MS);
 
@@ -903,7 +895,6 @@ int main(void)
   /* Flags */
   ON10MS = false;
   UART_BYPASS = true;
-  MPU_READ_REQUEST = false;
 
   /* USER CODE END 2 */
 
@@ -929,12 +920,12 @@ int main(void)
 
     ManageMpuReading();
 
-    if (hssd.update && HAL_I2C_GetState(&hi2c2) == HAL_I2C_STATE_READY && !hssd.dma_busy)
+    if (SSD_UPDATE_REQUEST && HAL_I2C_GetState(&hi2c2) == HAL_I2C_STATE_READY && !hssd.dma_busy)
     {
-      hssd.update = false; // Limpiar la solicitud de actualización
+      SSD_UPDATE_REQUEST = false; // Limpiar la solicitud de actualización
 
       // Iniciar la actualización de pantalla SSD1306
-      if (SSD1306_UpdateScreen_DMA(&hssd, NULL) == SSD1306_ERROR)
+      if (SSD1306_UpdateScreen_DMA(&hssd) == SSD1306_ERROR)
       {
         // Error al iniciar la actualización de pantalla. Indicar error y detener.
         IndicateError(5, 400);

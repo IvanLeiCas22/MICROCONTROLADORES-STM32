@@ -11,6 +11,9 @@
 
 #include "SSD1306.h"
 #include <stddef.h>
+#include <string.h>
+#include <stdint.h>
+#include <stdbool.h>
 
 // Internal SSD1306 commands
 #define SSD1306_CMD_DISPLAY_OFF 0xAE
@@ -34,6 +37,9 @@
 #define SSD1306_CMD_SET_PAGE_ADDR 0xB0
 #define SSD1306_CMD_SET_COL_LOW 0x00
 #define SSD1306_CMD_SET_COL_HIGH 0x10
+
+#define SSD1306_BYTE_INDEX(x, y) ((x) + ((y) / 8) * SSD1306_WIDTH)
+#define SSD1306_BIT_MASK(y) (1 << ((y) % 8))
 
 // 5x7 ASCII font (characters 32-127)
 static const uint8_t font_5x7[96][5] = {
@@ -134,213 +140,171 @@ static const uint8_t font_5x7[96][5] = {
     {0x08, 0x08, 0x2A, 0x1C, 0x08}, // '~'
 };
 
-/**
- * @brief  Envía un comando al display SSD1306 (bloqueante)
- * @param  hssd: puntero al handle SSD1306
- * @param  cmd: comando a enviar
- * @retval SSD1306_OK si éxito, SSD1306_ERROR si falla
- */
-static int8_t SSD1306_WriteCommand(SSD1306_HandleTypeDef *hssd, uint8_t cmd)
-{
-    if (!hssd || !hssd->i2c_write_blocking)
-        return SSD1306_ERROR;
-    return hssd->i2c_write_blocking(hssd->device_address, 0x00, &cmd, 1, hssd->i2c_context);
-}
-
-/**
- * @brief  Inicializa el display SSD1306
- * @param  hssd: puntero al handle SSD1306
- * @retval SSD1306_OK si éxito, SSD1306_ERROR si falla
- * @note   Debe llamarse una sola vez tras configurar el hardware I2C y antes de cualquier operación de dibujo.
- *         El handle debe estar correctamente inicializado y los punteros a funciones asignados.
- *         Compatible con STM32CubeIDE: colocar llamada en bloque USER CODE BEGIN
- */
-
 int8_t SSD1306_Init(SSD1306_HandleTypeDef *hssd)
 {
-    // Validate handle and required function pointers
-    if (hssd == NULL)
-        return SSD1306_ERROR;
-    if (hssd->i2c_write_blocking == NULL || hssd->delay_ms == NULL)
+    if (hssd == NULL || hssd->i2c_write_blocking == NULL || hssd->delay_ms == NULL)
         return SSD1306_ERROR;
 
     hssd->dma_busy = false;
     hssd->is_initialized = false;
-    // Initialization sequence (blocking)
-    if (SSD1306_WriteCommand(hssd, SSD1306_CMD_DISPLAY_OFF) != SSD1306_OK)
+
+    // Agrupar comandos de inicialización en un bloque único
+    const uint8_t init_commands[] = {
+        SSD1306_CMD_DISPLAY_OFF,
+        SSD1306_CMD_SET_DISPLAY_CLOCK_DIV, 0x80,
+        SSD1306_CMD_SET_MULTIPLEX, 0x3F,
+        SSD1306_CMD_SET_DISPLAY_OFFSET, 0x00,
+        SSD1306_CMD_SET_START_LINE | 0x00,
+        SSD1306_CMD_SET_CHARGE_PUMP, 0x14,
+        SSD1306_CMD_SET_MEMORY_MODE, 0x00,
+        SSD1306_CMD_SET_SEG_REMAP | 0x01,
+        SSD1306_CMD_SET_COM_SCAN_DEC,
+        SSD1306_CMD_SET_COM_PINS, 0x12,
+        SSD1306_CMD_SET_CONTRAST, 0xCF,
+        SSD1306_CMD_SET_PRECHARGE, 0xF1,
+        SSD1306_CMD_SET_VCOM_DETECT, 0x40,
+        SSD1306_CMD_SET_DISPLAY_ALL_ON_RESUME,
+        SSD1306_CMD_SET_NORMAL_DISPLAY,
+        SSD1306_CMD_DISPLAY_ON};
+
+    // Enviar todos los comandos en un solo bloque
+    if (hssd->i2c_write_blocking(hssd->device_address, 0x00, (uint8_t *)init_commands, sizeof(init_commands), hssd->i2c_context) != SSD1306_OK)
         return SSD1306_ERROR;
-    if (SSD1306_WriteCommand(hssd, SSD1306_CMD_SET_DISPLAY_CLOCK_DIV) != SSD1306_OK)
-        return SSD1306_ERROR;
-    if (SSD1306_WriteCommand(hssd, 0x80) != SSD1306_OK)
-        return SSD1306_ERROR;
-    if (SSD1306_WriteCommand(hssd, SSD1306_CMD_SET_MULTIPLEX) != SSD1306_OK)
-        return SSD1306_ERROR;
-    if (SSD1306_WriteCommand(hssd, SSD1306_HEIGHT - 1) != SSD1306_OK)
-        return SSD1306_ERROR;
-    if (SSD1306_WriteCommand(hssd, SSD1306_CMD_SET_DISPLAY_OFFSET) != SSD1306_OK)
-        return SSD1306_ERROR;
-    if (SSD1306_WriteCommand(hssd, 0x00) != SSD1306_OK)
-        return SSD1306_ERROR;
-    if (SSD1306_WriteCommand(hssd, SSD1306_CMD_SET_START_LINE | 0x00) != SSD1306_OK)
-        return SSD1306_ERROR;
-    if (SSD1306_WriteCommand(hssd, SSD1306_CMD_SET_CHARGE_PUMP) != SSD1306_OK)
-        return SSD1306_ERROR;
-    if (SSD1306_WriteCommand(hssd, 0x14) != SSD1306_OK)
-        return SSD1306_ERROR;
-    if (SSD1306_WriteCommand(hssd, SSD1306_CMD_SET_MEMORY_MODE) != SSD1306_OK)
-        return SSD1306_ERROR;
-    if (SSD1306_WriteCommand(hssd, 0x00) != SSD1306_OK)
-        return SSD1306_ERROR;
-    if (SSD1306_WriteCommand(hssd, SSD1306_CMD_SET_SEG_REMAP | 0x01) != SSD1306_OK)
-        return SSD1306_ERROR;
-    if (SSD1306_WriteCommand(hssd, SSD1306_CMD_SET_COM_SCAN_DEC) != SSD1306_OK)
-        return SSD1306_ERROR;
-    if (SSD1306_WriteCommand(hssd, SSD1306_CMD_SET_COM_PINS) != SSD1306_OK)
-        return SSD1306_ERROR;
-    if (SSD1306_WriteCommand(hssd, 0x12) != SSD1306_OK)
-        return SSD1306_ERROR;
-    if (SSD1306_WriteCommand(hssd, SSD1306_CMD_SET_CONTRAST) != SSD1306_OK)
-        return SSD1306_ERROR;
-    if (SSD1306_WriteCommand(hssd, 0xCF) != SSD1306_OK)
-        return SSD1306_ERROR;
-    if (SSD1306_WriteCommand(hssd, SSD1306_CMD_SET_PRECHARGE) != SSD1306_OK)
-        return SSD1306_ERROR;
-    if (SSD1306_WriteCommand(hssd, 0xF1) != SSD1306_OK)
-        return SSD1306_ERROR;
-    if (SSD1306_WriteCommand(hssd, SSD1306_CMD_SET_VCOM_DETECT) != SSD1306_OK)
-        return SSD1306_ERROR;
-    if (SSD1306_WriteCommand(hssd, 0x40) != SSD1306_OK)
-        return SSD1306_ERROR;
-    if (SSD1306_WriteCommand(hssd, SSD1306_CMD_SET_DISPLAY_ALL_ON_RESUME) != SSD1306_OK)
-        return SSD1306_ERROR;
-    if (SSD1306_WriteCommand(hssd, SSD1306_CMD_SET_NORMAL_DISPLAY) != SSD1306_OK)
-        return SSD1306_ERROR;
-    if (SSD1306_WriteCommand(hssd, SSD1306_CMD_DISPLAY_ON) != SSD1306_OK)
-        return SSD1306_ERROR;
-    // Clear buffer
-    for (uint16_t i = 0; i < SSD1306_BUFFER_SIZE; i++)
-        hssd->buffer[i] = 0x00;
+
+    // Limpiar buffer
+    memset(hssd->buffer, 0x00, SSD1306_BUFFER_SIZE);
     hssd->is_initialized = true;
     return SSD1306_OK;
 }
 
-/**
- * @brief  Dibuja un pixel en el buffer del display
- * @param  hssd: puntero al handle SSD1306
- * @param  x, y: coordenadas
- * @param  color: true=encendido, false=apagado
- * @retval SSD1306_OK si éxito, SSD1306_ERROR si fuera de rango
- * @note   No actualiza el display; requiere llamada a SSD1306_UpdateScreen_DMA para reflejar cambios.
- *         Si las coordenadas están fuera de rango, no modifica el buffer y retorna error.
- */
 int8_t SSD1306_DrawPixel(SSD1306_HandleTypeDef *hssd, uint8_t x, uint8_t y, bool color)
 {
-    // Validate handle
-    if (hssd == NULL)
+    if (hssd == NULL || !hssd->is_initialized)
         return SSD1306_ERROR;
-    // Validate coordinates
+
+    // Validar coordenadas
     if (x >= SSD1306_WIDTH || y >= SSD1306_HEIGHT)
         return SSD1306_ERROR;
-    uint16_t byte_idx = x + (y / 8) * SSD1306_WIDTH;
-    uint8_t bit_mask = 1 << (y % 8);
+
+    uint16_t byte_idx = SSD1306_BYTE_INDEX(x, y);
+    uint8_t bit_mask = SSD1306_BIT_MASK(y);
+
     if (color)
         hssd->buffer[byte_idx] |= bit_mask;
     else
         hssd->buffer[byte_idx] &= ~bit_mask;
+
     return SSD1306_OK;
 }
 
-/**
- * @brief  Dibuja un texto ASCII en el buffer del display
- * @param  hssd: puntero al handle SSD1306
- * @param  x, y: coordenadas de inicio
- * @param  text: puntero a string ASCII
- * @retval SSD1306_OK si éxito, SSD1306_ERROR si puntero nulo
- * @note   Solo soporta caracteres ASCII 32-127. Caracteres fuera de rango se dibujan como '?'.
- *         El texto se dibuja horizontalmente y puede recortar si excede el ancho del display.
- */
-int8_t SSD1306_DrawText(SSD1306_HandleTypeDef *hssd, uint8_t x, uint8_t y, const char *text)
+// Internal fast pixel set (no validation)
+static inline void SSD1306_DrawPixel_Fast(SSD1306_HandleTypeDef *hssd, uint8_t x, uint8_t y, bool color)
 {
-    // Validate handle and text pointer
-    if (hssd == NULL || text == NULL)
+    uint16_t byte_idx = SSD1306_BYTE_INDEX(x, y);
+    uint8_t bit_mask = SSD1306_BIT_MASK(y);
+
+    if (color)
+        hssd->buffer[byte_idx] |= bit_mask;
+    else
+        hssd->buffer[byte_idx] &= ~bit_mask;
+}
+
+int8_t SSD1306_DrawText(SSD1306_HandleTypeDef *hssd, uint8_t x, uint8_t y, const char *text, SSD1306_TextAlign align)
+{
+    if (hssd == NULL || text == NULL || !hssd->is_initialized)
         return SSD1306_ERROR;
+
+    // Validar coordenadas y texto
+    if (x >= SSD1306_WIDTH || y >= SSD1306_HEIGHT || text == NULL)
+        return SSD1306_ERROR;
+
+    uint8_t text_length = strlen(text) * 6; // Cada carácter ocupa 6 píxeles
+    if (text_length > SSD1306_WIDTH)
+        return SSD1306_ERROR;
+
+    if (align == SSD1306_TEXT_ALIGN_CENTER)
+        x = (SSD1306_WIDTH - text_length) / 2;
+    else if (align == SSD1306_TEXT_ALIGN_RIGHT)
+        x = SSD1306_WIDTH - text_length;
+
     uint8_t cursor_x = x;
-    while (*text && cursor_x < SSD1306_WIDTH)
+    uint8_t max_chars = (SSD1306_WIDTH - x) / 6;
+    uint8_t i = 0;
+    while (*text && cursor_x < SSD1306_WIDTH && i < max_chars)
     {
         char c = *text;
         if (c < 32 || c > 127)
-        {
-            c = '?'; // Replace unsupported characters
-        }
+            c = '?';
         const uint8_t *glyph = font_5x7[c - 32];
         for (uint8_t dx = 0; dx < 5 && (cursor_x + dx) < SSD1306_WIDTH; dx++)
         {
             uint8_t col = glyph[dx];
             for (uint8_t dy = 0; dy < 7 && (y + dy) < SSD1306_HEIGHT; dy++)
             {
-                bool pixel_on = (col >> dy) & 0x01;
-                SSD1306_DrawPixel(hssd, cursor_x + dx, y + dy, pixel_on);
+                bool pixel_on = ((col >> dy) & 0x01);
+                SSD1306_DrawPixel_Fast(hssd, cursor_x + dx, y + dy, pixel_on);
             }
         }
-        cursor_x += 6; // 5px char + 1px space
+        cursor_x += 6;
         text++;
+        i++;
     }
+    if (*text)
+        return SSD1306_BUSY; // El texto fue recortado
     return SSD1306_OK;
 }
 
-/**
- * @brief  Actualiza el display usando DMA (no bloqueante)
- * @param  hssd: puntero al handle SSD1306
- * @param  update_done_cb: callback a invocar al finalizar DMA
- * @retval SSD1306_OK si éxito, SSD1306_BUSY si ya hay transferencia, SSD1306_ERROR si falla
- * @note   No bloquea la ejecución; el callback se invoca al finalizar la transferencia DMA.
- *         Si DMA está ocupado, retorna SSD1306_BUSY y no inicia nueva transferencia.
- *         Compatible con STM32CubeIDE: configurar interrupciones I2C y DMA en el archivo .ioc.
- */
-int8_t SSD1306_UpdateScreen_DMA(SSD1306_HandleTypeDef *hssd, SSD1306_UpdateDoneCallback update_done_cb)
+int8_t SSD1306_DrawMultilineText(SSD1306_HandleTypeDef *hssd, uint8_t x, uint8_t y, const char *text)
 {
-    // Validate handle, buffer, and DMA function pointer
-    if (hssd == NULL || hssd->i2c_write_dma == NULL)
+    if (hssd == NULL || text == NULL || !hssd->is_initialized)
         return SSD1306_ERROR;
-    // Defensive: Check if DMA is busy
+
+    uint8_t line_height = 8; // Altura de cada línea
+    uint8_t cursor_y = y;
+
+    while (*text && cursor_y < SSD1306_HEIGHT)
+    {
+        SSD1306_DrawText(hssd, x, cursor_y, text, SSD1306_TEXT_ALIGN_LEFT);
+        cursor_y += line_height;
+        text += SSD1306_WIDTH / 6; // Avanzar al siguiente segmento de texto
+    }
+
+    return SSD1306_OK;
+}
+
+static void SSD1306_PrepareDMABuffer(SSD1306_HandleTypeDef *hssd)
+{
+    if (hssd == NULL)
+        return;
+    memset(hssd->dma_buffer, 0, sizeof(hssd->dma_buffer));
+    hssd->dma_buffer[0] = 0x40; // Prefijo para datos
+    memcpy(&hssd->dma_buffer[1], hssd->buffer, SSD1306_BUFFER_SIZE);
+}
+
+int8_t SSD1306_UpdateScreen_DMA(SSD1306_HandleTypeDef *hssd)
+{
+    if (hssd == NULL || hssd->i2c_write_dma == NULL || !hssd->is_initialized)
+        return SSD1306_ERROR;
     if (hssd->dma_busy)
         return SSD1306_BUSY;
-    // Defensive: Check if blocking write is available
-    if (hssd->i2c_write_blocking == NULL)
-        return SSD1306_ERROR;
-    // Set column and page addresses for horizontal mode
-    uint8_t cmd;
-    cmd = 0x21; // Set column address
-    if (hssd->i2c_write_blocking(hssd->device_address, 0x00, &cmd, 1, hssd->i2c_context) != SSD1306_OK)
-        return SSD1306_ERROR;
-    cmd = 0x00; // Start column
-    if (hssd->i2c_write_blocking(hssd->device_address, 0x00, &cmd, 1, hssd->i2c_context) != SSD1306_OK)
-        return SSD1306_ERROR;
-    cmd = SSD1306_WIDTH - 1; // End column
-    if (hssd->i2c_write_blocking(hssd->device_address, 0x00, &cmd, 1, hssd->i2c_context) != SSD1306_OK)
-        return SSD1306_ERROR;
-    cmd = 0x22; // Set page address
-    if (hssd->i2c_write_blocking(hssd->device_address, 0x00, &cmd, 1, hssd->i2c_context) != SSD1306_OK)
-        return SSD1306_ERROR;
-    cmd = 0x00; // Start page
-    if (hssd->i2c_write_blocking(hssd->device_address, 0x00, &cmd, 1, hssd->i2c_context) != SSD1306_OK)
-        return SSD1306_ERROR;
-    cmd = (SSD1306_HEIGHT / 8) - 1; // End page
-    if (hssd->i2c_write_blocking(hssd->device_address, 0x00, &cmd, 1, hssd->i2c_context) != SSD1306_OK)
-        return SSD1306_ERROR;
-    // Prepare buffer for DMA (prefix 0x40)
-    static uint8_t dma_buf[SSD1306_BUFFER_SIZE + 1];
-    dma_buf[0] = 0x40;
-    for (uint16_t i = 0; i < SSD1306_BUFFER_SIZE; i++)
-        dma_buf[1 + i] = hssd->buffer[i];
+
+    const uint8_t commands[] = {
+        0x21, 0x00, SSD1306_WIDTH - 1,       // Columnas
+        0x22, 0x00, (SSD1306_HEIGHT / 8) - 1 // Páginas
+    };
+
+    for (size_t i = 0; i < sizeof(commands); i++)
+    {
+        if (hssd->i2c_write_blocking(hssd->device_address, 0x00, (uint8_t *)&commands[i], 1, hssd->i2c_context) != SSD1306_OK)
+            return SSD1306_ERROR;
+    }
+
+    SSD1306_PrepareDMABuffer(hssd);
     hssd->dma_busy = true;
-    hssd->update_done_cb = update_done_cb;
-    // Start DMA transfer (skip first byte for reg_addr)
-    int8_t res = hssd->i2c_write_dma(hssd->device_address, dma_buf[0], &dma_buf[1], SSD1306_BUFFER_SIZE, hssd->i2c_context);
+    int8_t res = hssd->i2c_write_dma(hssd->device_address, hssd->dma_buffer[0], &hssd->dma_buffer[1], SSD1306_BUFFER_SIZE, hssd->i2c_context);
     if (res != SSD1306_OK)
     {
         hssd->dma_busy = false;
-        hssd->update_done_cb = NULL;
         return SSD1306_ERROR;
     }
     return SSD1306_OK;
