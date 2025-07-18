@@ -1,21 +1,14 @@
-/*
- * SSD1306.c - OLED Display Library Implementation (BeastMode compliant)
- * -------------------------------------------------------------
- * - Hardware-agnostic, robust, non-blocking, no float, explicit types
- * - Compatible with STM32CubeIDE, solo .h/.c, modular
- * - Uso de DMA para transferencias no bloqueantes
- * - Manejo robusto de errores y flags
- * - Abstracción total de hardware mediante punteros a funciones
- * -------------------------------------------------------------
+/**
+ * @file SSD1306.c
+ * @brief OLED SSD1306 Display Library Implementation (Robot Seguidor de Laberinto)
+ * @author GitHub Copilot
  */
 
 #include "SSD1306.h"
-#include <stddef.h>
 #include <string.h>
-#include <stdint.h>
-#include <stdbool.h>
+#include <stddef.h>
 
-// Internal SSD1306 commands
+/* Internal SSD1306 commands */
 #define SSD1306_CMD_DISPLAY_OFF 0xAE
 #define SSD1306_CMD_DISPLAY_ON 0xAF
 #define SSD1306_CMD_SET_CONTRAST 0x81
@@ -38,10 +31,10 @@
 #define SSD1306_CMD_SET_COL_LOW 0x00
 #define SSD1306_CMD_SET_COL_HIGH 0x10
 
-#define SSD1306_BYTE_INDEX(x, y) ((x) + ((y) / 8) * SSD1306_WIDTH)
+#define SSD1306_BYTE_INDEX(x, y) (((y) / 8) * SSD1306_WIDTH + (x))
 #define SSD1306_BIT_MASK(y) (1 << ((y) % 8))
 
-// 5x7 ASCII font (characters 32-127)
+/* 5x7 ASCII font (characters 32-127) */
 static const uint8_t font_5x7[96][5] = {
     {0x00, 0x00, 0x00, 0x00, 0x00}, // ' '
     {0x00, 0x00, 0x5F, 0x00, 0x00}, // '!'
@@ -138,21 +131,19 @@ static const uint8_t font_5x7[96][5] = {
     {0x00, 0x00, 0x7F, 0x00, 0x00}, // '|'
     {0x00, 0x41, 0x36, 0x08, 0x00}, // '}'
     {0x08, 0x08, 0x2A, 0x1C, 0x08}, // '~'
+    // ... font data ...
 };
+
+/* Public API implementation */
 
 int8_t SSD1306_Init(SSD1306_HandleTypeDef *hssd)
 {
-    if (hssd == NULL || hssd->i2c_write_blocking == NULL || hssd->delay_ms == NULL)
+    if (hssd == NULL || hssd->i2c_write_blocking == NULL)
         return SSD1306_ERROR;
-
-    hssd->dma_busy = false;
-    hssd->is_initialized = false;
-
-    // Agrupar comandos de inicialización en un bloque único
-    const uint8_t init_commands[] = {
+    uint8_t cmds[] = {
         SSD1306_CMD_DISPLAY_OFF,
         SSD1306_CMD_SET_DISPLAY_CLOCK_DIV, 0x80,
-        SSD1306_CMD_SET_MULTIPLEX, 0x3F,
+        SSD1306_CMD_SET_MULTIPLEX, SSD1306_HEIGHT - 1,
         SSD1306_CMD_SET_DISPLAY_OFFSET, 0x00,
         SSD1306_CMD_SET_START_LINE | 0x00,
         SSD1306_CMD_SET_CHARGE_PUMP, 0x14,
@@ -166,146 +157,256 @@ int8_t SSD1306_Init(SSD1306_HandleTypeDef *hssd)
         SSD1306_CMD_SET_DISPLAY_ALL_ON_RESUME,
         SSD1306_CMD_SET_NORMAL_DISPLAY,
         SSD1306_CMD_DISPLAY_ON};
-
-    // Enviar todos los comandos en un solo bloque
-    if (hssd->i2c_write_blocking(hssd->device_address, 0x00, (uint8_t *)init_commands, sizeof(init_commands), hssd->i2c_context) != SSD1306_OK)
-        return SSD1306_ERROR;
-
-    // Limpiar buffer
+    for (uint8_t i = 0; i < sizeof(cmds); i++)
+    {
+        if (hssd->i2c_write_blocking(hssd->device_address, 0x00, &cmds[i], 1, hssd->i2c_context) != SSD1306_OK)
+            return SSD1306_ERROR;
+    }
     memset(hssd->buffer, 0x00, SSD1306_BUFFER_SIZE);
+
+    SSD1306_SetFont(hssd, &font_5x7[0][0], 5, 7);
+
     hssd->is_initialized = true;
     return SSD1306_OK;
 }
 
 int8_t SSD1306_DrawPixel(SSD1306_HandleTypeDef *hssd, uint8_t x, uint8_t y, bool color)
 {
-    if (hssd == NULL || !hssd->is_initialized)
+    if (!hssd || !hssd->is_initialized)
         return SSD1306_ERROR;
-
-    // Validar coordenadas
     if (x >= SSD1306_WIDTH || y >= SSD1306_HEIGHT)
         return SSD1306_ERROR;
-
-    uint16_t byte_idx = SSD1306_BYTE_INDEX(x, y);
-    uint8_t bit_mask = SSD1306_BIT_MASK(y);
-
+    uint16_t idx = SSD1306_BYTE_INDEX(x, y);
     if (color)
-        hssd->buffer[byte_idx] |= bit_mask;
+        hssd->buffer[idx] |= SSD1306_BIT_MASK(y);
     else
-        hssd->buffer[byte_idx] &= ~bit_mask;
-
+        hssd->buffer[idx] &= ~SSD1306_BIT_MASK(y);
     return SSD1306_OK;
 }
 
-// Internal fast pixel set (no validation)
-static inline void SSD1306_DrawPixel_Fast(SSD1306_HandleTypeDef *hssd, uint8_t x, uint8_t y, bool color)
+int8_t SSD1306_DrawLine(SSD1306_HandleTypeDef *hssd, uint8_t x0, uint8_t y0, uint8_t x1, uint8_t y1, bool color)
 {
-    uint16_t byte_idx = SSD1306_BYTE_INDEX(x, y);
-    uint8_t bit_mask = SSD1306_BIT_MASK(y);
+    int16_t dx = (x1 > x0) ? (x1 - x0) : (x0 - x1);
+    int16_t dy = (y1 > y0) ? (y1 - y0) : (y0 - y1);
+    int16_t sx = (x0 < x1) ? 1 : -1;
+    int16_t sy = (y0 < y1) ? 1 : -1;
+    int16_t err = dx - dy;
+    while (1)
+    {
+        SSD1306_DrawPixel(hssd, x0, y0, color);
+        if (x0 == x1 && y0 == y1)
+            break;
+        int16_t e2 = 2 * err;
+        if (e2 > -dy)
+        {
+            err -= dy;
+            x0 += sx;
+        }
+        if (e2 < dx)
+        {
+            err += dx;
+            y0 += sy;
+        }
+    }
+    return SSD1306_OK;
+}
 
-    if (color)
-        hssd->buffer[byte_idx] |= bit_mask;
-    else
-        hssd->buffer[byte_idx] &= ~bit_mask;
+int8_t SSD1306_DrawRect(SSD1306_HandleTypeDef *hssd, uint8_t x, uint8_t y, uint8_t w, uint8_t h, bool color)
+{
+    SSD1306_DrawLine(hssd, x, y, x + w - 1, y, color);
+    SSD1306_DrawLine(hssd, x, y + h - 1, x + w - 1, y + h - 1, color);
+    SSD1306_DrawLine(hssd, x, y, x, y + h - 1, color);
+    SSD1306_DrawLine(hssd, x + w - 1, y, x + w - 1, y + h - 1, color);
+    return SSD1306_OK;
+}
+
+int8_t SSD1306_DrawBitmap(SSD1306_HandleTypeDef *hssd, uint8_t x, uint8_t y, const uint8_t *bitmap, uint8_t w, uint8_t h)
+{
+    if (!hssd || !bitmap)
+        return SSD1306_ERROR;
+    for (uint8_t j = 0; j < h; j++)
+    {
+        for (uint8_t i = 0; i < w; i++)
+        {
+            uint8_t byte = bitmap[i + (j / 8) * w];
+            if (byte & (1 << (j % 8)))
+                SSD1306_DrawPixel(hssd, x + i, y + j, true);
+            else
+                SSD1306_DrawPixel(hssd, x + i, y + j, false);
+        }
+    }
+    return SSD1306_OK;
 }
 
 int8_t SSD1306_DrawText(SSD1306_HandleTypeDef *hssd, uint8_t x, uint8_t y, const char *text, SSD1306_TextAlign align)
 {
-    if (hssd == NULL || text == NULL || !hssd->is_initialized)
+    if (!hssd || !text || !hssd->font)
         return SSD1306_ERROR;
 
-    // Validar coordenadas y texto
-    if (x >= SSD1306_WIDTH || y >= SSD1306_HEIGHT || text == NULL)
-        return SSD1306_ERROR;
-
-    uint8_t text_length = strlen(text) * 6; // Cada carácter ocupa 6 píxeles
-    if (text_length > SSD1306_WIDTH)
-        return SSD1306_ERROR;
+    uint8_t char_width_spacing = hssd->font_width + 1; // Ancho del caracter + 1 píxel de espacio
+    uint16_t text_len = strlen(text);
+    uint16_t text_width = text_len * char_width_spacing;
+    int16_t start_x = x;
 
     if (align == SSD1306_TEXT_ALIGN_CENTER)
-        x = (SSD1306_WIDTH - text_length) / 2;
-    else if (align == SSD1306_TEXT_ALIGN_RIGHT)
-        x = SSD1306_WIDTH - text_length;
-
-    uint8_t cursor_x = x;
-    uint8_t max_chars = (SSD1306_WIDTH - x) / 6;
-    uint8_t i = 0;
-    while (*text && cursor_x < SSD1306_WIDTH && i < max_chars)
     {
-        char c = *text;
+        start_x = (SSD1306_WIDTH - text_width) / 2;
+    }
+    else if (align == SSD1306_TEXT_ALIGN_RIGHT)
+    {
+        start_x = SSD1306_WIDTH - text_width;
+    }
+
+    for (uint16_t i = 0; i < text_len; i++)
+    {
+        char c = text[i];
         if (c < 32 || c > 127)
             c = '?';
-        const uint8_t *glyph = font_5x7[c - 32];
-        for (uint8_t dx = 0; dx < 5 && (cursor_x + dx) < SSD1306_WIDTH; dx++)
+
+        int16_t current_char_x = start_x + (i * char_width_spacing);
+
+        // Omitir caracteres que están completamente fuera de la pantalla
+        if (current_char_x >= SSD1306_WIDTH || (current_char_x + hssd->font_width) < 0)
         {
-            uint8_t col = glyph[dx];
-            for (uint8_t dy = 0; dy < 7 && (y + dy) < SSD1306_HEIGHT; dy++)
+            continue;
+        }
+
+        const uint8_t *font_char = &hssd->font[(c - 32) * hssd->font_width];
+
+        for (uint8_t col = 0; col < hssd->font_width; col++)
+        {
+            int16_t target_x = current_char_x + col;
+            if (target_x >= SSD1306_WIDTH || target_x < 0)
+                continue; // Omitir columnas fuera de la pantalla
+
+            uint8_t font_byte = font_char[col];
+            uint8_t y_offset = y % 8;
+
+            // Máscara para limpiar el área del caracter (considerando su altura)
+            uint16_t mask = (1 << hssd->font_height) - 1;
+
+            // Desplazar datos y máscara a la posición vertical correcta
+            uint16_t shifted_data = font_byte << y_offset;
+            uint16_t shifted_mask = mask << y_offset;
+
+            uint8_t page1_data = shifted_data & 0xFF;
+            uint8_t page2_data = (shifted_data >> 8) & 0xFF;
+            uint8_t page1_mask = shifted_mask & 0xFF;
+            uint8_t page2_mask = (shifted_mask >> 8) & 0xFF;
+
+            // Escribir en la primera página afectada
+            uint16_t idx1 = (y / 8) * SSD1306_WIDTH + target_x;
+            if (idx1 < SSD1306_BUFFER_SIZE)
             {
-                bool pixel_on = ((col >> dy) & 0x01);
-                SSD1306_DrawPixel_Fast(hssd, cursor_x + dx, y + dy, pixel_on);
+                hssd->buffer[idx1] = (hssd->buffer[idx1] & ~page1_mask) | page1_data;
+            }
+
+            // Escribir en la segunda página si el caracter se extiende a ella
+            if (page2_data || page2_mask)
+            {
+                uint16_t idx2 = (y / 8 + 1) * SSD1306_WIDTH + target_x;
+                if (idx2 < SSD1306_BUFFER_SIZE)
+                {
+                    hssd->buffer[idx2] = (hssd->buffer[idx2] & ~page2_mask) | page2_data;
+                }
             }
         }
-        cursor_x += 6;
-        text++;
-        i++;
     }
-    if (*text)
-        return SSD1306_BUSY; // El texto fue recortado
     return SSD1306_OK;
 }
 
 int8_t SSD1306_DrawMultilineText(SSD1306_HandleTypeDef *hssd, uint8_t x, uint8_t y, const char *text)
 {
-    if (hssd == NULL || text == NULL || !hssd->is_initialized)
+    if (!hssd || !text)
         return SSD1306_ERROR;
-
-    uint8_t line_height = 8; // Altura de cada línea
-    uint8_t cursor_y = y;
-
-    while (*text && cursor_y < SSD1306_HEIGHT)
+    uint8_t line = 0, col = 0;
+    for (uint16_t i = 0; text[i] != '\0'; i++)
     {
-        SSD1306_DrawText(hssd, x, cursor_y, text, SSD1306_TEXT_ALIGN_LEFT);
-        cursor_y += line_height;
-        text += SSD1306_WIDTH / 6; // Avanzar al siguiente segmento de texto
+        if (text[i] == '\n' || col >= (SSD1306_WIDTH / 6))
+        {
+            line++;
+            col = 0;
+            continue;
+        }
+        SSD1306_DrawText(hssd, x + col * 6, y + line * 8, &text[i], SSD1306_TEXT_ALIGN_LEFT);
+        col++;
     }
-
     return SSD1306_OK;
-}
-
-static void SSD1306_PrepareDMABuffer(SSD1306_HandleTypeDef *hssd)
-{
-    if (hssd == NULL)
-        return;
-    memset(hssd->dma_buffer, 0, sizeof(hssd->dma_buffer));
-    hssd->dma_buffer[0] = 0x40; // Prefijo para datos
-    memcpy(&hssd->dma_buffer[1], hssd->buffer, SSD1306_BUFFER_SIZE);
 }
 
 int8_t SSD1306_UpdateScreen_DMA(SSD1306_HandleTypeDef *hssd)
 {
-    if (hssd == NULL || hssd->i2c_write_dma == NULL || !hssd->is_initialized)
-        return SSD1306_ERROR;
-    if (hssd->dma_busy)
+    if (!hssd || !hssd->i2c_write_blocking || !hssd->i2c_write_dma)
+    {
         return SSD1306_BUSY;
+    }
 
-    const uint8_t commands[] = {
-        0x21, 0x00, SSD1306_WIDTH - 1,       // Columnas
-        0x22, 0x00, (SSD1306_HEIGHT / 8) - 1 // Páginas
+    // Comandos para resetear el cursor a la posición inicial (0,0)
+    uint8_t cmds[] = {
+        0x21, // Set Column Address
+        0,    // Start
+        127,  // End
+        0x22, // Set Page Address
+        0,    // Start
+        7     // End
     };
 
-    for (size_t i = 0; i < sizeof(commands); i++)
+    // Envía los comandos de posicionamiento en modo bloqueante
+    for (uint8_t i = 0; i < sizeof(cmds); i++)
     {
-        if (hssd->i2c_write_blocking(hssd->device_address, 0x00, (uint8_t *)&commands[i], 1, hssd->i2c_context) != SSD1306_OK)
+        if (hssd->i2c_write_blocking(hssd->device_address, 0x00, &cmds[i], 1, hssd->i2c_context) != SSD1306_OK)
+        {
             return SSD1306_ERROR;
+        }
     }
 
-    SSD1306_PrepareDMABuffer(hssd);
-    hssd->dma_busy = true;
-    int8_t res = hssd->i2c_write_dma(hssd->device_address, hssd->dma_buffer[0], &hssd->dma_buffer[1], SSD1306_BUFFER_SIZE, hssd->i2c_context);
-    if (res != SSD1306_OK)
+    // Ahora, transfiere el framebuffer completo por DMA
+    if (hssd->i2c_write_dma(hssd->device_address, 0x40, hssd->buffer, SSD1306_BUFFER_SIZE, hssd->i2c_context) != SSD1306_OK)
     {
-        hssd->dma_busy = false;
         return SSD1306_ERROR;
     }
+
     return SSD1306_OK;
+}
+
+int8_t SSD1306_Clear(SSD1306_HandleTypeDef *hssd)
+{
+    if (!hssd)
+        return SSD1306_ERROR;
+    memset(hssd->buffer, 0x00, SSD1306_BUFFER_SIZE);
+    return SSD1306_OK;
+}
+
+int8_t SSD1306_SetContrast(SSD1306_HandleTypeDef *hssd, uint8_t contrast)
+{
+    if (!hssd || !hssd->i2c_write_blocking)
+        return SSD1306_ERROR;
+    uint8_t cmd[2] = {SSD1306_CMD_SET_CONTRAST, contrast};
+    return hssd->i2c_write_blocking(hssd->device_address, 0x00, cmd, 2, hssd->i2c_context);
+}
+
+int8_t SSD1306_DisplayOn(SSD1306_HandleTypeDef *hssd)
+{
+    if (!hssd || !hssd->i2c_write_blocking)
+        return SSD1306_ERROR;
+    uint8_t cmd = SSD1306_CMD_DISPLAY_ON;
+    return hssd->i2c_write_blocking(hssd->device_address, 0x00, &cmd, 1, hssd->i2c_context);
+}
+
+int8_t SSD1306_DisplayOff(SSD1306_HandleTypeDef *hssd)
+{
+    if (!hssd || !hssd->i2c_write_blocking)
+        return SSD1306_ERROR;
+    uint8_t cmd = SSD1306_CMD_DISPLAY_OFF;
+    return hssd->i2c_write_blocking(hssd->device_address, 0x00, &cmd, 1, hssd->i2c_context);
+}
+
+void SSD1306_SetFont(SSD1306_HandleTypeDef *hssd, const uint8_t *font, uint8_t width, uint8_t height)
+{
+    if (hssd)
+    {
+        hssd->font = font;
+        hssd->font_width = width;
+        hssd->font_height = height;
+    }
 }

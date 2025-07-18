@@ -43,6 +43,13 @@ typedef enum
   MOTOR_FRONT_LEFT_IDX
 } MotorIndexTypeDef;
 
+typedef enum
+{
+  I2C_BUS_IDLE,
+  I2C_BUS_BUSY_MPU,
+  I2C_BUS_BUSY_SSD
+} I2C_BusStateTypeDef;
+
 typedef union
 {
   struct
@@ -221,6 +228,9 @@ uint16_t motor_pwm_values[PWM_CHANNELS] = {0, 0, 0, 0}; // Valores PWM para los 
 /* Buttons */
 Button_HandleTypeDef h_user_button;
 
+/* I2C Bus State */
+static volatile I2C_BusStateTypeDef i2c_bus_state = I2C_BUS_IDLE;
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -251,9 +261,6 @@ static int8_t I2C_WriteBlocking(uint8_t device_addr, uint8_t reg_addr, uint8_t *
 static int8_t I2C_WriteDMA(uint8_t device_addr, uint8_t reg_addr, uint8_t *data, uint16_t data_len, void *context);
 static int8_t I2C_ReadBlocking(uint8_t device_addr, uint8_t reg_addr, uint8_t *data, uint16_t data_len, void *context);
 static int8_t I2C_ReadDMA(uint8_t device_addr, uint8_t reg_addr, uint8_t *data, uint16_t data_len, void *context);
-
-/* MPU */
-static void ManageMpuReading(void);
 
 /* Botones */
 uint8_t Read_User_Button(void *context);
@@ -306,11 +313,10 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 
 void HAL_I2C_MemTxCpltCallback(I2C_HandleTypeDef *hi2c)
 {
-  // Escritura DMA completada para SSD1306
   if (hi2c == &hi2c2)
   {
-    hssd.dma_busy = false;
-    // Callback removed: nothing else to do
+    // La transferencia (del SSD1306) ha terminado
+    i2c_bus_state = I2C_BUS_IDLE;
   }
 }
 
@@ -318,7 +324,7 @@ void HAL_I2C_MemRxCpltCallback(I2C_HandleTypeDef *hi2c)
 {
   if (hi2c == &hi2c2)
   {
-    // Convertir datos del buffer DMA a la estructura
+    // La lectura (del MPU6050) ha terminado
     hmpu.raw_data.accel_x_raw = (int16_t)((hmpu.dma_buffer[MPU_DMA_BUF_ACCEL_X_H] << 8) | hmpu.dma_buffer[MPU_DMA_BUF_ACCEL_X_L]);
     hmpu.raw_data.accel_y_raw = (int16_t)((hmpu.dma_buffer[MPU_DMA_BUF_ACCEL_Y_H] << 8) | hmpu.dma_buffer[MPU_DMA_BUF_ACCEL_Y_L]);
     hmpu.raw_data.accel_z_raw = (int16_t)((hmpu.dma_buffer[MPU_DMA_BUF_ACCEL_Z_H] << 8) | hmpu.dma_buffer[MPU_DMA_BUF_ACCEL_Z_L]);
@@ -327,7 +333,7 @@ void HAL_I2C_MemRxCpltCallback(I2C_HandleTypeDef *hi2c)
     hmpu.raw_data.gyro_y_raw = (int16_t)((hmpu.dma_buffer[MPU_DMA_BUF_GYRO_Y_H] << 8) | hmpu.dma_buffer[MPU_DMA_BUF_GYRO_Y_L]);
     hmpu.raw_data.gyro_z_raw = (int16_t)((hmpu.dma_buffer[MPU_DMA_BUF_GYRO_Z_H] << 8) | hmpu.dma_buffer[MPU_DMA_BUF_GYRO_Z_L]);
 
-    hmpu.dma_busy = false; // Liberar DMA
+    i2c_bus_state = I2C_BUS_IDLE;
   }
 }
 
@@ -547,6 +553,8 @@ void Do100ms()
   static uint32_t test_counter = 1;
   char test_str[16];
 
+  // Limpiar pantalla SSD1306
+  SSD1306_Clear(&hssd);
   // Formatear texto: "TEST <contador>"
   snprintf(test_str, sizeof(test_str), "TEST %lu", test_counter);
   SSD1306_DrawText(&hssd, 10, 10, test_str, SSD1306_TEXT_ALIGN_LEFT);
@@ -641,7 +649,6 @@ int8_t I2C_DevicesInit(void)
   hmpu.device_address = MPU6050_ADDR;
   hmpu.is_initialized = false;
   hmpu.is_connected = false;
-  hmpu.dma_busy = false;
   MPU_READ_REQUEST = false;
 
   verificacion = MPU6050_Init(&hmpu);
@@ -659,7 +666,6 @@ int8_t I2C_DevicesInit(void)
   hssd.i2c_context = &hi2c2;
   hssd.device_address = 0x3C << 1; // Typical SSD1306 I2C address
   hssd.is_initialized = false;
-  hssd.dma_busy = false;
   SSD_UPDATE_REQUEST = false;
 
   // SSD1306: Initialize display
@@ -710,20 +716,38 @@ int8_t I2C_ReadDMA(uint8_t device_addr, uint8_t reg_addr, uint8_t *data, uint16_
 
 /* Fin I2C */
 
-static void ManageMpuReading(void)
+static void ManageI2CTransactions(void)
 {
+  // Solo iniciar una nueva transacción si el bus está libre
+  if (i2c_bus_state != I2C_BUS_IDLE)
+  {
+    return;
+  }
+
+  // Prioridad 1: Lectura del MPU6050
   if (MPU_READ_REQUEST)
   {
-    if (!hmpu.dma_busy && HAL_I2C_GetState(&hi2c2) == HAL_I2C_STATE_READY)
+    MPU_READ_REQUEST = false;         // Atender la solicitud
+    i2c_bus_state = I2C_BUS_BUSY_MPU; // Marcar el bus como ocupado por el MPU
+    if (MPU6050_ReadRawDataDMA(&hmpu) != MPU6050_OK)
     {
-      MPU_READ_REQUEST = false; // Limpiar la solicitud
-      if (MPU6050_ReadRawDataDMA(&hmpu) != 1)
-      {
-        // Error al iniciar la lectura del MPU. Indicar error y detener.
-        // Nota: Esta sección es bloqueante y termina en Error_Handler().
-        IndicateError(MPU_READ_ERROR_BLINKS, MPU_READ_ERROR_BLINK_DELAY_MS);
-        Error_Handler();
-      }
+      // Si falla el inicio, liberar el bus y manejar el error
+      i2c_bus_state = I2C_BUS_IDLE;
+      IndicateError(MPU_READ_ERROR_BLINKS, MPU_READ_ERROR_BLINK_DELAY_MS);
+      Error_Handler();
+    }
+  }
+  // Prioridad 2: Actualización del SSD1306
+  else if (SSD_UPDATE_REQUEST)
+  {
+    SSD_UPDATE_REQUEST = false;       // Atender la solicitud
+    i2c_bus_state = I2C_BUS_BUSY_SSD; // Marcar el bus como ocupado por el SSD
+    if (SSD1306_UpdateScreen_DMA(&hssd) != SSD1306_OK)
+    {
+      // Si falla el inicio, liberar el bus y manejar el error
+      i2c_bus_state = I2C_BUS_IDLE;
+      IndicateError(5, 400);
+      Error_Handler();
     }
   }
 }
@@ -918,20 +942,7 @@ int main(void)
             UNERBUS_WriteConstString(&unerbusPC, " El ALIVE", 1); */
     }
 
-    ManageMpuReading();
-
-    if (SSD_UPDATE_REQUEST && HAL_I2C_GetState(&hi2c2) == HAL_I2C_STATE_READY && !hssd.dma_busy)
-    {
-      SSD_UPDATE_REQUEST = false; // Limpiar la solicitud de actualización
-
-      // Iniciar la actualización de pantalla SSD1306
-      if (SSD1306_UpdateScreen_DMA(&hssd) == SSD1306_ERROR)
-      {
-        // Error al iniciar la actualización de pantalla. Indicar error y detener.
-        IndicateError(5, 400);
-        Error_Handler();
-      }
-    }
+    ManageI2CTransactions();
 
     if (!time_100ms)
       Do100ms();

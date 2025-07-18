@@ -75,18 +75,10 @@ int8_t MPU6050_Init(MPU6050_HandleTypeDef *hmpu)
 
 int8_t MPU6050_ReadRawDataDMA(MPU6050_HandleTypeDef *hmpu)
 {
-    if (hmpu->dma_busy)
-    {
-        return MPU6050_ERROR_DMA_BUSY; // DMA ya está en uso
-    }
-
-    hmpu->dma_busy = 1;
-
     // Iniciar lectura DMA
     if (hmpu->i2c_read_dma(hmpu->device_address, MPU6050_ACCEL_XOUT_H_ADDR, hmpu->dma_buffer, MPU6050_RAW_DATA_LEN, hmpu->i2c_context) != MPU6050_OK)
     {
-        hmpu->dma_busy = 0;
-        return MPU6050_ERROR_DMA_BUSY; // Reutilizo el mismo error para indicar fallo al iniciar DMA
+        return MPU6050_I2C_ERROR;
     }
 
     return MPU6050_OK;

@@ -22,7 +22,7 @@
 
 // Códigos de retorno
 #define MPU6050_OK 1
-#define MPU6050_ERROR_DMA_BUSY -1
+#define MPU6050_I2C_ERROR -1
 #define MPU6050_ERROR_WRONG_DEVICE_ID -2
 #define MPU6050_ERROR_WAKEUP_FAILED -3
 #define MPU6050_ERROR_ACCEL_CONFIG_FAILED -4
@@ -84,7 +84,6 @@ typedef struct
     // Estado
     uint8_t is_initialized;
     uint8_t is_connected;
-    uint8_t dma_busy;
 
     // Offsets de calibración
     int16_t accel_offset_x;
