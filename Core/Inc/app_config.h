@@ -85,6 +85,7 @@ extern SystemFlagTypeDef flags0;
 #define UART_BYPASS flags0.bit.b1
 #define MPU_READ_REQUEST flags0.bit.b2
 #define SSD_UPDATE_REQUEST flags0.bit.b3
+#define ACTIVATE_PID flags0.bit.b4
 
 /* MPU6050 */
 #define MPU_DMA_BUFFER_SIZE 14
@@ -116,6 +117,11 @@ extern SystemFlagTypeDef flags0;
 #define PWM_MAX_VALUE 9999
 #define PWM_50_PERCENT (PWM_MAX_VALUE / 2)
 #define PWM_DATA_BYTES (PWM_CHANNELS * 2)
+
+/* PID Controller */
+#define WALL_FOLLOW_SETPOINT 500 // Valor ADC objetivo (ajustar según la distancia deseada)
+#define BASE_SPEED 4000          // Velocidad base de los motores (0 a PWM_MAX_VALUE)
+#define MAX_PWM_CORRECTION 3000  // Corrección máxima del PID sobre la velocidad base
 
 /* Timers */
 #define TIME_10MS_PERIOD_COUNT 40

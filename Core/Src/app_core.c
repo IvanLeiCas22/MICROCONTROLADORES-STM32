@@ -11,6 +11,7 @@
 #include "MPU6050.h"
 #include "BUTTONS.h"
 #include "SSD1306.h"
+#include "pid_controller.h"
 
 //==============================================================================
 // DECLARACIONES EXTERN DE HANDLES DE PERIFÉRICOS (definidos en main.c)
@@ -49,6 +50,8 @@ Button_HandleTypeDef h_user_button;
 uint16_t motor_pwm_values[PWM_CHANNELS] = {0, 0, 0, 0};
 static volatile I2C_BusStateTypeDef i2c_bus_state = I2C_BUS_IDLE;
 
+PID_Controller_t wall_pid;
+
 //==============================================================================
 // PROTOTIPOS DE FUNCIONES PRIVADAS
 //==============================================================================
@@ -70,6 +73,7 @@ void IndicateError(uint8_t blinks, uint32_t delay_ms);
 int8_t I2C_DevicesInit(void);
 static void ManageI2CTransactions(void);
 uint8_t UART_TransmitByte(uint8_t value);
+void App_Core_Control_Loop(void);
 
 //==============================================================================
 // IMPLEMENTACIÓN DE WRAPPERS DE CALLBACKS HAL
@@ -573,6 +577,7 @@ static void ManageButtonEvents(void)
             /* code */
             break;
         case EVENT_PRESS_RELEASED:
+            ACTIVATE_PID = !ACTIVATE_PID; // Toggle PID activation
             /* code */
             break;
         case EVENT_LONG_PRESS:
@@ -665,6 +670,16 @@ void App_Core_Init(void)
     UNERBUS_Init(&unerbus_esp01_handle);
     UNERBUS_Init(&unerbus_pc_handle);
 
+    /* --- INICIALIZACIÓN DEL PID DE SEGUIMIENTO DE PARED --- */
+    // Las ganancias Kp, Ki, Kd son iniciales y deben ser sintonizadas.
+    // Se convierten a punto fijo. Por ejemplo, 0.5 se convierte con FLOAT_TO_FIXED(0.5)
+    PID_Init(&wall_pid, FLOAT_TO_FIXED(1), FLOAT_TO_FIXED(0), FLOAT_TO_FIXED(0));
+    PID_Set_Setpoint(&wall_pid, WALL_FOLLOW_SETPOINT);
+
+    // La salida del PID será una corrección. Limitarla para no saturar los motores.
+    // La corrección se convertirá a punto fijo para los límites.
+    PID_Set_Output_Limits(&wall_pid, INT_TO_FIXED(-MAX_PWM_CORRECTION), INT_TO_FIXED(MAX_PWM_CORRECTION));
+
     /* Buttons*/
     Button_Init(&h_user_button, Read_User_Button, NULL);
 
@@ -680,6 +695,55 @@ void App_Core_Init(void)
     /* Flags */
     ON10MS = false;
     UART_BYPASS = true;
+    ACTIVATE_PID = false;
+}
+
+/**
+ * @brief Bucle principal de control del robot (movimiento, sensores).
+ *        Esta función se debe llamar periódicamente.
+ */
+void App_Core_Control_Loop(void)
+{
+    // 1. Leer el valor del sensor de distancia derecho
+    // Se lee del buffer del ADC. Se usa el último valor completo y seguro.
+    uint8_t last_adc_idx = (adc_buf_write_idx == 0) ? (ADC_BUFFER_SIZE - 1) : (adc_buf_write_idx - 1);
+    uint16_t right_distance_raw = buf_adc[last_adc_idx][0]; // Canal 0 es el sensor derecho
+
+    // Lógica del sensor: ~4000 (cerca), ~0 (lejos).
+    // Error = Setpoint - ValorActual.
+    // - Si está muy cerca (Valor > Setpoint), Error < 0 -> Corrección negativa.
+    // - Si está muy lejos (Valor < Setpoint), Error > 0 -> Corrección positiva.
+
+    // 2. Calcular la salida del PID
+    // El tiempo dt es 10ms, que es el intervalo de llamada de Do10ms.
+    int32_t pid_output_fixed = PID_Update(&wall_pid, right_distance_raw, 10);
+
+    // Convertir la salida de punto fijo a un entero para la corrección de velocidad.
+    int16_t correction = (int16_t)FIXED_TO_INT(pid_output_fixed);
+
+    // 3. Aplicar la corrección a los motores para girar
+    // - Corrección positiva (lejos): Gira a la derecha (motor izq más rápido, der más lento).
+    // - Corrección negativa (cerca): Gira a la izquierda (motor der más rápido, izq más lento).
+    int16_t right_motor_speed = BASE_SPEED - correction;
+    int16_t left_motor_speed = BASE_SPEED + correction;
+
+    // 4. Limitar (saturar) la velocidad de los motores al rango válido de PWM.
+    if (right_motor_speed < 0)
+        right_motor_speed = 0;
+    if (right_motor_speed > PWM_MAX_VALUE)
+        right_motor_speed = PWM_MAX_VALUE;
+    if (left_motor_speed < 0)
+        left_motor_speed = 0;
+    if (left_motor_speed > PWM_MAX_VALUE)
+        left_motor_speed = PWM_MAX_VALUE;
+
+    // 5. Asignar a los canales de avance de los motores
+    // Motor derecho: ch2 adelante (TIM4_CH2), ch1 atrás (TIM4_CH1)
+    // Motor izquierdo: ch4 adelante (TIM4_CH4), ch3 atrás (TIM4_CH3)
+    __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_2, right_motor_speed);
+    __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_1, 0); // Hacia atrás apagado
+    __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_4, left_motor_speed);
+    __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_3, 0); // Hacia atrás apagado
 }
 
 void App_Core_Loop(void)
@@ -699,7 +763,21 @@ void App_Core_Loop(void)
         Do100ms();
 
     if (ON10MS)
+    {
         Do10ms();
+        if (ACTIVATE_PID)
+        {
+            App_Core_Control_Loop();
+        }
+        else
+        {
+            // Si el PID no está activo, detener los motores
+            __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_1, 0);
+            __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_2, 0);
+            __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_3, 0);
+            __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_4, 0);
+        }
+    }
 
     ManageTransmission();
 
