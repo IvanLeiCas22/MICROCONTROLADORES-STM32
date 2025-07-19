@@ -51,6 +51,11 @@ uint16_t motor_pwm_values[PWM_CHANNELS] = {0, 0, 0, 0};
 static volatile I2C_BusStateTypeDef i2c_bus_state = I2C_BUS_IDLE;
 
 PID_Controller_t wall_pid;
+uint16_t wall_follow_setpoint = 500;    // Valor ADC objetivo
+uint16_t base_speed = 4000;             // Velocidad base de referencia
+uint16_t right_motor_base_speed = 4000; // Velocidad base motor derecho
+uint16_t left_motor_base_speed = 4000;  // Velocidad base motor izquierdo
+uint16_t max_pwm_correction = 3000;     // Corrección máxima del PID
 
 //==============================================================================
 // PROTOTIPOS DE FUNCIONES PRIVADAS
@@ -191,6 +196,10 @@ void DecodeCMD(struct UNERBUSHandle *aBus, uint8_t iStartData)
     uint8_t length = 0;
     uint8_t idx = 0;
 
+    uint16_t kp_int = 0;
+    uint16_t ki_int = 0;
+    uint16_t kd_int = 0;
+
     id = UNERBUS_GetUInt8(aBus);
     switch ((CommandIdTypeDef)id)
     {
@@ -315,6 +324,102 @@ void DecodeCMD(struct UNERBUSHandle *aBus, uint8_t iStartData)
 
         UNERBUS_Write(aBus, test_response, UNERBUS_ACK_SIZE);
         length = UNERBUS_CMD_ID_SIZE + UNERBUS_ACK_SIZE; // 1 (CMD) + 1 (status)
+        break;
+    case CMD_SET_PID_GAINS: // Configurar Kp, Ki, Kd
+        // Se esperan 3 valores uint16_t: Kp*1000, Ki*1000, Kd*1000
+        kp_int = UNERBUS_GetUInt16(aBus);
+        ki_int = UNERBUS_GetUInt16(aBus);
+        kd_int = UNERBUS_GetUInt16(aBus);
+
+        // Convertir de entero a punto fijo (dividiendo por 1000.0)
+        // Para evitar floats, hacemos la división en punto fijo:
+        // value_fixed = (value_int * 2^16) / 1000
+        wall_pid.kp = (int32_t)(((int64_t)kp_int << FIXED_POINT_SHIFT) / 1000);
+        wall_pid.ki = (int32_t)(((int64_t)ki_int << FIXED_POINT_SHIFT) / 1000);
+        wall_pid.kd = (int32_t)(((int64_t)kd_int << FIXED_POINT_SHIFT) / 1000);
+
+        // Enviar confirmación (ACK)
+        UNERBUS_WriteByte(aBus, CMD_ACK);
+        length = UNERBUS_CMD_ID_SIZE + UNERBUS_ACK_SIZE;
+        break;
+    case CMD_GET_PID_GAINS: // Leer Kp, Ki, Kd
+        uint8_t response_buffer[UNERBUS_PID_GAINS_SIZE];
+
+        // Convertir de punto fijo a entero para enviar
+        kp_int = (uint16_t)(((int64_t)wall_pid.kp * 1000) >> FIXED_POINT_SHIFT);
+        ki_int = (uint16_t)(((int64_t)wall_pid.ki * 1000) >> FIXED_POINT_SHIFT);
+        kd_int = (uint16_t)(((int64_t)wall_pid.kd * 1000) >> FIXED_POINT_SHIFT);
+
+        response_buffer[0] = (uint8_t)(kp_int & 0xFF);
+        response_buffer[1] = (uint8_t)((kp_int >> 8) & 0xFF);
+        response_buffer[2] = (uint8_t)(ki_int & 0xFF);
+        response_buffer[3] = (uint8_t)((ki_int >> 8) & 0xFF);
+        response_buffer[4] = (uint8_t)(kd_int & 0xFF);
+        response_buffer[5] = (uint8_t)((kd_int >> 8) & 0xFF);
+
+        UNERBUS_Write(aBus, response_buffer, UNERBUS_PID_GAINS_SIZE);
+        length = UNERBUS_CMD_ID_SIZE + UNERBUS_PID_GAINS_SIZE;
+        break;
+    case CMD_SET_CONTROL_PARAMS: // Configurar Setpoint, Base Speed, Max Correction
+        // Se esperan 3 valores uint16_t
+        wall_follow_setpoint = UNERBUS_GetUInt16(aBus);
+        base_speed = UNERBUS_GetUInt16(aBus);
+        max_pwm_correction = UNERBUS_GetUInt16(aBus);
+
+        // Actualizar la configuración del PID con los nuevos valores
+        PID_Set_Setpoint(&wall_pid, wall_follow_setpoint);
+        PID_Set_Output_Limits(&wall_pid, INT_TO_FIXED(-max_pwm_correction), INT_TO_FIXED(max_pwm_correction));
+
+        // Enviar confirmación (ACK)
+        UNERBUS_WriteByte(aBus, CMD_ACK);
+        length = UNERBUS_CMD_ID_SIZE + UNERBUS_ACK_SIZE;
+        break;
+    case CMD_GET_CONTROL_PARAMS: // Leer Setpoint, Base Speed, Max Correction
+        uint8_t response_buffer_2[UNERBUS_CONTROL_PARAMS_SIZE];
+
+        response_buffer_2[0] = (uint8_t)(wall_follow_setpoint & 0xFF);
+        response_buffer_2[1] = (uint8_t)((wall_follow_setpoint >> 8) & 0xFF);
+        response_buffer_2[2] = (uint8_t)(base_speed & 0xFF);
+        response_buffer_2[3] = (uint8_t)((base_speed >> 8) & 0xFF);
+        response_buffer_2[4] = (uint8_t)(max_pwm_correction & 0xFF);
+        response_buffer_2[5] = (uint8_t)((max_pwm_correction >> 8) & 0xFF);
+
+        UNERBUS_Write(aBus, response_buffer_2, UNERBUS_CONTROL_PARAMS_SIZE);
+        length = UNERBUS_CMD_ID_SIZE + UNERBUS_CONTROL_PARAMS_SIZE;
+        break;
+    case CMD_SET_MOTOR_BASE_SPEEDS: // Configurar velocidades base independientes
+        // Se esperan 2 valores uint16_t: Right Motor Base Speed, Left Motor Base Speed
+        right_motor_base_speed = UNERBUS_GetUInt16(aBus);
+        left_motor_base_speed = UNERBUS_GetUInt16(aBus);
+
+        // Actualizar también base_speed como promedio para compatibilidad
+        base_speed = (right_motor_base_speed + left_motor_base_speed) / 2;
+
+        // Enviar confirmación (ACK)
+        UNERBUS_WriteByte(aBus, CMD_ACK);
+        length = UNERBUS_CMD_ID_SIZE + UNERBUS_ACK_SIZE;
+        break;
+    case CMD_GET_MOTOR_BASE_SPEEDS: // Leer velocidades base independientes
+        uint8_t motor_speeds_buffer[UNERBUS_MOTOR_BASE_SPEEDS_SIZE];
+
+        motor_speeds_buffer[0] = (uint8_t)(right_motor_base_speed & 0xFF);
+        motor_speeds_buffer[1] = (uint8_t)((right_motor_base_speed >> 8) & 0xFF);
+        motor_speeds_buffer[2] = (uint8_t)(left_motor_base_speed & 0xFF);
+        motor_speeds_buffer[3] = (uint8_t)((left_motor_base_speed >> 8) & 0xFF);
+
+        UNERBUS_Write(aBus, motor_speeds_buffer, UNERBUS_MOTOR_BASE_SPEEDS_SIZE);
+        length = UNERBUS_CMD_ID_SIZE + UNERBUS_MOTOR_BASE_SPEEDS_SIZE;
+        break;
+    case CMD_CALIBRATE_MOTORS: // Calibración automática de motores
+        // Esta función realiza una calibración automática:
+        // 1. Aplica la misma velocidad PWM a ambos motores
+        // 2. Usa el giroscopio para detectar deriva
+        // 3. Ajusta las velocidades base para compensar
+        // NOTA: Requiere que el robot esté en una superficie lisa y sin obstáculos
+
+        // Por ahora, enviar ACK indicando que la funcionalidad está pendiente
+        UNERBUS_WriteByte(aBus, CMD_ACK);
+        length = UNERBUS_CMD_ID_SIZE + UNERBUS_ACK_SIZE;
         break;
     }
 
@@ -578,6 +683,20 @@ static void ManageButtonEvents(void)
             break;
         case EVENT_PRESS_RELEASED:
             ACTIVATE_PID = !ACTIVATE_PID; // Toggle PID activation
+
+            if (!ACTIVATE_PID)
+            {
+                // si el PID no está activado, detener los motores
+                __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_1, 0);
+                __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_2, 0);
+                __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_3, 0);
+                __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_4, 0);
+            }
+            else
+            {
+                // Si el PID está activado, reiniciar el controlador PID
+                PID_Reset(&wall_pid);
+            }
             /* code */
             break;
         case EVENT_LONG_PRESS:
@@ -674,11 +793,16 @@ void App_Core_Init(void)
     // Las ganancias Kp, Ki, Kd son iniciales y deben ser sintonizadas.
     // Se convierten a punto fijo. Por ejemplo, 0.5 se convierte con FLOAT_TO_FIXED(0.5)
     PID_Init(&wall_pid, FLOAT_TO_FIXED(1), FLOAT_TO_FIXED(0), FLOAT_TO_FIXED(0));
-    PID_Set_Setpoint(&wall_pid, WALL_FOLLOW_SETPOINT);
+    PID_Set_Setpoint(&wall_pid, wall_follow_setpoint);
 
     // La salida del PID será una corrección. Limitarla para no saturar los motores.
     // La corrección se convertirá a punto fijo para los límites.
-    PID_Set_Output_Limits(&wall_pid, INT_TO_FIXED(-MAX_PWM_CORRECTION), INT_TO_FIXED(MAX_PWM_CORRECTION));
+    PID_Set_Output_Limits(&wall_pid, INT_TO_FIXED(-max_pwm_correction), INT_TO_FIXED(max_pwm_correction));
+
+    /* --- INICIALIZACIÓN DE VELOCIDADES BASE INDEPENDIENTES --- */
+    // Inicializar con la misma velocidad base. Se pueden calibrar posteriormente.
+    right_motor_base_speed = base_speed;
+    left_motor_base_speed = base_speed;
 
     /* Buttons*/
     Button_Init(&h_user_button, Read_User_Button, NULL);
@@ -724,8 +848,9 @@ void App_Core_Control_Loop(void)
     // 3. Aplicar la corrección a los motores para girar
     // - Corrección positiva (lejos): Gira a la derecha (motor izq más rápido, der más lento).
     // - Corrección negativa (cerca): Gira a la izquierda (motor der más rápido, izq más lento).
-    int16_t right_motor_speed = BASE_SPEED - correction;
-    int16_t left_motor_speed = BASE_SPEED + correction;
+    // IMPORTANTE: Usar velocidades base independientes para compensar diferencias entre motores
+    int16_t right_motor_speed = right_motor_base_speed - correction;
+    int16_t left_motor_speed = left_motor_base_speed + correction;
 
     // 4. Limitar (saturar) la velocidad de los motores al rango válido de PWM.
     if (right_motor_speed < 0)
@@ -768,14 +893,6 @@ void App_Core_Loop(void)
         if (ACTIVATE_PID)
         {
             App_Core_Control_Loop();
-        }
-        else
-        {
-            // Si el PID no está activo, detener los motores
-            __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_1, 0);
-            __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_2, 0);
-            __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_3, 0);
-            __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_4, 0);
         }
     }
 

@@ -62,6 +62,13 @@ typedef enum
     CMD_GET_LOCAL_IP = 0xE0,
     CMD_UART_BYPASS_CONTROL = 0xDD,
     CMD_MPU_CALIBRATE = 0xA3,
+    CMD_SET_PID_GAINS = 0x40,         // Para configurar Kp, Ki, Kd
+    CMD_GET_PID_GAINS = 0x41,         // Para leer Kp, Ki, Kd
+    CMD_SET_CONTROL_PARAMS = 0x42,    // Para configurar Setpoint, Base Speed, etc.
+    CMD_GET_CONTROL_PARAMS = 0x43,    // Para leer Setpoint, Base Speed, etc.
+    CMD_SET_MOTOR_BASE_SPEEDS = 0x44, // Para configurar velocidades base independientes
+    CMD_GET_MOTOR_BASE_SPEEDS = 0x45, // Para leer velocidades base independientes
+    CMD_CALIBRATE_MOTORS = 0x46,      // Para calibrar motores automáticamente
     CMD_OTHERS
 } CommandIdTypeDef;
 
@@ -118,11 +125,6 @@ extern SystemFlagTypeDef flags0;
 #define PWM_50_PERCENT (PWM_MAX_VALUE / 2)
 #define PWM_DATA_BYTES (PWM_CHANNELS * 2)
 
-/* PID Controller */
-#define WALL_FOLLOW_SETPOINT 500 // Valor ADC objetivo (ajustar según la distancia deseada)
-#define BASE_SPEED 4000          // Velocidad base de los motores (0 a PWM_MAX_VALUE)
-#define MAX_PWM_CORRECTION 3000  // Corrección máxima del PID sobre la velocidad base
-
 /* Timers */
 #define TIME_10MS_PERIOD_COUNT 40
 #define TIME_100MS_PEDIOD_COUNT 10
@@ -135,6 +137,9 @@ extern SystemFlagTypeDef flags0;
 #define UNERBUS_BYPASS_STATUS_SIZE 1
 #define UNERBUS_BUTTON_EVENT_SIZE 1
 #define UNERBUS_PWM_RESPONSE_STATUS_SIZE 1
+#define UNERBUS_PID_GAINS_SIZE (sizeof(uint16_t) * 3)         // Kp, Ki, Kd como uint16_t
+#define UNERBUS_CONTROL_PARAMS_SIZE (sizeof(uint16_t) * 3)    // Setpoint, Speed, Correction como uint16_t
+#define UNERBUS_MOTOR_BASE_SPEEDS_SIZE (sizeof(uint16_t) * 2) // Right, Left motor base speeds como uint16_t
 
 /* USB CDC Buffer Sizes */
 #define USB_CDC_RX_BUFFER_SIZE 128
