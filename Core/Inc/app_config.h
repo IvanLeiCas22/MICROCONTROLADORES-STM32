@@ -29,6 +29,12 @@ typedef enum
     I2C_BUS_BUSY_SSD
 } I2C_BusStateTypeDef;
 
+typedef enum
+{
+    TURN_STATE_IDLE,
+    TURN_STATE_TURNING
+} TurnStateTypeDef;
+
 typedef union
 {
     struct
@@ -51,24 +57,24 @@ typedef enum
     CMD_GET_ALIVE = 0xF0,
     CMD_START_CONFIG = 0xEE,
     CMD_FIRMWARE = 0xF1,
-    CMD_BUTTON_STATE = 0x12,
-    CMD_MPU = 0xA2,
-    CMD_LAST_ADC = 0xA0,
-    CMD_TEST_MOTORES = 0xA1,
-    CMD_VELOCIDAD_MOTORES = 0xA4,
-    CMD_SET_PWM_MOTORES = 0xA5,
-    CMD_GET_PWM_MOTORES = 0xA6,
-    CMD_TEST_MOTORES_50 = 0xA7,
-    CMD_GET_LOCAL_IP = 0xE0,
-    CMD_UART_BYPASS_CONTROL = 0xDD,
-    CMD_MPU_CALIBRATE = 0xA3,
-    CMD_SET_PID_GAINS = 0x40,         // Para configurar Kp, Ki, Kd
-    CMD_GET_PID_GAINS = 0x41,         // Para leer Kp, Ki, Kd
-    CMD_SET_CONTROL_PARAMS = 0x42,    // Para configurar Setpoint, Base Speed, etc.
-    CMD_GET_CONTROL_PARAMS = 0x43,    // Para leer Setpoint, Base Speed, etc.
-    CMD_SET_MOTOR_BASE_SPEEDS = 0x44, // Para configurar velocidades base independientes
-    CMD_GET_MOTOR_BASE_SPEEDS = 0x45, // Para leer velocidades base independientes
-    CMD_CALIBRATE_MOTORS = 0x46,      // Para calibrar motores automáticamente
+    CMD_GET_BUTTON_STATE = 0x12,
+    CMD_GET_MPU_DATA = 0xA2,
+    CMD_GET_LAST_ADC_VALUES = 0xA0,
+    CMD_TEST_MOTORS = 0xA1,
+    CMD_GET_MOTOR_SPEEDS = 0xA4,
+    CMD_SET_MOTOR_PWM = 0xA5,
+    CMD_GET_MOTOR_PWM = 0xA6,
+    CMD_GET_LOCAL_IP_ADDRESS = 0xE0,
+    CMD_SET_UART_BYPASS_CONTROL = 0xDD,
+    CMD_CALIBRATE_MPU = 0xA3,
+    CMD_SET_PID_GAINS = 0x40,          // Para configurar Kp, Ki, Kd
+    CMD_GET_PID_GAINS = 0x41,          // Para leer Kp, Ki, Kd
+    CMD_SET_CONTROL_PARAMETERS = 0x42, // Para configurar Setpoint, Base Speed, etc.
+    CMD_GET_CONTROL_PARAMETERS = 0x43, // Para leer Setpoint, Base Speed, etc.
+    CMD_SET_MOTOR_BASE_SPEEDS = 0x44,  // Para configurar velocidades base independientes
+    CMD_GET_MOTOR_BASE_SPEEDS = 0x45,  // Para leer velocidades base independientes
+    CMD_CALIBRATE_MOTORS = 0x46,       // Para calibrar motores automáticamente
+    CMD_TURN_DEGREES = 0x47,           // Para girar un número de grados
     CMD_OTHERS
 } CommandIdTypeDef;
 
@@ -140,6 +146,7 @@ extern SystemFlagTypeDef flags0;
 #define UNERBUS_PID_GAINS_SIZE (sizeof(uint16_t) * 3)         // Kp, Ki, Kd como uint16_t
 #define UNERBUS_CONTROL_PARAMS_SIZE (sizeof(uint16_t) * 3)    // Setpoint, Speed, Correction como uint16_t
 #define UNERBUS_MOTOR_BASE_SPEEDS_SIZE (sizeof(uint16_t) * 2) // Right, Left motor base speeds como uint16_t
+#define UNERBUS_TURN_DEGREES_SIZE 2                           // int16_t
 
 /* USB CDC Buffer Sizes */
 #define USB_CDC_RX_BUFFER_SIZE 128
@@ -157,7 +164,7 @@ extern SystemFlagTypeDef flags0;
 /* Wifi Settings */
 #define WIFI_SSID "InternetPlus_8e2fbb"
 #define WIFI_PASSWORD "Akhantos2340"
-#define WIFI_UDP_REMOTE_IP "192.168.1.8"
+#define WIFI_UDP_REMOTE_IP "192.168.1.3"
 #define WIFI_UDP_REMOTE_PORT 30010
 #define WIFI_UDP_LOCAL_PORT 30000
 
@@ -167,5 +174,10 @@ extern SystemFlagTypeDef flags0;
 
 /* Initialization */
 #define DEVICE_INIT_DELAY_MS 1000
+
+/* --- Yaw Calculation --- */
+// Scaling factor to convert raw gyro Z value to Q16.16 fixed-point degrees
+// Formula: (dt_s * (1 << 16)) / LSB_per_dps = (0.01s * 65536) / 131 = 4.995...
+#define GYRO_Z_SCALER 5
 
 #endif /* INC_APP_CONFIG_H_ */
