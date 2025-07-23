@@ -51,6 +51,7 @@ uint16_t motor_pwm_values[PWM_CHANNELS] = {0, 0, 0, 0};
 static volatile I2C_BusStateTypeDef i2c_bus_state = I2C_BUS_IDLE;
 
 PID_Controller_t wall_pid;
+PID_Controller_t turn_pid;
 uint16_t wall_follow_setpoint = 300;    // Valor ADC objetivo
 uint16_t base_speed = 4000;             // Velocidad base de referencia
 uint16_t right_motor_base_speed = 5000; // Velocidad base motor derecho
@@ -208,6 +209,10 @@ void DecodeCMD(struct UNERBUSHandle *aBus, uint8_t iStartData)
     uint16_t kp_int = 0;
     uint16_t ki_int = 0;
     uint16_t kd_int = 0;
+
+    uint16_t turn_kp_int = 0;
+    uint16_t turn_ki_int = 0;
+    uint16_t turn_kd_int = 0;
 
     id = UNERBUS_GetUInt8(aBus);
     switch ((CommandIdTypeDef)id)
@@ -416,6 +421,39 @@ void DecodeCMD(struct UNERBUSHandle *aBus, uint8_t iStartData)
         Turn_Start(angle);
         UNERBUS_WriteByte(aBus, CMD_ACK);
         length = UNERBUS_CMD_ID_SIZE + UNERBUS_ACK_SIZE + UNERBUS_TURN_DEGREES_SIZE;
+        break;
+    case CMD_SET_TURN_PID_GAINS: // Configurar Kp, Ki, Kd del PID de giro
+        // Se esperan 3 valores uint16_t: Kp*100, Ki*100, Kd*100
+        turn_kp_int = UNERBUS_GetUInt16(aBus);
+        turn_ki_int = UNERBUS_GetUInt16(aBus);
+        turn_kd_int = UNERBUS_GetUInt16(aBus);
+
+        // Convertir de entero a punto fijo (dividiendo por 100.0)
+        turn_pid.kp = (int32_t)(((int64_t)turn_kp_int << FIXED_POINT_SHIFT) / 100);
+        turn_pid.ki = (int32_t)(((int64_t)turn_ki_int << FIXED_POINT_SHIFT) / 100);
+        turn_pid.kd = (int32_t)(((int64_t)turn_kd_int << FIXED_POINT_SHIFT) / 100);
+
+        // Enviar confirmación (ACK)
+        UNERBUS_WriteByte(aBus, CMD_ACK);
+        length = UNERBUS_CMD_ID_SIZE + UNERBUS_ACK_SIZE;
+        break;
+    case CMD_GET_TURN_PID_GAINS: // Leer Kp, Ki, Kd del PID de giro
+        uint8_t turn_pid_buffer[UNERBUS_TURN_PID_GAINS_SIZE];
+
+        // Convertir de punto fijo a entero para enviar (multiplicando por 100)
+        turn_kp_int = (uint16_t)(((int64_t)turn_pid.kp * 100) >> FIXED_POINT_SHIFT);
+        turn_ki_int = (uint16_t)(((int64_t)turn_pid.ki * 100) >> FIXED_POINT_SHIFT);
+        turn_kd_int = (uint16_t)(((int64_t)turn_pid.kd * 100) >> FIXED_POINT_SHIFT);
+
+        turn_pid_buffer[0] = (uint8_t)(turn_kp_int & 0xFF);
+        turn_pid_buffer[1] = (uint8_t)((turn_kp_int >> 8) & 0xFF);
+        turn_pid_buffer[2] = (uint8_t)(turn_ki_int & 0xFF);
+        turn_pid_buffer[3] = (uint8_t)((turn_ki_int >> 8) & 0xFF);
+        turn_pid_buffer[4] = (uint8_t)(turn_kd_int & 0xFF);
+        turn_pid_buffer[5] = (uint8_t)((turn_kd_int >> 8) & 0xFF);
+
+        UNERBUS_Write(aBus, turn_pid_buffer, UNERBUS_TURN_PID_GAINS_SIZE);
+        length = UNERBUS_CMD_ID_SIZE + UNERBUS_TURN_PID_GAINS_SIZE;
         break;
     }
 
@@ -804,6 +842,13 @@ void App_Core_Init(void)
     PID_Set_Setpoint(&wall_pid, wall_follow_setpoint);
     PID_Set_Output_Limits(&wall_pid, INT_TO_FIXED(-max_pwm_correction), INT_TO_FIXED(max_pwm_correction));
 
+    /* --- INICIALIZACIÓN DEL PID DE GIRO --- */
+    PID_Init(&turn_pid,
+             FLOAT_TO_FIXED(TURN_PID_KP_DEFAULT),
+             FLOAT_TO_FIXED(TURN_PID_KI_DEFAULT),
+             FLOAT_TO_FIXED(TURN_PID_KD_DEFAULT));
+    PID_Set_Output_Limits(&turn_pid, INT_TO_FIXED(-TURN_PID_MAX_EFFORT), INT_TO_FIXED(TURN_PID_MAX_EFFORT));
+
     /* Buttons*/
     Button_Init(&h_user_button, Read_User_Button, NULL);
 
@@ -931,14 +976,16 @@ void Turn_Start(int16_t angle_degrees)
         ACTIVATE_PID = false;
         Set_Motor_Speeds(0, 0); // Detener motores antes de girar
 
-        // Establecer el ángulo objetivo
+        // Resetear el PID de giro y establecer el nuevo ángulo objetivo
+        PID_Reset(&turn_pid);
         target_yaw_fixed = current_yaw_fixed + INT_TO_FIXED(angle_degrees);
+        PID_Set_Setpoint(&turn_pid, FIXED_TO_INT(target_yaw_fixed)); // El setpoint del PID es un entero
         turn_state = TURN_STATE_TURNING;
     }
 }
 
 /**
- * @brief Gestiona el estado de giro del robot usando un controlador P.
+ * @brief Gestiona el estado de giro del robot usando un controlador PID.
  *        Debe ser llamada periódicamente mientras se está girando.
  */
 static void Manage_Turn(void)
@@ -948,41 +995,37 @@ static void Manage_Turn(void)
         return;
     }
 
-    // --- Parámetros del Controlador de Giro (Lógica Mejorada) ---
-    // La ganancia P ahora se ajusta para que la salida sea un "esfuerzo" genérico, no un PWM directo.
-    // NOTA: Es posible que necesites reajustar este valor.
-    const int32_t turn_p_gain_fixed = FLOAT_TO_FIXED(100.0);
-    const int16_t max_turn_effort = 1000;                // Esfuerzo máximo (rango de -1000 a 1000)
-    const int32_t dead_zone_fixed = FLOAT_TO_FIXED(2.0); // Zona muerta en grados para finalizar
-
-    int32_t error_fixed = target_yaw_fixed - current_yaw_fixed;
+    // El error se calcula en grados enteros para simplicidad
+    int32_t current_yaw_degrees = FIXED_TO_INT(current_yaw_fixed);
+    int32_t target_yaw_degrees = FIXED_TO_INT(target_yaw_fixed);
+    int32_t error_degrees = target_yaw_degrees - current_yaw_degrees;
 
     // Comprobar si el giro ha terminado
-    if (abs(error_fixed) < dead_zone_fixed)
+    if (abs(error_degrees) <= TURN_COMPLETION_DEAD_ZONE)
     {
         Set_Motor_Speeds(0, 0);
         turn_state = TURN_STATE_IDLE;
         return;
     }
 
-    // 1. Calcular el "esfuerzo" de giro con el controlador P. No es un PWM.
-    int16_t turn_effort = FIXED_TO_INT(FIXED_MUL(error_fixed, turn_p_gain_fixed));
+    // 1. Calcular la salida del PID. La función `PID_Update` espera un valor entero.
+    //    El dt es 10ms, que es el período de llamada de esta función.
+    int32_t pid_output_fixed = PID_Update(&turn_pid, current_yaw_degrees, 10);
 
-    // 2. Limitar el esfuerzo a un rango [-max_turn_effort, +max_turn_effort]
-    if (turn_effort > max_turn_effort)
-        turn_effort = max_turn_effort;
-    if (turn_effort < -max_turn_effort)
-        turn_effort = -max_turn_effort;
+    // 2. Convertir la salida del PID a un "esfuerzo de giro" entero.
+    int16_t turn_effort = (int16_t)FIXED_TO_INT(pid_output_fixed);
 
     // 3. Escalar el esfuerzo a los PWM de cada motor usando sus velocidades base calibradas.
-    //    Un esfuerzo máximo (1000) corresponde a girar usando las velocidades base.
+    //    Un esfuerzo máximo (TURN_PID_MAX_EFFORT) corresponde a girar usando las velocidades base.
     //    Se usa int32_t para evitar desbordes en la multiplicación intermedia.
-    int16_t right_pwm = ((int32_t)turn_effort * right_motor_base_speed) / max_turn_effort;
-    int16_t left_pwm = ((int32_t)turn_effort * left_motor_base_speed) / max_turn_effort;
+    int16_t right_pwm = ((int32_t)turn_effort * right_motor_base_speed) / TURN_PID_MAX_EFFORT;
+    int16_t left_pwm = ((int32_t)turn_effort * left_motor_base_speed) / TURN_PID_MAX_EFFORT;
 
     // 4. Aplicar velocidades a los motores para girar en el sitio.
     //    Si el esfuerzo es positivo (error > 0), se gira a la derecha.
     //    Giro a la derecha: motor izquierdo adelante (PWM positivo), motor derecho atrás (PWM negativo).
+    //    Aquí, el esfuerzo ya tiene signo, así que lo aplicamos directamente.
+    //    Para girar a la derecha (esfuerzo > 0), el motor derecho debe ir hacia atrás (-right_pwm) y el izquierdo hacia adelante (+left_pwm).
     Set_Motor_Speeds(-right_pwm, left_pwm);
 }
 

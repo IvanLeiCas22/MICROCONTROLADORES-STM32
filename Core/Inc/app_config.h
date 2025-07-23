@@ -75,6 +75,8 @@ typedef enum
     CMD_GET_MOTOR_BASE_SPEEDS = 0x45,  // Para leer velocidades base independientes
     CMD_CALIBRATE_MOTORS = 0x46,       // Para calibrar motores automáticamente
     CMD_TURN_DEGREES = 0x47,           // Para girar un número de grados
+    CMD_SET_TURN_PID_GAINS = 0x48,     // Para configurar Kp, Ki, Kd del PID de giro
+    CMD_GET_TURN_PID_GAINS = 0x49,     // Para leer Kp, Ki, Kd del PID de giro
     CMD_OTHERS
 } CommandIdTypeDef;
 
@@ -147,6 +149,7 @@ extern SystemFlagTypeDef flags0;
 #define UNERBUS_CONTROL_PARAMS_SIZE (sizeof(uint16_t) * 3)    // Setpoint, Speed, Correction como uint16_t
 #define UNERBUS_MOTOR_BASE_SPEEDS_SIZE (sizeof(uint16_t) * 2) // Right, Left motor base speeds como uint16_t
 #define UNERBUS_TURN_DEGREES_SIZE 2                           // int16_t
+#define UNERBUS_TURN_PID_GAINS_SIZE (sizeof(uint16_t) * 3)    // Kp, Ki, Kd para el giro como uint16_t
 
 /* USB CDC Buffer Sizes */
 #define USB_CDC_RX_BUFFER_SIZE 128
@@ -179,5 +182,12 @@ extern SystemFlagTypeDef flags0;
 // Scaling factor to convert raw gyro Z value to Q16.16 fixed-point degrees
 // Formula: (dt_s * (1 << 16)) / LSB_per_dps = (0.01s * 65536) / 131 = 4.995...
 #define GYRO_Z_SCALER 5
+
+/* --- Turn PID Controller --- */
+#define TURN_PID_KP_DEFAULT 80.0f   // Ganancia Proporcional inicial
+#define TURN_PID_KI_DEFAULT 0.0f    // Ganancia Integral (iniciamos en 0)
+#define TURN_PID_KD_DEFAULT 150.0f  // Ganancia Derivativa inicial (NOTA: estos valores probablemente necesiten reajuste)
+#define TURN_PID_MAX_EFFORT 1000    // Esfuerzo máximo de giro (rango de -1000 a 1000)
+#define TURN_COMPLETION_DEAD_ZONE 1 // Zona muerta en grados para considerar el giro completo
 
 #endif /* INC_APP_CONFIG_H_ */
