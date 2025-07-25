@@ -29,6 +29,7 @@ extern DMA_HandleTypeDef hdma_i2c2_tx;
 // VARIABLES GLOBALES DEL MÓDULO
 //==============================================================================
 SystemFlagTypeDef flags0;
+uint16_t pwm_max_value = 1000; // Valor máximo del PWM
 
 _sESP01Handle esp01_handle;
 _sUNERBUSHandle unerbus_pc_handle;
@@ -246,9 +247,9 @@ void DecodeCMD(struct UNERBUSHandle *aBus, uint8_t iStartData)
         UNERBUS_WriteByte(aBus, CMD_ACK); // Confirmar calibración
         length = UNERBUS_CMD_ID_SIZE + UNERBUS_ACK_SIZE;
         break;
-    case CMD_SET_UART_BYPASS_CONTROL:         // UART_BYPASS_CONTROL - Activar/desactivar bypass
-        UART_BYPASS = UNERBUS_GetUInt8(aBus); // 0 o 1
-        UNERBUS_WriteByte(aBus, UART_BYPASS); // Confirmar estado
+    case CMD_SET_UART_BYPASS_CONTROL: // UART_BYPASS_CONTROL - Activar/desactivar bypass
+        UART_BYPASS = !UART_BYPASS;
+        UNERBUS_WriteByte(aBus, UART_BYPASS);
         length = UNERBUS_CMD_ID_SIZE + UNERBUS_BYPASS_STATUS_SIZE;
         break;
     case CMD_GET_MPU_DATA: // Enviar datos del MPU6050 calibrados
@@ -284,8 +285,8 @@ void DecodeCMD(struct UNERBUSHandle *aBus, uint8_t iStartData)
         for (uint8_t i = 0; i < PWM_CHANNELS; i++)
         {
             uint16_t pwm_val = UNERBUS_GetUInt16(aBus);
-            if (pwm_val > PWM_MAX_VALUE)
-                pwm_val = PWM_MAX_VALUE; // Limitar a máximo
+            if (pwm_val > pwm_max_value)
+                pwm_val = pwm_max_value; // Limitar a máximo
             motor_pwm_values[i] = pwm_val;
         }
 
@@ -308,16 +309,46 @@ void DecodeCMD(struct UNERBUSHandle *aBus, uint8_t iStartData)
         break;
     case CMD_GET_MOTOR_PWM:                         // Obtener valores PWM actuales
         uint8_t pwm_current_buffer[PWM_DATA_BYTES]; // Buffer para valores actuales
+        uint16_t idx_pwm = 0;
 
-        // Convertir valores actuales a bytes (Little Endian)
-        for (uint8_t i = 0; i < PWM_CHANNELS; i++)
-        {
-            pwm_current_buffer[i * 2] = (uint8_t)(motor_pwm_values[i] & 0xFF);            // Byte bajo
-            pwm_current_buffer[i * 2 + 1] = (uint8_t)((motor_pwm_values[i] >> 8) & 0xFF); // Byte alto
-        }
+        // Leer los valores directamente de los registros de comparación del temporizador
+        // Este es el valor real que se está aplicando a los motores.
+        uint16_t right_rev = __HAL_TIM_GET_COMPARE(&htim4, TIM_CHANNEL_1);
+        uint16_t right_fwd = __HAL_TIM_GET_COMPARE(&htim4, TIM_CHANNEL_2);
+        uint16_t left_rev = __HAL_TIM_GET_COMPARE(&htim4, TIM_CHANNEL_3);
+        uint16_t left_fwd = __HAL_TIM_GET_COMPARE(&htim4, TIM_CHANNEL_4);
+
+        // Escribir en el buffer en el orden esperado por la HMI (Little Endian)
+        pwm_current_buffer[idx_pwm++] = (uint8_t)(right_rev & 0xFF);
+        pwm_current_buffer[idx_pwm++] = (uint8_t)((right_rev >> 8) & 0xFF);
+        pwm_current_buffer[idx_pwm++] = (uint8_t)(right_fwd & 0xFF);
+        pwm_current_buffer[idx_pwm++] = (uint8_t)((right_fwd >> 8) & 0xFF);
+        pwm_current_buffer[idx_pwm++] = (uint8_t)(left_rev & 0xFF);
+        pwm_current_buffer[idx_pwm++] = (uint8_t)((left_rev >> 8) & 0xFF);
+        pwm_current_buffer[idx_pwm++] = (uint8_t)(left_fwd & 0xFF);
+        pwm_current_buffer[idx_pwm++] = (uint8_t)((left_fwd >> 8) & 0xFF);
 
         UNERBUS_Write(aBus, pwm_current_buffer, PWM_DATA_BYTES);
         length = UNERBUS_CMD_ID_SIZE + PWM_DATA_BYTES; // 1 (CMD) + 8 (datos)
+        break;
+    case CMD_SET_PWM_PERIOD:
+        uint16_t new_period = UNERBUS_GetUInt16(aBus);
+        // Validar para evitar valores que puedan dañar el hardware o bloquear el timer
+        if (new_period > 100 && new_period <= 65535)
+        {
+            pwm_max_value = new_period;
+            // Actualizar el registro de auto-recarga del temporizador
+            __HAL_TIM_SET_AUTORELOAD(&htim4, pwm_max_value - 1);
+        }
+        UNERBUS_WriteByte(aBus, CMD_ACK);
+        length = UNERBUS_CMD_ID_SIZE + UNERBUS_ACK_SIZE;
+        break;
+    case CMD_GET_PWM_PERIOD:
+        uint8_t period_buffer[UNERBUS_PWM_PERIOD_SIZE];
+        period_buffer[0] = (uint8_t)(pwm_max_value & 0xFF);
+        period_buffer[1] = (uint8_t)((pwm_max_value >> 8) & 0xFF);
+        UNERBUS_Write(aBus, period_buffer, UNERBUS_PWM_PERIOD_SIZE);
+        length = UNERBUS_CMD_ID_SIZE + UNERBUS_PWM_PERIOD_SIZE;
         break;
     case CMD_SET_PID_GAINS: // Configurar Kp, Ki, Kd
         // Se esperan 3 valores uint16_t: Kp*1000, Ki*1000, Kd*1000
@@ -814,6 +845,7 @@ void App_Core_Init(void)
 
     /* Timers */
     HAL_TIM_Base_Start_IT(&htim1);
+    __HAL_TIM_SET_AUTORELOAD(&htim4, pwm_max_value - 1);
     __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_1, 0);
     __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_2, 0);
     __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_3, 0);
@@ -900,12 +932,12 @@ void App_Core_Control_Loop(void)
     // 4. Limitar (saturar) la velocidad de los motores al rango válido de PWM.
     if (right_motor_speed < 0)
         right_motor_speed = 0;
-    if (right_motor_speed > PWM_MAX_VALUE)
-        right_motor_speed = PWM_MAX_VALUE;
+    if (right_motor_speed > pwm_max_value)
+        right_motor_speed = pwm_max_value;
     if (left_motor_speed < 0)
         left_motor_speed = 0;
-    if (left_motor_speed > PWM_MAX_VALUE)
-        left_motor_speed = PWM_MAX_VALUE;
+    if (left_motor_speed > pwm_max_value)
+        left_motor_speed = pwm_max_value;
 
     // 5. Asignar a los canales de avance de los motores
     Set_Motor_Speeds(right_motor_speed, left_motor_speed);
@@ -1041,21 +1073,21 @@ static void Set_Motor_Speeds(int16_t right_speed, int16_t left_speed)
     // Lógica para motor derecho
     if (right_speed > 0)
     {
-        right_fwd = (right_speed > PWM_MAX_VALUE) ? PWM_MAX_VALUE : right_speed;
+        right_fwd = (right_speed > pwm_max_value) ? pwm_max_value : right_speed;
     }
     else
     {
-        right_rev = (-right_speed > PWM_MAX_VALUE) ? PWM_MAX_VALUE : -right_speed;
+        right_rev = (-right_speed > pwm_max_value) ? pwm_max_value : -right_speed;
     }
 
     // Lógica para motor izquierdo
     if (left_speed > 0)
     {
-        left_fwd = (left_speed > PWM_MAX_VALUE) ? PWM_MAX_VALUE : left_speed;
+        left_fwd = (left_speed > pwm_max_value) ? pwm_max_value : left_speed;
     }
     else
     {
-        left_rev = (-left_speed > PWM_MAX_VALUE) ? PWM_MAX_VALUE : -left_speed;
+        left_rev = (-left_speed > pwm_max_value) ? pwm_max_value : -left_speed;
     }
 
     // Motor derecho: ch2 adelante (TIM4_CH2), ch1 atrás (TIM4_CH1)

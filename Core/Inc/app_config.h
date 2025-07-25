@@ -77,6 +77,8 @@ typedef enum
     CMD_TURN_DEGREES = 0x47,           // Para girar un número de grados
     CMD_SET_TURN_PID_GAINS = 0x48,     // Para configurar Kp, Ki, Kd del PID de giro
     CMD_GET_TURN_PID_GAINS = 0x49,     // Para leer Kp, Ki, Kd del PID de giro
+    CMD_SET_PWM_PERIOD = 0x50,
+    CMD_GET_PWM_PERIOD = 0x51,
     CMD_OTHERS
 } CommandIdTypeDef;
 
@@ -129,8 +131,7 @@ extern SystemFlagTypeDef flags0;
 
 /* PWM */
 #define PWM_CHANNELS 4
-#define PWM_MAX_VALUE 9999
-#define PWM_50_PERCENT (PWM_MAX_VALUE / 2)
+extern uint16_t pwm_max_value;
 #define PWM_DATA_BYTES (PWM_CHANNELS * 2)
 
 /* Timers */
@@ -150,6 +151,7 @@ extern SystemFlagTypeDef flags0;
 #define UNERBUS_MOTOR_BASE_SPEEDS_SIZE (sizeof(uint16_t) * 2) // Right, Left motor base speeds como uint16_t
 #define UNERBUS_TURN_DEGREES_SIZE 2                           // int16_t
 #define UNERBUS_TURN_PID_GAINS_SIZE (sizeof(uint16_t) * 3)    // Kp, Ki, Kd para el giro como uint16_t
+#define UNERBUS_PWM_PERIOD_SIZE (sizeof(uint16_t))
 
 /* USB CDC Buffer Sizes */
 #define USB_CDC_RX_BUFFER_SIZE 128
