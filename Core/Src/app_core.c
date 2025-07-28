@@ -29,7 +29,7 @@ extern DMA_HandleTypeDef hdma_i2c2_tx;
 // VARIABLES GLOBALES DEL MÓDULO
 //==============================================================================
 SystemFlagTypeDef flags0;
-uint16_t pwm_max_value = 1000; // Valor máximo del PWM
+uint16_t pwm_max_value = 6500; // Valor máximo del PWM
 
 _sESP01Handle esp01_handle;
 _sUNERBUSHandle unerbus_pc_handle;
@@ -51,17 +51,19 @@ Button_HandleTypeDef h_user_button;
 uint16_t motor_pwm_values[PWM_CHANNELS] = {0, 0, 0, 0};
 static volatile I2C_BusStateTypeDef i2c_bus_state = I2C_BUS_IDLE;
 
-PID_Controller_t wall_pid;
+PID_Controller_t centering_pid;
 PID_Controller_t turn_pid;
-uint16_t wall_follow_setpoint = 300;    // Valor ADC objetivo
-uint16_t base_speed = 4000;             // Velocidad base de referencia
-uint16_t right_motor_base_speed = 5000; // Velocidad base motor derecho
-uint16_t left_motor_base_speed = 2500;  // Velocidad base motor izquierdo
-uint16_t max_pwm_correction = 4000;     // Corrección máxima del PID
+uint16_t right_motor_base_speed = 2600;   // Velocidad base motor derecho
+uint16_t left_motor_base_speed = 2600;    // Velocidad base motor izquierdo
+uint16_t wall_detection_threshold = 1500; // Umbral ADC para detectar pared
+uint16_t max_pwm_correction = 4000;       // Corrección máxima del PID
+uint16_t turn_max_speed = TURN_MAX_SPEED_DEFAULT;
+uint16_t turn_min_speed = TURN_MIN_SPEED_DEFAULT;
 
-static volatile TurnStateTypeDef turn_state = TURN_STATE_IDLE;
 static int32_t current_yaw_fixed = 0; // Yaw angle in Q16.16 fixed-point (degrees)
-static int32_t target_yaw_fixed = 0;  // Target yaw for turning
+static int32_t gyro_z_scaler;         // Factor de escala dinámico para el giroscopio
+
+static volatile RobotStateTypeDef robot_state = STATE_IDLE;
 
 //==============================================================================
 // PROTOTIPOS DE FUNCIONES PRIVADAS
@@ -84,12 +86,16 @@ void IndicateError(uint8_t blinks, uint32_t delay_ms);
 int8_t I2C_DevicesInit(void);
 static void ManageI2CTransactions(void);
 uint8_t UART_TransmitByte(uint8_t value);
-void App_Core_Control_Loop(void);
 
-static void Update_Yaw(void);
-static void Manage_Turn(void);
-void Turn_Start(int16_t angle_degrees);
+static void Update_Gyro_Scaler(void);
 static void Set_Motor_Speeds(int16_t right_speed, int16_t left_speed);
+
+static void Handle_Idle(void);
+static void Handle_Centering(void);
+static void Handle_Deciding(void);
+static void Manage_Turn(void);
+static void Update_Yaw(void);
+void Turn_Start(int16_t angle_degrees);
 
 //==============================================================================
 // IMPLEMENTACIÓN DE WRAPPERS DE CALLBACKS HAL
@@ -350,6 +356,50 @@ void DecodeCMD(struct UNERBUSHandle *aBus, uint8_t iStartData)
         UNERBUS_Write(aBus, period_buffer, UNERBUS_PWM_PERIOD_SIZE);
         length = UNERBUS_CMD_ID_SIZE + UNERBUS_PWM_PERIOD_SIZE;
         break;
+    case CMD_SET_MPU_CONFIG:
+    {
+        uint8_t new_accel_range = UNERBUS_GetUInt8(aBus);
+        uint8_t new_gyro_range = UNERBUS_GetUInt8(aBus);
+        uint8_t new_dlpf_config = UNERBUS_GetUInt8(aBus);
+
+        // --- Validación de los datos recibidos (Sugerencia implementada) ---
+        // Se comprueba que los valores estén dentro de los rangos permitidos por el MPU6050.h
+        bool is_valid = (new_accel_range == MPU6050_ACCEL_RANGE_2G || new_accel_range == MPU6050_ACCEL_RANGE_4G || new_accel_range == MPU6050_ACCEL_RANGE_8G || new_accel_range == MPU6050_ACCEL_RANGE_16G) &&
+                        (new_gyro_range == MPU6050_GYRO_RANGE_250DPS || new_gyro_range == MPU6050_GYRO_RANGE_500DPS || new_gyro_range == MPU6050_GYRO_RANGE_1000DPS || new_gyro_range == MPU6050_GYRO_RANGE_2000DPS) &&
+                        (new_dlpf_config <= MPU6050_DLPF_5HZ);
+
+        if (is_valid)
+        {
+            hmpu.accel_range = new_accel_range;
+            hmpu.gyro_range = new_gyro_range;
+            hmpu.dlpf_config = new_dlpf_config;
+
+            // Re-inicializar el MPU para aplicar la nueva configuración
+            MPU6050_Init(&hmpu);
+
+            // Actualizar el escalador del giroscopio con la nueva configuración
+            Update_Gyro_Scaler();
+        }
+
+        // --- Respuesta con la configuración actual (Sugerencia implementada) ---
+        // Se envía la configuración que está actualmente en el handle, ya sea la nueva o la anterior si la validación falló.
+        // Esto sirve como confirmación explícita para la HMI.
+        uint8_t mpu_config_buffer[UNERBUS_MPU_CONFIG_SIZE];
+        mpu_config_buffer[0] = hmpu.accel_range;
+        mpu_config_buffer[1] = hmpu.gyro_range;
+        mpu_config_buffer[2] = hmpu.dlpf_config;
+        UNERBUS_Write(aBus, mpu_config_buffer, UNERBUS_MPU_CONFIG_SIZE);
+        length = UNERBUS_CMD_ID_SIZE + UNERBUS_MPU_CONFIG_SIZE;
+    }
+    break;
+    case CMD_GET_MPU_CONFIG:
+        uint8_t mpu_config_buffer[UNERBUS_MPU_CONFIG_SIZE];
+        mpu_config_buffer[0] = hmpu.accel_range;
+        mpu_config_buffer[1] = hmpu.gyro_range;
+        mpu_config_buffer[2] = hmpu.dlpf_config;
+        UNERBUS_Write(aBus, mpu_config_buffer, UNERBUS_MPU_CONFIG_SIZE);
+        length = UNERBUS_CMD_ID_SIZE + UNERBUS_MPU_CONFIG_SIZE;
+        break;
     case CMD_SET_PID_GAINS: // Configurar Kp, Ki, Kd
         // Se esperan 3 valores uint16_t: Kp*1000, Ki*1000, Kd*1000
         kp_int = UNERBUS_GetUInt16(aBus);
@@ -359,9 +409,9 @@ void DecodeCMD(struct UNERBUSHandle *aBus, uint8_t iStartData)
         // Convertir de entero a punto fijo (dividiendo por 1000.0)
         // Para evitar floats, hacemos la división en punto fijo:
         // value_fixed = (value_int * 2^16) / 1000
-        wall_pid.kp = (int32_t)(((int64_t)kp_int << FIXED_POINT_SHIFT) / 1000);
-        wall_pid.ki = (int32_t)(((int64_t)ki_int << FIXED_POINT_SHIFT) / 1000);
-        wall_pid.kd = (int32_t)(((int64_t)kd_int << FIXED_POINT_SHIFT) / 1000);
+        centering_pid.kp = (int32_t)(((int64_t)kp_int << FIXED_POINT_SHIFT) / 1000);
+        centering_pid.ki = (int32_t)(((int64_t)ki_int << FIXED_POINT_SHIFT) / 1000);
+        centering_pid.kd = (int32_t)(((int64_t)kd_int << FIXED_POINT_SHIFT) / 1000);
 
         // Enviar confirmación (ACK)
         UNERBUS_WriteByte(aBus, CMD_ACK);
@@ -371,9 +421,9 @@ void DecodeCMD(struct UNERBUSHandle *aBus, uint8_t iStartData)
         uint8_t response_buffer[UNERBUS_PID_GAINS_SIZE];
 
         // Convertir de punto fijo a entero para enviar
-        kp_int = (uint16_t)(((int64_t)wall_pid.kp * 1000) >> FIXED_POINT_SHIFT);
-        ki_int = (uint16_t)(((int64_t)wall_pid.ki * 1000) >> FIXED_POINT_SHIFT);
-        kd_int = (uint16_t)(((int64_t)wall_pid.kd * 1000) >> FIXED_POINT_SHIFT);
+        kp_int = (uint16_t)(((int64_t)centering_pid.kp * 1000) >> FIXED_POINT_SHIFT);
+        ki_int = (uint16_t)(((int64_t)centering_pid.ki * 1000) >> FIXED_POINT_SHIFT);
+        kd_int = (uint16_t)(((int64_t)centering_pid.kd * 1000) >> FIXED_POINT_SHIFT);
 
         response_buffer[0] = (uint8_t)(kp_int & 0xFF);
         response_buffer[1] = (uint8_t)((kp_int >> 8) & 0xFF);
@@ -387,13 +437,12 @@ void DecodeCMD(struct UNERBUSHandle *aBus, uint8_t iStartData)
         break;
     case CMD_SET_CONTROL_PARAMETERS: // Configurar Setpoint, Base Speed, Max Correction
         // Se esperan 3 valores uint16_t
-        wall_follow_setpoint = UNERBUS_GetUInt16(aBus);
-        base_speed = UNERBUS_GetUInt16(aBus);
+        wall_detection_threshold = UNERBUS_GetUInt16(aBus);
         max_pwm_correction = UNERBUS_GetUInt16(aBus);
 
         // Actualizar la configuración del PID con los nuevos valores
-        PID_Set_Setpoint(&wall_pid, wall_follow_setpoint);
-        PID_Set_Output_Limits(&wall_pid, INT_TO_FIXED(-max_pwm_correction), INT_TO_FIXED(max_pwm_correction));
+        PID_Set_Setpoint(&centering_pid, wall_detection_threshold);
+        PID_Set_Output_Limits(&centering_pid, INT_TO_FIXED(-max_pwm_correction), INT_TO_FIXED(max_pwm_correction));
 
         // Enviar confirmación (ACK)
         UNERBUS_WriteByte(aBus, CMD_ACK);
@@ -402,12 +451,10 @@ void DecodeCMD(struct UNERBUSHandle *aBus, uint8_t iStartData)
     case CMD_GET_CONTROL_PARAMETERS: // Leer Setpoint, Base Speed, Max Correction
         uint8_t response_buffer_2[UNERBUS_CONTROL_PARAMS_SIZE];
 
-        response_buffer_2[0] = (uint8_t)(wall_follow_setpoint & 0xFF);
-        response_buffer_2[1] = (uint8_t)((wall_follow_setpoint >> 8) & 0xFF);
-        response_buffer_2[2] = (uint8_t)(base_speed & 0xFF);
-        response_buffer_2[3] = (uint8_t)((base_speed >> 8) & 0xFF);
-        response_buffer_2[4] = (uint8_t)(max_pwm_correction & 0xFF);
-        response_buffer_2[5] = (uint8_t)((max_pwm_correction >> 8) & 0xFF);
+        response_buffer_2[0] = (uint8_t)(wall_detection_threshold & 0xFF);
+        response_buffer_2[1] = (uint8_t)((wall_detection_threshold >> 8) & 0xFF);
+        response_buffer_2[2] = (uint8_t)(max_pwm_correction & 0xFF);
+        response_buffer_2[3] = (uint8_t)((max_pwm_correction >> 8) & 0xFF);
 
         UNERBUS_Write(aBus, response_buffer_2, UNERBUS_CONTROL_PARAMS_SIZE);
         length = UNERBUS_CMD_ID_SIZE + UNERBUS_CONTROL_PARAMS_SIZE;
@@ -416,9 +463,6 @@ void DecodeCMD(struct UNERBUSHandle *aBus, uint8_t iStartData)
         // Se esperan 2 valores uint16_t: Right Motor Base Speed, Left Motor Base Speed
         right_motor_base_speed = UNERBUS_GetUInt16(aBus);
         left_motor_base_speed = UNERBUS_GetUInt16(aBus);
-
-        // Actualizar también base_speed como promedio para compatibilidad
-        base_speed = (right_motor_base_speed + left_motor_base_speed) / 2;
 
         // Enviar confirmación (ACK)
         UNERBUS_WriteByte(aBus, CMD_ACK);
@@ -486,6 +530,49 @@ void DecodeCMD(struct UNERBUSHandle *aBus, uint8_t iStartData)
         UNERBUS_Write(aBus, turn_pid_buffer, UNERBUS_TURN_PID_GAINS_SIZE);
         length = UNERBUS_CMD_ID_SIZE + UNERBUS_TURN_PID_GAINS_SIZE;
         break;
+    case CMD_SET_TURN_MAX_SPEED:
+        turn_max_speed = UNERBUS_GetUInt16(aBus);
+        if (turn_max_speed > pwm_max_value)
+            turn_max_speed = pwm_max_value; // Limitar al máximo global
+        UNERBUS_WriteByte(aBus, CMD_ACK);
+        length = UNERBUS_CMD_ID_SIZE + UNERBUS_ACK_SIZE;
+        break;
+    case CMD_GET_TURN_MAX_SPEED:
+        uint8_t speed_buffer[UNERBUS_TURN_MAX_SPEED_SIZE];
+        speed_buffer[0] = (uint8_t)(turn_max_speed & 0xFF);
+        speed_buffer[1] = (uint8_t)((turn_max_speed >> 8) & 0xFF);
+        UNERBUS_Write(aBus, speed_buffer, UNERBUS_TURN_MAX_SPEED_SIZE);
+        length = UNERBUS_CMD_ID_SIZE + UNERBUS_TURN_MAX_SPEED_SIZE;
+        break;
+    case CMD_SET_TURN_MIN_SPEED:
+        turn_min_speed = UNERBUS_GetUInt16(aBus);
+        if (turn_min_speed > turn_max_speed)
+            turn_min_speed = turn_max_speed; // No puede ser mayor que la máxima
+        UNERBUS_WriteByte(aBus, CMD_ACK);
+        length = UNERBUS_CMD_ID_SIZE + UNERBUS_ACK_SIZE;
+        break;
+    case CMD_GET_TURN_MIN_SPEED:
+        uint8_t min_speed_buffer[UNERBUS_TURN_MIN_SPEED_SIZE];
+        min_speed_buffer[0] = (uint8_t)(turn_min_speed & 0xFF);
+        min_speed_buffer[1] = (uint8_t)((turn_min_speed >> 8) & 0xFF);
+        UNERBUS_Write(aBus, min_speed_buffer, UNERBUS_TURN_MIN_SPEED_SIZE);
+        length = UNERBUS_CMD_ID_SIZE + UNERBUS_TURN_MIN_SPEED_SIZE;
+        break;
+    case CMD_SET_WALL_THRESHOLD:
+        wall_detection_threshold = UNERBUS_GetUInt16(aBus);
+        UNERBUS_WriteByte(aBus, CMD_ACK);
+        length = UNERBUS_CMD_ID_SIZE + UNERBUS_ACK_SIZE;
+        break;
+    case CMD_GET_WALL_THRESHOLD:
+        UNERBUS_WriteByte(aBus, (uint8_t)(wall_detection_threshold & 0xFF));
+        UNERBUS_WriteByte(aBus, (uint8_t)(wall_detection_threshold >> 8));
+        length = UNERBUS_CMD_ID_SIZE + UNERBUS_WALL_THRESHOLD_SIZE;
+        break;
+    default:
+        // Comando desconocido, enviar ACK de error
+        /*         UNERBUS_WriteByte(aBus, CMD_NACK);
+                length = UNERBUS_CMD_ID_SIZE + UNERBUS_NACK_SIZE; */
+        break;
     }
 
     if (length)
@@ -539,19 +626,29 @@ void Do100ms()
     snprintf(text_line1, sizeof(text_line1), "Yaw: %ld deg", yaw_degrees);
     SSD1306_DrawText(&hssd, 0, 0, text_line1, SSD1306_TEXT_ALIGN_LEFT);
 
-    // Mostrar estado del robot
-    if (turn_state == TURN_STATE_TURNING)
+    switch (robot_state)
     {
-        int32_t target_deg = FIXED_TO_INT(target_yaw_fixed);
-        snprintf(text_line2, sizeof(text_line2), "Turn -> %ld", target_deg);
-    }
-    else if (ACTIVATE_PID)
-    {
-        snprintf(text_line2, sizeof(text_line2), "PID Active");
-    }
-    else
-    {
+    case STATE_IDLE:
         snprintf(text_line2, sizeof(text_line2), "Idle");
+        break;
+    case STATE_CENTERING:
+        snprintf(text_line2, sizeof(text_line2), "Centering...");
+        break;
+    case STATE_DECIDING:
+        snprintf(text_line2, sizeof(text_line2), "Deciding...");
+        break;
+    case STATE_TURNING_LEFT:
+        snprintf(text_line2, sizeof(text_line2), "Turn Left -90");
+        break;
+    case STATE_TURNING_RIGHT:
+        snprintf(text_line2, sizeof(text_line2), "Turn Right 90");
+        break;
+    case STATE_TURN_AROUND:
+        snprintf(text_line2, sizeof(text_line2), "Turn Around 180");
+        break;
+    default:
+        snprintf(text_line2, sizeof(text_line2), "Unknown State");
+        break;
     }
     SSD1306_DrawText(&hssd, 0, 10, text_line2, SSD1306_TEXT_ALIGN_LEFT);
 
@@ -631,7 +728,7 @@ int8_t I2C_DevicesInit(void)
     hmpu.i2c_read_dma = I2C_ReadDMA;
     hmpu.delay_ms = HAL_Delay;
     hmpu.accel_range = MPU6050_ACCEL_RANGE_2G;
-    hmpu.gyro_range = MPU6050_GYRO_RANGE_250DPS;
+    hmpu.gyro_range = MPU6050_GYRO_RANGE_500DPS;
     hmpu.dlpf_config = MPU6050_DLPF_44HZ;
     hmpu.i2c_context = &hi2c2;
     hmpu.device_address = MPU6050_ADDR;
@@ -763,26 +860,26 @@ static void ManageButtonEvents(void)
             /* code */
             break;
         case EVENT_PRESS_RELEASED:
-            ACTIVATE_PID = !ACTIVATE_PID; // Toggle PID activation
+            MAZE_SOLVING_ACTIVE = !MAZE_SOLVING_ACTIVE; // Alternar estado
 
-            if (!ACTIVATE_PID)
+            if (MAZE_SOLVING_ACTIVE)
             {
-                // si el PID no está activado, detener los motores
-                Set_Motor_Speeds(0, 0);
+                robot_state = STATE_CENTERING; // Empezar a resolver
+                PID_Reset(&centering_pid);
+                PID_Reset(&turn_pid);
             }
             else
             {
-                // Si el PID está activado, reiniciar el controlador PID
-                PID_Reset(&wall_pid);
+                robot_state = STATE_IDLE; // Detenerse
+                Set_Motor_Speeds(0, 0);   // Apagar motores
             }
-            /* code */
             break;
         case EVENT_LONG_PRESS:
             /* code */
             break;
         case EVENT_LONG_PRESS_RELEASED:
             // Iniciar un giro de 90 grados a la derecha
-            Turn_Start(90);
+            // Turn_Start(90);
             break;
         default:
             break;
@@ -870,9 +967,9 @@ void App_Core_Init(void)
     UNERBUS_Init(&unerbus_pc_handle);
 
     /* --- INICIALIZACIÓN DEL PID DE SEGUIMIENTO DE PARED --- */
-    PID_Init(&wall_pid, FLOAT_TO_FIXED(1), FLOAT_TO_FIXED(0), FLOAT_TO_FIXED(0));
-    PID_Set_Setpoint(&wall_pid, wall_follow_setpoint);
-    PID_Set_Output_Limits(&wall_pid, INT_TO_FIXED(-max_pwm_correction), INT_TO_FIXED(max_pwm_correction));
+    PID_Init(&centering_pid, FLOAT_TO_FIXED(0.8f), FLOAT_TO_FIXED(0.0f), FLOAT_TO_FIXED(0.2f)); // Kp, Ki, Kd
+    PID_Set_Setpoint(&centering_pid, 0);                                                        // Objetivo: diferencia entre sensores es 0
+    PID_Set_Output_Limits(&centering_pid, INT_TO_FIXED(-max_pwm_correction), INT_TO_FIXED(max_pwm_correction));
 
     /* --- INICIALIZACIÓN DEL PID DE GIRO --- */
     PID_Init(&turn_pid,
@@ -881,12 +978,16 @@ void App_Core_Init(void)
              FLOAT_TO_FIXED(TURN_PID_KD_DEFAULT));
     PID_Set_Output_Limits(&turn_pid, INT_TO_FIXED(-TURN_PID_MAX_EFFORT), INT_TO_FIXED(TURN_PID_MAX_EFFORT));
 
+    srand(1); // Inicializa la semilla para rand()
+
     /* Buttons*/
     Button_Init(&h_user_button, Read_User_Button, NULL);
 
     /* I2C devices */
     HAL_Delay(DEVICE_INIT_DELAY_MS);
     I2C_DevicesInit();
+    // Calcular el escalador inicial del giroscopio basado en la configuración por defecto
+    Update_Gyro_Scaler();
     SSD1306_UpdateScreen_DMA(&hssd);
     HAL_Delay(DEVICE_INIT_DELAY_MS);
 
@@ -896,51 +997,7 @@ void App_Core_Init(void)
     /* Flags */
     ON10MS = false;
     UART_BYPASS = false;
-    ACTIVATE_PID = false;
-}
-
-/**
- * @brief Bucle principal de control del robot (movimiento, sensores).
- *        Esta función se debe llamar periódicamente.
- */
-void App_Core_Control_Loop(void)
-{
-    // 1. Leer el valor del sensor de distancia derecho
-    // Se lee del buffer del ADC. Se usa el último valor completo y seguro.
-    uint8_t last_adc_idx = (adc_buf_write_idx == 0) ? (ADC_BUFFER_SIZE - 1) : (adc_buf_write_idx - 1);
-    uint16_t right_distance_raw = buf_adc[last_adc_idx][0]; // Canal 0 es el sensor derecho
-
-    // Lógica del sensor: ~4000 (cerca), ~0 (lejos).
-    // Error = Setpoint - ValorActual.
-    // - Si está muy cerca (Valor > Setpoint), Error < 0 -> Corrección negativa.
-    // - Si está muy lejos (Valor < Setpoint), Error > 0 -> Corrección positiva.
-
-    // 2. Calcular la salida del PID
-    // El tiempo dt es 10ms, que es el intervalo de llamada de Do10ms.
-    int32_t pid_output_fixed = PID_Update(&wall_pid, right_distance_raw, 10);
-
-    // Convertir la salida de punto fijo a un entero para la corrección de velocidad.
-    int16_t correction = (int16_t)FIXED_TO_INT(pid_output_fixed);
-
-    // 3. Aplicar la corrección a los motores para girar
-    // - Corrección positiva (lejos): Gira a la derecha (motor izq más rápido, der más lento).
-    // - Corrección negativa (cerca): Gira a la izquierda (motor der más rápido, izq más lento).
-    // IMPORTANTE: Usar velocidades base independientes para compensar diferencias entre motores
-    int16_t right_motor_speed = right_motor_base_speed - correction;
-    int16_t left_motor_speed = left_motor_base_speed + correction;
-
-    // 4. Limitar (saturar) la velocidad de los motores al rango válido de PWM.
-    if (right_motor_speed < 0)
-        right_motor_speed = 0;
-    if (right_motor_speed > pwm_max_value)
-        right_motor_speed = pwm_max_value;
-    if (left_motor_speed < 0)
-        left_motor_speed = 0;
-    if (left_motor_speed > pwm_max_value)
-        left_motor_speed = pwm_max_value;
-
-    // 5. Asignar a los canales de avance de los motores
-    Set_Motor_Speeds(right_motor_speed, left_motor_speed);
+    MAZE_SOLVING_ACTIVE = false;
 }
 
 void App_Core_Loop(void)
@@ -962,14 +1019,35 @@ void App_Core_Loop(void)
     if (ON10MS)
     {
         Do10ms();
-        // El control de giro tiene prioridad sobre el seguimiento de pared
-        if (turn_state == TURN_STATE_TURNING)
+
+        // --- MÁQUINA DE ESTADOS PRINCIPAL ---
+        if (MAZE_SOLVING_ACTIVE)
         {
-            Manage_Turn();
+            switch (robot_state)
+            {
+            case STATE_CENTERING:
+                Handle_Centering();
+                break;
+
+            case STATE_DECIDING:
+                Handle_Deciding();
+                break;
+
+            case STATE_TURNING_LEFT:
+            case STATE_TURNING_RIGHT:
+            case STATE_TURN_AROUND:
+                Manage_Turn(); // La lógica de giro se encarga de sí misma
+                break;
+
+            case STATE_IDLE:
+            default:
+                Handle_Idle();
+                break;
+            }
         }
-        else if (ACTIVATE_PID)
+        else
         {
-            App_Core_Control_Loop();
+            Handle_Idle();
         }
     }
 
@@ -993,7 +1071,7 @@ static void Update_Yaw(void)
 
     // Integrar para obtener el ángulo en punto fijo (Q16.16)
     // El escalador convierte el valor raw del giroscopio a un cambio de ángulo en grados (formato Q16.16) para un dt de 10ms.
-    current_yaw_fixed -= (int32_t)gz * GYRO_Z_SCALER;
+    current_yaw_fixed -= (int32_t)gz * gyro_z_scaler;
 }
 
 /**
@@ -1002,17 +1080,28 @@ static void Update_Yaw(void)
  */
 void Turn_Start(int16_t angle_degrees)
 {
-    if (turn_state == TURN_STATE_IDLE)
+    if (robot_state == STATE_CENTERING || robot_state == STATE_DECIDING)
     {
-        // Desactivar el PID de seguimiento de pared durante el giro
-        ACTIVATE_PID = false;
-        Set_Motor_Speeds(0, 0); // Detener motores antes de girar
-
-        // Resetear el PID de giro y establecer el nuevo ángulo objetivo
         PID_Reset(&turn_pid);
-        target_yaw_fixed = current_yaw_fixed + INT_TO_FIXED(angle_degrees);
-        PID_Set_Setpoint(&turn_pid, FIXED_TO_INT(target_yaw_fixed)); // El setpoint del PID es un entero
-        turn_state = TURN_STATE_TURNING;
+        // ¡ESTA ES LA CORRECCIÓN CLAVE!
+        // Establecemos el ángulo objetivo en el controlador PID.
+        PID_Set_Setpoint(&turn_pid, angle_degrees);
+
+        current_yaw_fixed = 0; // Reseteamos la medición de ángulo para un giro relativo.
+
+        // Asignar el estado de giro correcto
+        if (angle_degrees == 90)
+        {
+            robot_state = STATE_TURNING_RIGHT;
+        }
+        else if (angle_degrees == -90)
+        {
+            robot_state = STATE_TURNING_LEFT;
+        }
+        else // 180 o cualquier otro ángulo
+        {
+            robot_state = STATE_TURN_AROUND;
+        }
     }
 }
 
@@ -1022,43 +1111,46 @@ void Turn_Start(int16_t angle_degrees)
  */
 static void Manage_Turn(void)
 {
-    if (turn_state != TURN_STATE_TURNING)
+    if (robot_state != STATE_TURNING_LEFT && robot_state != STATE_TURNING_RIGHT && robot_state != STATE_TURN_AROUND)
     {
         return;
     }
 
-    // El error se calcula en grados enteros para simplicidad
     int32_t current_yaw_degrees = FIXED_TO_INT(current_yaw_fixed);
-    int32_t target_yaw_degrees = FIXED_TO_INT(target_yaw_fixed);
+    // Obtenemos el objetivo directamente del setpoint del PID
+    int32_t target_yaw_degrees = FIXED_TO_INT(turn_pid.setpoint);
     int32_t error_degrees = target_yaw_degrees - current_yaw_degrees;
 
     // Comprobar si el giro ha terminado
     if (abs(error_degrees) <= TURN_COMPLETION_DEAD_ZONE)
     {
         Set_Motor_Speeds(0, 0);
-        turn_state = TURN_STATE_IDLE;
+        robot_state = STATE_CENTERING;
+        PID_Reset(&centering_pid); // Reseteamos el PID de centrado para empezar de cero
         return;
     }
 
-    // 1. Calcular la salida del PID. La función `PID_Update` espera un valor entero.
-    //    El dt es 10ms, que es el período de llamada de esta función.
+    // 1. Calcular la salida del PID. Ahora usará el setpoint correcto internamente.
     int32_t pid_output_fixed = PID_Update(&turn_pid, current_yaw_degrees, 10);
 
     // 2. Convertir la salida del PID a un "esfuerzo de giro" entero.
     int16_t turn_effort = (int16_t)FIXED_TO_INT(pid_output_fixed);
 
-    // 3. Escalar el esfuerzo a los PWM de cada motor usando sus velocidades base calibradas.
-    //    Un esfuerzo máximo (TURN_PID_MAX_EFFORT) corresponde a girar usando las velocidades base.
-    //    Se usa int32_t para evitar desbordes en la multiplicación intermedia.
-    int16_t right_pwm = ((int32_t)turn_effort * right_motor_base_speed) / TURN_PID_MAX_EFFORT;
-    int16_t left_pwm = ((int32_t)turn_effort * left_motor_base_speed) / TURN_PID_MAX_EFFORT;
+    // 3. Escalar el esfuerzo a los PWM de cada motor.
+    int16_t motor_speed = ((int32_t)turn_effort * turn_max_speed) / TURN_PID_MAX_EFFORT;
 
-    // 4. Aplicar velocidades a los motores para girar en el sitio.
-    //    Si el esfuerzo es positivo (error > 0), se gira a la derecha.
-    //    Giro a la derecha: motor izquierdo adelante (PWM positivo), motor derecho atrás (PWM negativo).
-    //    Aquí, el esfuerzo ya tiene signo, así que lo aplicamos directamente.
-    //    Para girar a la derecha (esfuerzo > 0), el motor derecho debe ir hacia atrás (-right_pwm) y el izquierdo hacia adelante (+left_pwm).
-    Set_Motor_Speeds(-right_pwm, left_pwm);
+    // 4. Lógica de potencia mínima para vencer la inercia.
+    if (motor_speed > 0 && motor_speed < turn_min_speed)
+    {
+        motor_speed = turn_min_speed;
+    }
+    else if (motor_speed < 0 && motor_speed > -turn_min_speed)
+    {
+        motor_speed = -turn_min_speed;
+    }
+
+    // 5. Aplicar velocidades a los motores para girar en el sitio.
+    Set_Motor_Speeds(-motor_speed, motor_speed);
 }
 
 /**
@@ -1097,4 +1189,115 @@ static void Set_Motor_Speeds(int16_t right_speed, int16_t left_speed)
     // Motor izquierdo: ch4 adelante (TIM4_CH4), ch3 atrás (TIM4_CH3)
     __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_4, left_fwd);
     __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_3, left_rev);
+}
+
+/**
+ * @brief Actualiza el factor de escala del giroscopio según la configuración actual.
+ *        Este factor se usa para convertir el valor raw del giroscopio a grados/s.
+ */
+static void Update_Gyro_Scaler(void)
+{
+    // La fórmula es: (dt_s * (1 << 16)) / LSB_per_dps
+    // dt_s = 0.01s (10ms), (1 << 16) = 65536
+    // El resultado es (655.36 / LSB_per_dps)
+    switch (hmpu.gyro_range)
+    {
+    case MPU6050_GYRO_RANGE_250DPS:
+        // LSB/dps = 131
+        gyro_z_scaler = 5; // 655.36 / 131 = 4.995...
+        break;
+    case MPU6050_GYRO_RANGE_500DPS:
+        // LSB/dps = 65.5
+        gyro_z_scaler = 10; // 655.36 / 65.5 = 9.99...
+        break;
+    case MPU6050_GYRO_RANGE_1000DPS:
+        // LSB/dps = 32.8
+        gyro_z_scaler = 20; // 655.36 / 32.8 = 19.98...
+        break;
+    case MPU6050_GYRO_RANGE_2000DPS:
+        // LSB/dps = 16.4
+        gyro_z_scaler = 40; // 655.36 / 16.4 = 39.96...
+        break;
+    default:
+        // Caso por defecto seguro
+        gyro_z_scaler = 5;
+        break;
+    }
+}
+
+static void Handle_Idle(void)
+{
+    Set_Motor_Speeds(0, 0); // Asegurarse de que los motores estén parados
+}
+
+static void Handle_Centering(void)
+{
+    // 1. Leer sensores laterales
+    uint8_t last_adc_idx = (adc_buf_write_idx == 0) ? (ADC_BUFFER_SIZE - 1) : (adc_buf_write_idx - 1);
+    int32_t left_sensor_val = buf_adc[last_adc_idx][SENSOR_LEFT_LAT_CH];
+    int32_t right_sensor_val = buf_adc[last_adc_idx][SENSOR_RIGHT_LAT_CH];
+
+    // 2. Leer sensores frontales para detectar intersección
+    int32_t front_left_val = buf_adc[last_adc_idx][SENSOR_FRONT_LEFT_CH];
+    int32_t front_right_val = buf_adc[last_adc_idx][SENSOR_FRONT_RIGHT_CH];
+
+    if (front_left_val > wall_detection_threshold || front_right_val > wall_detection_threshold)
+    {
+        robot_state = STATE_DECIDING;
+        Set_Motor_Speeds(0, 0); // Detenerse antes de decidir
+        return;
+    }
+
+    // 3. Calcular error para el PID de centrado
+    // Error > 0: muy a la derecha, necesita girar a la izquierda
+    // Error < 0: muy a la izquierda, necesita girar a la derecha
+    int32_t centering_error = left_sensor_val - right_sensor_val;
+
+    // 4. Calcular la salida del PID
+    int32_t pid_output_fixed = PID_Update(&centering_pid, centering_error, 10); // dt = 10ms
+    int16_t correction = (int16_t)FIXED_TO_INT(pid_output_fixed);
+
+    // 5. Aplicar corrección a los motores
+    int16_t right_motor_speed = right_motor_base_speed + correction;
+    int16_t left_motor_speed = left_motor_base_speed - correction;
+
+    // 6. Limitar velocidades y aplicar
+    Set_Motor_Speeds(right_motor_speed, left_motor_speed);
+}
+
+static void Handle_Deciding(void)
+{
+    // Leer sensores laterales para ver qué caminos están abiertos
+    uint8_t last_adc_idx = (adc_buf_write_idx == 0) ? (ADC_BUFFER_SIZE - 1) : (adc_buf_write_idx - 1);
+    int32_t left_sensor_val = buf_adc[last_adc_idx][SENSOR_LEFT_LAT_CH];
+    int32_t right_sensor_val = buf_adc[last_adc_idx][SENSOR_RIGHT_LAT_CH];
+
+    bool left_path_is_open = left_sensor_val < wall_detection_threshold;
+    bool right_path_is_open = right_sensor_val < wall_detection_threshold;
+
+    if (left_path_is_open && right_path_is_open)
+    {
+        // Ambos caminos abiertos, elegir aleatoriamente
+        if (rand() % 2 == 0)
+        {
+            Turn_Start(-90); // Girar a la izquierda
+        }
+        else
+        {
+            Turn_Start(90); // Girar a la derecha
+        }
+    }
+    else if (left_path_is_open)
+    {
+        Turn_Start(-90); // Solo izquierda abierta
+    }
+    else if (right_path_is_open)
+    {
+        Turn_Start(90); // Solo derecha abierta
+    }
+    else
+    {
+        // Callejón sin salida, dar la vuelta
+        Turn_Start(180);
+    }
 }

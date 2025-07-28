@@ -77,8 +77,16 @@ typedef enum
     CMD_TURN_DEGREES = 0x47,           // Para girar un número de grados
     CMD_SET_TURN_PID_GAINS = 0x48,     // Para configurar Kp, Ki, Kd del PID de giro
     CMD_GET_TURN_PID_GAINS = 0x49,     // Para leer Kp, Ki, Kd del PID de giro
+    CMD_SET_TURN_MAX_SPEED = 0x4A,
+    CMD_GET_TURN_MAX_SPEED = 0x4B,
     CMD_SET_PWM_PERIOD = 0x50,
     CMD_GET_PWM_PERIOD = 0x51,
+    CMD_SET_MPU_CONFIG = 0xA7,
+    CMD_GET_MPU_CONFIG = 0xA8,
+    CMD_SET_TURN_MIN_SPEED = 0x4C, // Para configurar la velocidad mínima de giro
+    CMD_GET_TURN_MIN_SPEED = 0x4D, // Para leer la velocidad mínima de giro
+    CMD_SET_WALL_THRESHOLD = 0x60, // Configurar el umbral de pared
+    CMD_GET_WALL_THRESHOLD = 0x61, // Leer el umbral de pared
     CMD_OTHERS
 } CommandIdTypeDef;
 
@@ -92,6 +100,16 @@ typedef union
     int32_t i32;
 } DataUnionTypeDef;
 
+typedef enum
+{
+    STATE_IDLE,
+    STATE_CENTERING,
+    STATE_DECIDING,
+    STATE_TURNING_LEFT,
+    STATE_TURNING_RIGHT,
+    STATE_TURN_AROUND
+} RobotStateTypeDef;
+
 //==============================================================================
 // DEFINICIONES Y MACROS
 //==============================================================================
@@ -102,7 +120,7 @@ extern SystemFlagTypeDef flags0;
 #define UART_BYPASS flags0.bit.b1
 #define MPU_READ_REQUEST flags0.bit.b2
 #define SSD_UPDATE_REQUEST flags0.bit.b3
-#define ACTIVATE_PID flags0.bit.b4
+#define MAZE_SOLVING_ACTIVE flags0.bit.b4
 
 /* MPU6050 */
 #define MPU_DMA_BUFFER_SIZE 14
@@ -147,11 +165,15 @@ extern uint16_t pwm_max_value;
 #define UNERBUS_BUTTON_EVENT_SIZE 1
 #define UNERBUS_PWM_RESPONSE_STATUS_SIZE 1
 #define UNERBUS_PID_GAINS_SIZE (sizeof(uint16_t) * 3)         // Kp, Ki, Kd como uint16_t
-#define UNERBUS_CONTROL_PARAMS_SIZE (sizeof(uint16_t) * 3)    // Setpoint, Speed, Correction como uint16_t
+#define UNERBUS_CONTROL_PARAMS_SIZE (sizeof(uint16_t) * 2)    // Setpoint, Speed, Correction como uint16_t
 #define UNERBUS_MOTOR_BASE_SPEEDS_SIZE (sizeof(uint16_t) * 2) // Right, Left motor base speeds como uint16_t
 #define UNERBUS_TURN_DEGREES_SIZE 2                           // int16_t
 #define UNERBUS_TURN_PID_GAINS_SIZE (sizeof(uint16_t) * 3)    // Kp, Ki, Kd para el giro como uint16_t
+#define UNERBUS_TURN_MAX_SPEED_SIZE (sizeof(uint16_t))
+#define UNERBUS_TURN_MIN_SPEED_SIZE (sizeof(uint16_t))
 #define UNERBUS_PWM_PERIOD_SIZE (sizeof(uint16_t))
+#define UNERBUS_MPU_CONFIG_SIZE (sizeof(uint8_t) * 3) // Accel, Gyro, DLPF
+#define UNERBUS_WALL_THRESHOLD_SIZE (sizeof(uint16_t))
 
 /* USB CDC Buffer Sizes */
 #define USB_CDC_RX_BUFFER_SIZE 128
@@ -180,16 +202,20 @@ extern uint16_t pwm_max_value;
 /* Initialization */
 #define DEVICE_INIT_DELAY_MS 1000
 
-/* --- Yaw Calculation --- */
-// Scaling factor to convert raw gyro Z value to Q16.16 fixed-point degrees
-// Formula: (dt_s * (1 << 16)) / LSB_per_dps = (0.01s * 65536) / 131 = 4.995...
-#define GYRO_Z_SCALER 5
-
 /* --- Turn PID Controller --- */
 #define TURN_PID_KP_DEFAULT 80.0f   // Ganancia Proporcional inicial
 #define TURN_PID_KI_DEFAULT 0.0f    // Ganancia Integral (iniciamos en 0)
 #define TURN_PID_KD_DEFAULT 150.0f  // Ganancia Derivativa inicial (NOTA: estos valores probablemente necesiten reajuste)
 #define TURN_PID_MAX_EFFORT 1000    // Esfuerzo máximo de giro (rango de -1000 a 1000)
 #define TURN_COMPLETION_DEAD_ZONE 1 // Zona muerta en grados para considerar el giro completo
+#define TURN_MAX_SPEED_DEFAULT 6500 // Velocidad máxima de giro en PWM
+#define TURN_MIN_SPEED_DEFAULT 2600 // Velocidad mínima de giro para vencer la inercia
+
+/* --- Sensores --- */
+#define SENSOR_RIGHT_LAT_CH 0
+#define SENSOR_FRONT_RIGHT_CH 2
+#define SENSOR_FRONT_LEFT_CH 4
+#define SENSOR_LEFT_LAT_CH 6
+#define WALL_DETECTION_THRESHOLD 1500 // Umbral ADC para detectar una pared. AJUSTAR SEGÚN PRUEBAS.
 
 #endif /* INC_APP_CONFIG_H_ */
