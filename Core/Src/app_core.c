@@ -53,10 +53,12 @@ static volatile I2C_BusStateTypeDef i2c_bus_state = I2C_BUS_IDLE;
 
 PID_Controller_t centering_pid;
 PID_Controller_t turn_pid;
-uint16_t right_motor_base_speed = 2600;   // Velocidad base motor derecho
-uint16_t left_motor_base_speed = 2600;    // Velocidad base motor izquierdo
-uint16_t wall_detection_threshold = 1500; // Umbral ADC para detectar pared
-uint16_t max_pwm_correction = 4000;       // Corrección máxima del PID
+uint16_t right_motor_base_speed = 2600; // Velocidad base motor derecho
+uint16_t left_motor_base_speed = 2600;  // Velocidad base motor izquierdo
+uint16_t wall_threshold_front;          // Umbral ADC para detectar pared frontal
+uint16_t wall_threshold_side;           // Umbral ADC para detectar pared lateral
+uint16_t wall_target_adc;               // Valor ADC objetivo al seguir solo una pared
+uint16_t max_pwm_correction = 4000;     // Corrección máxima del PID
 uint16_t turn_max_speed = TURN_MAX_SPEED_DEFAULT;
 uint16_t turn_min_speed = TURN_MIN_SPEED_DEFAULT;
 
@@ -64,6 +66,7 @@ static int32_t current_yaw_fixed = 0; // Yaw angle in Q16.16 fixed-point (degree
 static int32_t gyro_z_scaler;         // Factor de escala dinámico para el giroscopio
 
 static volatile RobotStateTypeDef robot_state = STATE_IDLE;
+static bool was_wall_following_active = false;
 
 //==============================================================================
 // PROTOTIPOS DE FUNCIONES PRIVADAS
@@ -435,26 +438,22 @@ void DecodeCMD(struct UNERBUSHandle *aBus, uint8_t iStartData)
         UNERBUS_Write(aBus, response_buffer, UNERBUS_PID_GAINS_SIZE);
         length = UNERBUS_CMD_ID_SIZE + UNERBUS_PID_GAINS_SIZE;
         break;
-    case CMD_SET_CONTROL_PARAMETERS: // Configurar Setpoint, Base Speed, Max Correction
-        // Se esperan 3 valores uint16_t
-        wall_detection_threshold = UNERBUS_GetUInt16(aBus);
+    case CMD_SET_MAX_PWM_CORRECTION: // Configurar la corrección máxima del PWM
+        // Se espera 1 valor uint16_t
         max_pwm_correction = UNERBUS_GetUInt16(aBus);
 
         // Actualizar la configuración del PID con los nuevos valores
-        PID_Set_Setpoint(&centering_pid, wall_detection_threshold);
         PID_Set_Output_Limits(&centering_pid, INT_TO_FIXED(-max_pwm_correction), INT_TO_FIXED(max_pwm_correction));
 
         // Enviar confirmación (ACK)
         UNERBUS_WriteByte(aBus, CMD_ACK);
         length = UNERBUS_CMD_ID_SIZE + UNERBUS_ACK_SIZE;
         break;
-    case CMD_GET_CONTROL_PARAMETERS: // Leer Setpoint, Base Speed, Max Correction
+    case CMD_GET_MAX_PWM_CORRECTION: // Leer la corrección máxima del PWM
         uint8_t response_buffer_2[UNERBUS_CONTROL_PARAMS_SIZE];
 
-        response_buffer_2[0] = (uint8_t)(wall_detection_threshold & 0xFF);
-        response_buffer_2[1] = (uint8_t)((wall_detection_threshold >> 8) & 0xFF);
-        response_buffer_2[2] = (uint8_t)(max_pwm_correction & 0xFF);
-        response_buffer_2[3] = (uint8_t)((max_pwm_correction >> 8) & 0xFF);
+        response_buffer_2[0] = (uint8_t)(max_pwm_correction & 0xFF);
+        response_buffer_2[1] = (uint8_t)((max_pwm_correction >> 8) & 0xFF);
 
         UNERBUS_Write(aBus, response_buffer_2, UNERBUS_CONTROL_PARAMS_SIZE);
         length = UNERBUS_CMD_ID_SIZE + UNERBUS_CONTROL_PARAMS_SIZE;
@@ -558,15 +557,32 @@ void DecodeCMD(struct UNERBUSHandle *aBus, uint8_t iStartData)
         UNERBUS_Write(aBus, min_speed_buffer, UNERBUS_TURN_MIN_SPEED_SIZE);
         length = UNERBUS_CMD_ID_SIZE + UNERBUS_TURN_MIN_SPEED_SIZE;
         break;
-    case CMD_SET_WALL_THRESHOLD:
-        wall_detection_threshold = UNERBUS_GetUInt16(aBus);
+    case CMD_SET_WALL_THRESHOLDS:
+        wall_threshold_front = UNERBUS_GetUInt16(aBus);
+        wall_threshold_side = UNERBUS_GetUInt16(aBus);
         UNERBUS_WriteByte(aBus, CMD_ACK);
         length = UNERBUS_CMD_ID_SIZE + UNERBUS_ACK_SIZE;
         break;
-    case CMD_GET_WALL_THRESHOLD:
-        UNERBUS_WriteByte(aBus, (uint8_t)(wall_detection_threshold & 0xFF));
-        UNERBUS_WriteByte(aBus, (uint8_t)(wall_detection_threshold >> 8));
-        length = UNERBUS_CMD_ID_SIZE + UNERBUS_WALL_THRESHOLD_SIZE;
+    case CMD_GET_WALL_THRESHOLDS:
+        uint8_t thresholds_buffer[UNERBUS_WALL_THRESHOLDS_SIZE];
+        thresholds_buffer[0] = (uint8_t)(wall_threshold_front & 0xFF);
+        thresholds_buffer[1] = (uint8_t)((wall_threshold_front >> 8) & 0xFF);
+        thresholds_buffer[2] = (uint8_t)(wall_threshold_side & 0xFF);
+        thresholds_buffer[3] = (uint8_t)((wall_threshold_side >> 8) & 0xFF);
+        UNERBUS_Write(aBus, thresholds_buffer, UNERBUS_WALL_THRESHOLDS_SIZE);
+        length = UNERBUS_CMD_ID_SIZE + UNERBUS_WALL_THRESHOLDS_SIZE;
+        break;
+    case CMD_SET_WALL_TARGET_ADC:
+        wall_target_adc = UNERBUS_GetUInt16(aBus);
+        UNERBUS_WriteByte(aBus, CMD_ACK);
+        length = UNERBUS_CMD_ID_SIZE + UNERBUS_ACK_SIZE;
+        break;
+    case CMD_GET_WALL_TARGET_ADC:
+        uint8_t target_buffer[UNERBUS_WALL_TARGET_ADC_SIZE];
+        target_buffer[0] = (uint8_t)(wall_target_adc & 0xFF);
+        target_buffer[1] = (uint8_t)((wall_target_adc >> 8) & 0xFF);
+        UNERBUS_Write(aBus, target_buffer, UNERBUS_WALL_TARGET_ADC_SIZE);
+        length = UNERBUS_CMD_ID_SIZE + UNERBUS_WALL_TARGET_ADC_SIZE;
         break;
     default:
         // Comando desconocido, enviar ACK de error
@@ -729,7 +745,7 @@ int8_t I2C_DevicesInit(void)
     hmpu.delay_ms = HAL_Delay;
     hmpu.accel_range = MPU6050_ACCEL_RANGE_2G;
     hmpu.gyro_range = MPU6050_GYRO_RANGE_500DPS;
-    hmpu.dlpf_config = MPU6050_DLPF_44HZ;
+    hmpu.dlpf_config = MPU6050_DLPF_260HZ;
     hmpu.i2c_context = &hi2c2;
     hmpu.device_address = MPU6050_ADDR;
     hmpu.is_initialized = false;
@@ -966,9 +982,14 @@ void App_Core_Init(void)
     UNERBUS_Init(&unerbus_esp01_handle);
     UNERBUS_Init(&unerbus_pc_handle);
 
+    /* --- INICIALIZACIÓN DE PARÁMETROS DE NAVEGACIÓN --- */
+    wall_threshold_front = WALL_THRESHOLD_FRONT_DEFAULT;
+    wall_threshold_side = WALL_THRESHOLD_SIDE_DEFAULT;
+    wall_target_adc = WALL_TARGET_ADC_DEFAULT;
+
     /* --- INICIALIZACIÓN DEL PID DE SEGUIMIENTO DE PARED --- */
     PID_Init(&centering_pid, FLOAT_TO_FIXED(0.8f), FLOAT_TO_FIXED(0.0f), FLOAT_TO_FIXED(0.2f)); // Kp, Ki, Kd
-    PID_Set_Setpoint(&centering_pid, 0);                                                        // Objetivo: diferencia entre sensores es 0
+    PID_Set_Setpoint(&centering_pid, 0);                                                        // El setpoint se ajustará dinámicamente
     PID_Set_Output_Limits(&centering_pid, INT_TO_FIXED(-max_pwm_correction), INT_TO_FIXED(max_pwm_correction));
 
     /* --- INICIALIZACIÓN DEL PID DE GIRO --- */
@@ -1083,7 +1104,7 @@ void Turn_Start(int16_t angle_degrees)
     if (robot_state == STATE_CENTERING || robot_state == STATE_DECIDING)
     {
         PID_Reset(&turn_pid);
-        // ¡ESTA ES LA CORRECCIÓN CLAVE!
+
         // Establecemos el ángulo objetivo en el controlador PID.
         PID_Set_Setpoint(&turn_pid, angle_degrees);
 
@@ -1126,7 +1147,8 @@ static void Manage_Turn(void)
     {
         Set_Motor_Speeds(0, 0);
         robot_state = STATE_CENTERING;
-        PID_Reset(&centering_pid); // Reseteamos el PID de centrado para empezar de cero
+        PID_Reset(&centering_pid);         // Reseteamos el PID de centrado para empezar de cero
+        was_wall_following_active = false; // Olvidar el estado anterior al entrar en un nuevo pasillo
         return;
     }
 
@@ -1232,32 +1254,78 @@ static void Handle_Idle(void)
 
 static void Handle_Centering(void)
 {
-    // 1. Leer sensores laterales
+    // 1. Leer sensores
     uint8_t last_adc_idx = (adc_buf_write_idx == 0) ? (ADC_BUFFER_SIZE - 1) : (adc_buf_write_idx - 1);
-    int32_t left_sensor_val = buf_adc[last_adc_idx][SENSOR_LEFT_LAT_CH];
-    int32_t right_sensor_val = buf_adc[last_adc_idx][SENSOR_RIGHT_LAT_CH];
-
-    // 2. Leer sensores frontales para detectar intersección
+    int32_t left_lat_val = buf_adc[last_adc_idx][SENSOR_LEFT_LAT_CH];
+    int32_t right_lat_val = buf_adc[last_adc_idx][SENSOR_RIGHT_LAT_CH];
     int32_t front_left_val = buf_adc[last_adc_idx][SENSOR_FRONT_LEFT_CH];
     int32_t front_right_val = buf_adc[last_adc_idx][SENSOR_FRONT_RIGHT_CH];
 
-    if (front_left_val > wall_detection_threshold || front_right_val > wall_detection_threshold)
+    // 2. Comprobar si hay una pared frontal para pasar a decidir
+    if (front_left_val > wall_threshold_front || front_right_val > wall_threshold_front)
     {
         robot_state = STATE_DECIDING;
         Set_Motor_Speeds(0, 0); // Detenerse antes de decidir
         return;
     }
 
-    // 3. Calcular error para el PID de centrado
-    // Error > 0: muy a la derecha, necesita girar a la izquierda
-    // Error < 0: muy a la izquierda, necesita girar a la derecha
-    int32_t centering_error = left_sensor_val - right_sensor_val;
+    // 3. Determinar qué paredes laterales están presentes
+    bool left_wall_present = left_lat_val > wall_threshold_side;
+    bool right_wall_present = right_lat_val > wall_threshold_side;
+
+    int32_t pid_input = 0;
+    int16_t correction_inversion = 1; // Para invertir la corrección si seguimos la pared izquierda
+
+    if (left_wall_present && right_wall_present)
+    {
+        // CASO 1: Ambas paredes presentes. Centrarse entre ellas.
+        PID_Set_Setpoint(&centering_pid, 0); // El objetivo es que la diferencia sea 0
+        pid_input = left_lat_val - right_lat_val;
+        was_wall_following_active = true; // Recordar que estábamos siguiendo pared
+    }
+    else if (right_wall_present)
+    {
+        // CASO 2: Solo pared derecha. Mantener distancia objetivo.
+        PID_Set_Setpoint(&centering_pid, wall_target_adc);
+        pid_input = right_lat_val;
+        // Si estamos muy cerca (error negativo), necesitamos una corrección positiva (girar izquierda).
+        // Por lo tanto, invertimos la salida del PID.
+        correction_inversion = -1;
+        was_wall_following_active = true; // Recordar que estábamos siguiendo pared
+    }
+    else if (left_wall_present)
+    {
+        // CASO 3: Solo pared izquierda. Mantener distancia objetivo.
+        PID_Set_Setpoint(&centering_pid, wall_target_adc);
+        pid_input = left_lat_val;
+        // Si estamos muy cerca (error negativo), necesitamos una corrección negativa (girar derecha).
+        // Por lo tanto, NO invertimos la salida del PID.
+        correction_inversion = 1;         // Invertir la salida del PID
+        was_wall_following_active = true; // Recordar que estábamos siguiendo pared
+    }
+    else
+    {
+        // CASO 4: Sin paredes laterales.
+        if (was_wall_following_active)
+        {
+            // Si estábamos siguiendo una pared y ahora no hay ninguna, hemos llegado a un cruce.
+            robot_state = STATE_DECIDING; // Forzar decisión
+            Set_Motor_Speeds(0, 0);       // Detenerse
+        }
+        else
+        {
+            // Si ya estábamos en un espacio abierto, continuar recto.
+            Set_Motor_Speeds(right_motor_base_speed, left_motor_base_speed);
+        }
+        return;
+    }
 
     // 4. Calcular la salida del PID
-    int32_t pid_output_fixed = PID_Update(&centering_pid, centering_error, 10); // dt = 10ms
-    int16_t correction = (int16_t)FIXED_TO_INT(pid_output_fixed);
+    int32_t pid_output_fixed = PID_Update(&centering_pid, pid_input, 10); // dt = 10ms
+    int16_t correction = (int16_t)FIXED_TO_INT(pid_output_fixed) * correction_inversion;
 
     // 5. Aplicar corrección a los motores
+    // Si la corrección es positiva, gira a la derecha. Si es negativa, a la izquierda.
     int16_t right_motor_speed = right_motor_base_speed + correction;
     int16_t left_motor_speed = left_motor_base_speed - correction;
 
@@ -1272,8 +1340,8 @@ static void Handle_Deciding(void)
     int32_t left_sensor_val = buf_adc[last_adc_idx][SENSOR_LEFT_LAT_CH];
     int32_t right_sensor_val = buf_adc[last_adc_idx][SENSOR_RIGHT_LAT_CH];
 
-    bool left_path_is_open = left_sensor_val < wall_detection_threshold;
-    bool right_path_is_open = right_sensor_val < wall_detection_threshold;
+    bool left_path_is_open = left_sensor_val < wall_threshold_side;
+    bool right_path_is_open = right_sensor_val < wall_threshold_side;
 
     if (left_path_is_open && right_path_is_open)
     {

@@ -69,8 +69,8 @@ typedef enum
     CMD_CALIBRATE_MPU = 0xA3,
     CMD_SET_PID_GAINS = 0x40,          // Para configurar Kp, Ki, Kd
     CMD_GET_PID_GAINS = 0x41,          // Para leer Kp, Ki, Kd
-    CMD_SET_CONTROL_PARAMETERS = 0x42, // Para configurar Setpoint, Base Speed, etc.
-    CMD_GET_CONTROL_PARAMETERS = 0x43, // Para leer Setpoint, Base Speed, etc.
+    CMD_SET_MAX_PWM_CORRECTION = 0x42, // Para configurar la corrección máxima del PWM
+    CMD_GET_MAX_PWM_CORRECTION = 0x43, // Para leer la corrección máxima del PWM
     CMD_SET_MOTOR_BASE_SPEEDS = 0x44,  // Para configurar velocidades base independientes
     CMD_GET_MOTOR_BASE_SPEEDS = 0x45,  // Para leer velocidades base independientes
     CMD_CALIBRATE_MOTORS = 0x46,       // Para calibrar motores automáticamente
@@ -83,10 +83,12 @@ typedef enum
     CMD_GET_PWM_PERIOD = 0x51,
     CMD_SET_MPU_CONFIG = 0xA7,
     CMD_GET_MPU_CONFIG = 0xA8,
-    CMD_SET_TURN_MIN_SPEED = 0x4C, // Para configurar la velocidad mínima de giro
-    CMD_GET_TURN_MIN_SPEED = 0x4D, // Para leer la velocidad mínima de giro
-    CMD_SET_WALL_THRESHOLD = 0x60, // Configurar el umbral de pared
-    CMD_GET_WALL_THRESHOLD = 0x61, // Leer el umbral de pared
+    CMD_SET_TURN_MIN_SPEED = 0x4C,  // Para configurar la velocidad mínima de giro
+    CMD_GET_TURN_MIN_SPEED = 0x4D,  // Para leer la velocidad mínima de giro
+    CMD_SET_WALL_THRESHOLDS = 0x60, // Configurar el umbral de pared
+    CMD_GET_WALL_THRESHOLDS = 0x61, // Leer el umbral de pared
+    CMD_SET_WALL_TARGET_ADC = 0x62, // Configurar el valor ADC objetivo para seguimiento de pared
+    CMD_GET_WALL_TARGET_ADC = 0x63, // Leer el valor ADC objetivo
     CMD_OTHERS
 } CommandIdTypeDef;
 
@@ -165,7 +167,7 @@ extern uint16_t pwm_max_value;
 #define UNERBUS_BUTTON_EVENT_SIZE 1
 #define UNERBUS_PWM_RESPONSE_STATUS_SIZE 1
 #define UNERBUS_PID_GAINS_SIZE (sizeof(uint16_t) * 3)         // Kp, Ki, Kd como uint16_t
-#define UNERBUS_CONTROL_PARAMS_SIZE (sizeof(uint16_t) * 2)    // Setpoint, Speed, Correction como uint16_t
+#define UNERBUS_CONTROL_PARAMS_SIZE (sizeof(uint16_t))        // Setpoint, Speed, Correction como uint16_t
 #define UNERBUS_MOTOR_BASE_SPEEDS_SIZE (sizeof(uint16_t) * 2) // Right, Left motor base speeds como uint16_t
 #define UNERBUS_TURN_DEGREES_SIZE 2                           // int16_t
 #define UNERBUS_TURN_PID_GAINS_SIZE (sizeof(uint16_t) * 3)    // Kp, Ki, Kd para el giro como uint16_t
@@ -173,7 +175,8 @@ extern uint16_t pwm_max_value;
 #define UNERBUS_TURN_MIN_SPEED_SIZE (sizeof(uint16_t))
 #define UNERBUS_PWM_PERIOD_SIZE (sizeof(uint16_t))
 #define UNERBUS_MPU_CONFIG_SIZE (sizeof(uint8_t) * 3) // Accel, Gyro, DLPF
-#define UNERBUS_WALL_THRESHOLD_SIZE (sizeof(uint16_t))
+#define UNERBUS_WALL_THRESHOLDS_SIZE (sizeof(uint16_t) * 2)
+#define UNERBUS_WALL_TARGET_ADC_SIZE (sizeof(uint16_t))
 
 /* USB CDC Buffer Sizes */
 #define USB_CDC_RX_BUFFER_SIZE 128
@@ -216,6 +219,8 @@ extern uint16_t pwm_max_value;
 #define SENSOR_FRONT_RIGHT_CH 2
 #define SENSOR_FRONT_LEFT_CH 4
 #define SENSOR_LEFT_LAT_CH 6
-#define WALL_DETECTION_THRESHOLD 1500 // Umbral ADC para detectar una pared. AJUSTAR SEGÚN PRUEBAS.
+#define WALL_THRESHOLD_FRONT_DEFAULT 1500 // Umbral ADC para detectar pared frontal
+#define WALL_THRESHOLD_SIDE_DEFAULT 1000  // Umbral ADC para detectar pared lateral
+#define WALL_TARGET_ADC_DEFAULT 2000      // Valor ADC objetivo al seguir una sola pared
 
 #endif /* INC_APP_CONFIG_H_ */
