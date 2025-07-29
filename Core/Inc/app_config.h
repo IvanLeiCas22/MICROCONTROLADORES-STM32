@@ -35,6 +35,20 @@ typedef enum
     TURN_STATE_TURNING
 } TurnStateTypeDef;
 
+typedef enum
+{
+    APP_STATE_MENU,
+    APP_STATE_RUNNING
+} AppStateTypeDef;
+
+typedef enum
+{
+    MENU_MODE_IDLE,
+    MENU_MODE_FIND_CELLS,
+    MENU_MODE_GO_TO_B,
+    MENU_MODE_COUNT // Mantener este último para ciclar fácilmente
+} MenuModeTypeDef;
+
 typedef union
 {
     struct
@@ -89,6 +103,11 @@ typedef enum
     CMD_GET_WALL_THRESHOLDS = 0x61, // Leer el umbral de pared
     CMD_SET_WALL_TARGET_ADC = 0x62, // Configurar el valor ADC objetivo para seguimiento de pared
     CMD_GET_WALL_TARGET_ADC = 0x63, // Leer el valor ADC objetivo
+    CMD_SET_APP_STATE = 0x70,       // Para cambiar entre MENU y RUNNING
+    CMD_GET_APP_STATE = 0x71,       // Para leer el estado de la app
+    CMD_SET_MENU_MODE = 0x72,       // Para seleccionar un modo de operación
+    CMD_GET_MENU_MODE = 0x73,       // Para leer el modo de operación actual
+    CMD_GET_ROBOT_STATUS = 0x74,    // Para leer el estado completo (AppState y MenuMode)
     CMD_OTHERS
 } CommandIdTypeDef;
 
@@ -122,7 +141,6 @@ extern SystemFlagTypeDef flags0;
 #define UART_BYPASS flags0.bit.b1
 #define MPU_READ_REQUEST flags0.bit.b2
 #define SSD_UPDATE_REQUEST flags0.bit.b3
-#define MAZE_SOLVING_ACTIVE flags0.bit.b4
 
 /* MPU6050 */
 #define MPU_DMA_BUFFER_SIZE 14
@@ -177,6 +195,9 @@ extern uint16_t pwm_max_value;
 #define UNERBUS_MPU_CONFIG_SIZE (sizeof(uint8_t) * 3) // Accel, Gyro, DLPF
 #define UNERBUS_WALL_THRESHOLDS_SIZE (sizeof(uint16_t) * 2)
 #define UNERBUS_WALL_TARGET_ADC_SIZE (sizeof(uint16_t))
+#define UNERBUS_APP_STATE_SIZE (sizeof(uint8_t))
+#define UNERBUS_MENU_MODE_SIZE (sizeof(uint8_t))
+#define UNERBUS_ROBOT_STATUS_SIZE (sizeof(uint8_t) * 2)
 
 /* USB CDC Buffer Sizes */
 #define USB_CDC_RX_BUFFER_SIZE 128
@@ -191,10 +212,25 @@ extern uint16_t pwm_max_value;
 #define HEARTBEAT_WIFI_READY 0xF5000000
 #define HEARTBEAT_UDP_READY 0xF5400000
 
+/* --- Máscaras de Heartbeat para Menú y Estados --- */
+// Eventos de Botón (temporales)
+#define HEARTBEAT_BTN_SHORT_PRESS 0xFFF00000 // Blink rápido
+#define HEARTBEAT_BTN_LONG_PRESS 0xFFFFFFFF  // Sólido ON
+
+// Modos de Menú (en APP_STATE_MENU)
+#define HEARTBEAT_MENU_IDLE 0x88880000       // Doble blink lento
+#define HEARTBEAT_MENU_FIND_CELLS 0xCCCCCCCC // Triple blink rápido
+#define HEARTBEAT_MENU_GO_TO_B 0xF0F00000    // Blink alternado
+
+// Modos en Ejecución (en APP_STATE_RUNNING)
+#define HEARTBEAT_RUNNING_IDLE 0x80808080       // Blink regular lento
+#define HEARTBEAT_RUNNING_FIND_CELLS 0xFEFE0000 // Blink "corriendo" rápido
+#define HEARTBEAT_RUNNING_GO_TO_B 0xFAFA0000    // Blink "corriendo" diferente
+
 /* Wifi Settings */
-#define WIFI_SSID "InternetPlus_8e2fbb"
-#define WIFI_PASSWORD "Akhantos2340"
-#define WIFI_UDP_REMOTE_IP "192.168.1.3"
+#define WIFI_SSID "InternetPlus_403ea8"
+#define WIFI_PASSWORD "Fenofinalform01"
+#define WIFI_UDP_REMOTE_IP "192.168.1.100"
 #define WIFI_UDP_REMOTE_PORT 30010
 #define WIFI_UDP_LOCAL_PORT 30000
 

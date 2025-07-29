@@ -51,6 +51,13 @@ Button_HandleTypeDef h_user_button;
 uint16_t motor_pwm_values[PWM_CHANNELS] = {0, 0, 0, 0};
 static volatile I2C_BusStateTypeDef i2c_bus_state = I2C_BUS_IDLE;
 
+// --- Variables de Estado de la Aplicación ---
+static AppStateTypeDef app_state = APP_STATE_MENU;
+static MenuModeTypeDef menu_mode = MENU_MODE_IDLE;
+static uint32_t temporary_heartbeat = 0;
+static uint8_t temporary_heartbeat_ticks = 0;
+
+// --- Variables de PID y Control del Robot ---
 PID_Controller_t centering_pid;
 PID_Controller_t turn_pid;
 uint16_t right_motor_base_speed = 2600; // Velocidad base motor derecho
@@ -584,6 +591,41 @@ void DecodeCMD(struct UNERBUSHandle *aBus, uint8_t iStartData)
         UNERBUS_Write(aBus, target_buffer, UNERBUS_WALL_TARGET_ADC_SIZE);
         length = UNERBUS_CMD_ID_SIZE + UNERBUS_WALL_TARGET_ADC_SIZE;
         break;
+    case CMD_SET_APP_STATE:
+        app_state = (AppStateTypeDef)UNERBUS_GetUInt8(aBus);
+        if (app_state >= APP_STATE_RUNNING)
+        { // Si se pasa a RUNNING, resetear PIDs
+            PID_Reset(&centering_pid);
+            PID_Reset(&turn_pid);
+        }
+        else
+        { // Si se vuelve a MENU, detener motores
+            Set_Motor_Speeds(0, 0);
+            robot_state = STATE_IDLE;
+        }
+        UNERBUS_WriteByte(aBus, CMD_ACK);
+        length = UNERBUS_CMD_ID_SIZE + UNERBUS_ACK_SIZE;
+        break;
+    case CMD_GET_APP_STATE:
+        UNERBUS_WriteByte(aBus, (uint8_t)app_state);
+        length = UNERBUS_CMD_ID_SIZE + UNERBUS_APP_STATE_SIZE;
+        break;
+    case CMD_SET_MENU_MODE:
+        menu_mode = (MenuModeTypeDef)UNERBUS_GetUInt8(aBus);
+        UNERBUS_WriteByte(aBus, CMD_ACK);
+        length = UNERBUS_CMD_ID_SIZE + UNERBUS_ACK_SIZE;
+        break;
+    case CMD_GET_MENU_MODE:
+        UNERBUS_WriteByte(aBus, (uint8_t)menu_mode);
+        length = UNERBUS_CMD_ID_SIZE + UNERBUS_MENU_MODE_SIZE;
+        break;
+    case CMD_GET_ROBOT_STATUS:
+        uint8_t status_buffer[UNERBUS_ROBOT_STATUS_SIZE];
+        status_buffer[0] = (uint8_t)app_state;
+        status_buffer[1] = (uint8_t)menu_mode;
+        UNERBUS_Write(aBus, status_buffer, UNERBUS_ROBOT_STATUS_SIZE);
+        length = UNERBUS_CMD_ID_SIZE + UNERBUS_ROBOT_STATUS_SIZE;
+        break;
     default:
         // Comando desconocido, enviar ACK de error
         /*         UNERBUS_WriteByte(aBus, CMD_NACK);
@@ -618,6 +660,52 @@ void Do100ms()
 {
     time_100ms = TIME_100MS_PEDIOD_COUNT;
 
+    // --- Lógica de Heartbeat Dinámico ---
+    if (temporary_heartbeat_ticks > 0)
+    {
+        temporary_heartbeat_ticks--;
+        heartbeat_counter = temporary_heartbeat;
+    }
+    else
+    {
+        if (app_state == APP_STATE_MENU)
+        {
+            switch (menu_mode)
+            {
+            case MENU_MODE_IDLE:
+                heartbeat_counter = HEARTBEAT_MENU_IDLE;
+                break;
+            case MENU_MODE_FIND_CELLS:
+                heartbeat_counter = HEARTBEAT_MENU_FIND_CELLS;
+                break;
+            case MENU_MODE_GO_TO_B:
+                heartbeat_counter = HEARTBEAT_MENU_GO_TO_B;
+                break;
+            default:
+                heartbeat_counter = HEARTBEAT_IDLE;
+                break;
+            }
+        }
+        else // APP_STATE_RUNNING
+        {
+            switch (menu_mode)
+            {
+            case MENU_MODE_IDLE:
+                heartbeat_counter = HEARTBEAT_RUNNING_IDLE;
+                break;
+            case MENU_MODE_FIND_CELLS:
+                heartbeat_counter = HEARTBEAT_RUNNING_FIND_CELLS;
+                break;
+            case MENU_MODE_GO_TO_B:
+                heartbeat_counter = HEARTBEAT_RUNNING_GO_TO_B;
+                break;
+            default:
+                heartbeat_counter = HEARTBEAT_IDLE;
+                break;
+            }
+        }
+    }
+
     if (heartbeat_mask & heartbeat_counter)
         HAL_GPIO_WritePin(LED_GPIO_Port, LED_Pin, GPIO_PIN_RESET);
     else
@@ -630,45 +718,63 @@ void Do100ms()
     if (timeout_alive_udp)
         timeout_alive_udp--;
 
-    /* Prueba SSD1306: mostrar yaw y estado */
-    char text_line1[20];
-    char text_line2[20];
+    // --- Lógica de Display OLED ---
+    char text_line1[22];
+    char text_line2[22];
+    char text_line3[22];
 
-    // Limpiar pantalla SSD1306
     SSD1306_Clear(&hssd);
 
-    // Mostrar Yaw actual
-    int32_t yaw_degrees = FIXED_TO_INT(current_yaw_fixed);
-    snprintf(text_line1, sizeof(text_line1), "Yaw: %ld deg", yaw_degrees);
-    SSD1306_DrawText(&hssd, 0, 0, text_line1, SSD1306_TEXT_ALIGN_LEFT);
-
-    switch (robot_state)
+    if (app_state == APP_STATE_MENU)
     {
-    case STATE_IDLE:
-        snprintf(text_line2, sizeof(text_line2), "Idle");
-        break;
-    case STATE_CENTERING:
-        snprintf(text_line2, sizeof(text_line2), "Centering...");
-        break;
-    case STATE_DECIDING:
-        snprintf(text_line2, sizeof(text_line2), "Deciding...");
-        break;
-    case STATE_TURNING_LEFT:
-        snprintf(text_line2, sizeof(text_line2), "Turn Left -90");
-        break;
-    case STATE_TURNING_RIGHT:
-        snprintf(text_line2, sizeof(text_line2), "Turn Right 90");
-        break;
-    case STATE_TURN_AROUND:
-        snprintf(text_line2, sizeof(text_line2), "Turn Around 180");
-        break;
-    default:
-        snprintf(text_line2, sizeof(text_line2), "Unknown State");
-        break;
-    }
-    SSD1306_DrawText(&hssd, 0, 10, text_line2, SSD1306_TEXT_ALIGN_LEFT);
+        snprintf(text_line1, sizeof(text_line1), "%s Idle", (menu_mode == MENU_MODE_IDLE) ? ">" : " ");
+        snprintf(text_line2, sizeof(text_line2), "%s Find Cells", (menu_mode == MENU_MODE_FIND_CELLS) ? ">" : " ");
+        snprintf(text_line3, sizeof(text_line3), "%s Go A->B", (menu_mode == MENU_MODE_GO_TO_B) ? ">" : " ");
 
-    // Solicitar actualización de pantalla (no bloqueante)
+        SSD1306_DrawText(&hssd, 0, 0, "--- MENU ---", SSD1306_TEXT_ALIGN_LEFT);
+        SSD1306_DrawText(&hssd, 0, 10, text_line1, SSD1306_TEXT_ALIGN_LEFT);
+        SSD1306_DrawText(&hssd, 0, 20, text_line2, SSD1306_TEXT_ALIGN_LEFT);
+        SSD1306_DrawText(&hssd, 0, 30, text_line3, SSD1306_TEXT_ALIGN_LEFT);
+    }
+    else // APP_STATE_RUNNING
+    {
+        const char *current_mode_str = "Unknown";
+        switch (menu_mode)//
+        {
+        case MENU_MODE_IDLE:
+            current_mode_str = "Idle";
+            break;
+        case MENU_MODE_FIND_CELLS:
+            current_mode_str = "Finding Cells";
+            break;
+        case MENU_MODE_GO_TO_B:
+            current_mode_str = "Going A->B";
+            break;
+        }
+        snprintf(text_line1, sizeof(text_line1), "Mode: %s", current_mode_str);
+
+        // Mostrar estado específico del robot
+        const char *robot_state_str = "Stopped";
+        switch (robot_state)
+        {
+        case STATE_CENTERING:
+            robot_state_str = "Centering...";
+            break;
+        case STATE_DECIDING:
+            robot_state_str = "Deciding...";
+            break;
+        case STATE_TURNING_LEFT:
+        case STATE_TURNING_RIGHT:
+        case STATE_TURN_AROUND:
+            robot_state_str = "Turning...";
+            break;
+        }
+        snprintf(text_line2, sizeof(text_line2), "State: %s", robot_state_str);
+
+        SSD1306_DrawText(&hssd, 0, 0, text_line1, SSD1306_TEXT_ALIGN_LEFT);
+        SSD1306_DrawText(&hssd, 0, 10, text_line2, SSD1306_TEXT_ALIGN_LEFT);
+    }
+
     SSD_UPDATE_REQUEST = true;
 }
 
@@ -864,41 +970,43 @@ static void ManageButtonEvents(void)
     Button_EventsTypeDef button_event = Button_GetEvent(&h_user_button);
     if (button_event != EVENT_NONE)
     {
-
-        // A button event has occurred, handle it here.
-        // For example, send a message via UNERBUS
+        // Enviar evento por UNERBUS para debug
         UNERBUS_WriteByte(&unerbus_pc_handle, (uint8_t)button_event);
         UNERBUS_Send(&unerbus_pc_handle, CMD_GET_BUTTON_STATE, UNERBUS_CMD_ID_SIZE + UNERBUS_BUTTON_EVENT_SIZE);
 
-        switch (button_event)
+        if (app_state == APP_STATE_MENU)
         {
-        case EVENT_PRESSED:
-            /* code */
-            break;
-        case EVENT_PRESS_RELEASED:
-            MAZE_SOLVING_ACTIVE = !MAZE_SOLVING_ACTIVE; // Alternar estado
-
-            if (MAZE_SOLVING_ACTIVE)
+            switch (button_event)
             {
-                robot_state = STATE_CENTERING; // Empezar a resolver
+            case EVENT_PRESS_RELEASED: // Pulsación corta: ciclar menú
+                menu_mode = (MenuModeTypeDef)((menu_mode + 1) % MENU_MODE_COUNT);
+                temporary_heartbeat = HEARTBEAT_BTN_SHORT_PRESS;
+                temporary_heartbeat_ticks = 5; // Duración del feedback (5 * 100ms = 0.5s)
+                break;
+            case EVENT_LONG_PRESS_RELEASED: // Pulsación larga: seleccionar y correr
+                app_state = APP_STATE_RUNNING;
+                temporary_heartbeat = HEARTBEAT_BTN_LONG_PRESS;
+                temporary_heartbeat_ticks = 10; // Duración del feedback (10 * 100ms = 1s)
+                // Resetear PIDs y estados al iniciar un modo
                 PID_Reset(&centering_pid);
                 PID_Reset(&turn_pid);
+                robot_state = (menu_mode == MENU_MODE_FIND_CELLS) ? STATE_CENTERING : STATE_IDLE;
+                break;
+            default:
+                break;
             }
-            else
+        }
+        else // APP_STATE_RUNNING
+        {
+            // En modo ejecución, una pulsación larga detiene y vuelve al menú
+            if (button_event == EVENT_LONG_PRESS_RELEASED)
             {
-                robot_state = STATE_IDLE; // Detenerse
-                Set_Motor_Speeds(0, 0);   // Apagar motores
+                app_state = APP_STATE_MENU;
+                robot_state = STATE_IDLE;
+                Set_Motor_Speeds(0, 0); // Detener motores
+                temporary_heartbeat = HEARTBEAT_BTN_LONG_PRESS;
+                temporary_heartbeat_ticks = 10;
             }
-            break;
-        case EVENT_LONG_PRESS:
-            /* code */
-            break;
-        case EVENT_LONG_PRESS_RELEASED:
-            // Iniciar un giro de 90 grados a la derecha
-            // Turn_Start(90);
-            break;
-        default:
-            break;
         }
     }
 }
@@ -1018,7 +1126,10 @@ void App_Core_Init(void)
     /* Flags */
     ON10MS = false;
     UART_BYPASS = false;
-    MAZE_SOLVING_ACTIVE = false;
+
+    /* Estados de la aplicación */
+    app_state = APP_STATE_MENU;
+    menu_mode = MENU_MODE_IDLE;
 }
 
 void App_Core_Loop(void)
@@ -1041,33 +1152,43 @@ void App_Core_Loop(void)
     {
         Do10ms();
 
-        // --- MÁQUINA DE ESTADOS PRINCIPAL ---
-        if (MAZE_SOLVING_ACTIVE)
+        // Maquina de estados del robot
+        if (app_state == APP_STATE_RUNNING)
         {
-            switch (robot_state)
+            switch (menu_mode)
             {
-            case STATE_CENTERING:
-                Handle_Centering();
+            case MENU_MODE_FIND_CELLS:
+                // Ejecutar la lógica de resolución de laberintos
+                switch (robot_state)
+                {
+                case STATE_CENTERING:
+                    Handle_Centering();
+                    break;
+                case STATE_DECIDING:
+                    Handle_Deciding();
+                    break;
+                case STATE_TURNING_LEFT:
+                case STATE_TURNING_RIGHT:
+                case STATE_TURN_AROUND:
+                    Manage_Turn();
+                    break;
+                default:
+                    Handle_Idle();
+                    break;
+                }
                 break;
 
-            case STATE_DECIDING:
-                Handle_Deciding();
-                break;
-
-            case STATE_TURNING_LEFT:
-            case STATE_TURNING_RIGHT:
-            case STATE_TURN_AROUND:
-                Manage_Turn(); // La lógica de giro se encarga de sí misma
-                break;
-
-            case STATE_IDLE:
+            case MENU_MODE_IDLE:
+            case MENU_MODE_GO_TO_B:
             default:
+                // Para otros modos, por ahora, solo estar en reposo.
                 Handle_Idle();
                 break;
             }
         }
-        else
+        else // APP_STATE_MENU
         {
+            // En el menú, los motores siempre están parados.
             Handle_Idle();
         }
     }
