@@ -592,17 +592,35 @@ void DecodeCMD(struct UNERBUSHandle *aBus, uint8_t iStartData)
         length = UNERBUS_CMD_ID_SIZE + UNERBUS_WALL_TARGET_ADC_SIZE;
         break;
     case CMD_SET_APP_STATE:
-        app_state = (AppStateTypeDef)UNERBUS_GetUInt8(aBus);
-        if (app_state >= APP_STATE_RUNNING)
-        { // Si se pasa a RUNNING, resetear PIDs
+        AppStateTypeDef new_state = (AppStateTypeDef)UNERBUS_GetUInt8(aBus);
+        if (new_state == APP_STATE_RUNNING && app_state == APP_STATE_MENU)
+        {
+            // Transición de MENU a RUNNING
+            app_state = APP_STATE_RUNNING;
+            // Resetear PIDs y Yaw para un inicio limpio
             PID_Reset(&centering_pid);
             PID_Reset(&turn_pid);
+            current_yaw_fixed = 0;
+            // Iniciar la máquina de estados del robot si el modo es activo.
+            // Esto replica el comportamiento del botón físico.
+            if (menu_mode == MENU_MODE_FIND_CELLS || menu_mode == MENU_MODE_GO_TO_B)
+            {
+                robot_state = STATE_CENTERING; // Aquí se inicia el movimiento
+            }
+            else
+            {
+                robot_state = STATE_IDLE; // Para modos que no inician movimiento
+            }
         }
-        else
-        { // Si se vuelve a MENU, detener motores
-            Set_Motor_Speeds(0, 0);
+        else if (new_state == APP_STATE_MENU && app_state == APP_STATE_RUNNING)
+        {
+            // Transición de RUNNING a MENU
+            app_state = APP_STATE_MENU;
+            Set_Motor_Speeds(0, 0); // Detener motores por seguridad
             robot_state = STATE_IDLE;
         }
+        // Si el estado ya es el solicitado, no se hace nada.
+
         UNERBUS_WriteByte(aBus, CMD_ACK);
         length = UNERBUS_CMD_ID_SIZE + UNERBUS_ACK_SIZE;
         break;
@@ -739,7 +757,7 @@ void Do100ms()
     else // APP_STATE_RUNNING
     {
         const char *current_mode_str = "Unknown";
-        switch (menu_mode)//
+        switch (menu_mode) //
         {
         case MENU_MODE_IDLE:
             current_mode_str = "Idle";
