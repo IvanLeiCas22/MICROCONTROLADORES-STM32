@@ -108,6 +108,8 @@ typedef enum
     CMD_SET_MENU_MODE = 0x72,       // Para seleccionar un modo de operación
     CMD_GET_MENU_MODE = 0x73,       // Para leer el modo de operación actual
     CMD_GET_ROBOT_STATUS = 0x74,    // Para leer el estado completo (AppState y MenuMode)
+    CMD_SET_CRUISE_PARAMS = 0x4E,   // Configurar velocidad crucero y umbral de aceleración
+    CMD_GET_CRUISE_PARAMS = 0x4F,   // Leer velocidad crucero y umbral de aceleración
     CMD_OTHERS
 } CommandIdTypeDef;
 
@@ -166,6 +168,7 @@ extern SystemFlagTypeDef flags0;
 #define ADC_BUFFER_SIZE 48
 #define ADC_CHANNELS 8
 #define ADC_DATA_BYTES (ADC_CHANNELS * 2)
+#define ADC_MOVING_AVERAGE_SAMPLES 40 // Número de muestras a promediar (10ms / 250us)
 
 /* PWM */
 #define PWM_CHANNELS 4
@@ -198,6 +201,7 @@ extern uint16_t pwm_max_value;
 #define UNERBUS_APP_STATE_SIZE (sizeof(uint8_t))
 #define UNERBUS_MENU_MODE_SIZE (sizeof(uint8_t))
 #define UNERBUS_ROBOT_STATUS_SIZE (sizeof(uint8_t) * 2)
+#define UNERBUS_CRUISE_PARAMS_SIZE (sizeof(uint16_t) * 3) // cruise_speed, accel_threshold, confirm_ticks
 
 /* USB CDC Buffer Sizes */
 #define USB_CDC_RX_BUFFER_SIZE 128
@@ -258,5 +262,10 @@ extern uint16_t pwm_max_value;
 #define WALL_THRESHOLD_FRONT_DEFAULT 1500 // Umbral ADC para detectar pared frontal
 #define WALL_THRESHOLD_SIDE_DEFAULT 1000  // Umbral ADC para detectar pared lateral
 #define WALL_TARGET_ADC_DEFAULT 2000      // Valor ADC objetivo al seguir una sola pared
+
+/* --- Cruise Control --- */
+#define MOTOR_CRUISE_SPEED_DEFAULT 2600      // Velocidad PWM para navegación en rectas
+#define ACCEL_MOTION_THRESHOLD_DEFAULT 1000  // Umbral de aceleración (raw) para detectar movimiento
+#define ACCEL_MOTION_CONFIRM_TICKS_DEFAULT 2 // Nº de ciclos de 10ms para confirmar movimiento
 
 #endif /* INC_APP_CONFIG_H_ */

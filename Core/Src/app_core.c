@@ -60,8 +60,8 @@ static uint8_t temporary_heartbeat_ticks = 0;
 // --- Variables de PID y Control del Robot ---
 PID_Controller_t centering_pid;
 PID_Controller_t turn_pid;
-uint16_t right_motor_base_speed = 2600; // Velocidad base motor derecho
-uint16_t left_motor_base_speed = 2600;  // Velocidad base motor izquierdo
+uint16_t right_motor_base_speed = 3500; // Velocidad base motor derecho
+uint16_t left_motor_base_speed = 3500;  // Velocidad base motor izquierdo
 uint16_t wall_threshold_front;          // Umbral ADC para detectar pared frontal
 uint16_t wall_threshold_side;           // Umbral ADC para detectar pared lateral
 uint16_t wall_target_adc;               // Valor ADC objetivo al seguir solo una pared
@@ -74,6 +74,11 @@ static int32_t gyro_z_scaler;         // Factor de escala dinámico para el giro
 
 static volatile RobotStateTypeDef robot_state = STATE_IDLE;
 static bool was_wall_following_active = false;
+uint16_t motor_cruise_speed;
+uint16_t accel_motion_threshold;
+uint8_t accel_motion_confirm_ticks;
+static bool kick_start_active = false;
+static uint8_t motion_confirm_counter = 0;
 
 //==============================================================================
 // PROTOTIPOS DE FUNCIONES PRIVADAS
@@ -106,6 +111,7 @@ static void Handle_Deciding(void);
 static void Manage_Turn(void);
 static void Update_Yaw(void);
 void Turn_Start(int16_t angle_degrees);
+static int32_t Get_Filtered_ADC_Value(uint8_t channel);
 
 //==============================================================================
 // IMPLEMENTACIÓN DE WRAPPERS DE CALLBACKS HAL
@@ -242,17 +248,18 @@ void DecodeCMD(struct UNERBUSHandle *aBus, uint8_t iStartData)
         UNERBUS_WriteByte(aBus, CMD_ACK);
         length = UNERBUS_CMD_ID_SIZE + UNERBUS_ACK_SIZE; //
         break;
-    case CMD_GET_LAST_ADC_VALUES:           // LAST_ADC - Enviar datos del ADC - 55 4E 45 52 02 3A A0 94
+    case CMD_GET_LAST_ADC_VALUES:           // LAST_ADC - Enviar datos del ADC
         uint8_t adc_buffer[ADC_DATA_BYTES]; // Buffer temporal para los datos del ADC
 
-        // Leer del último buffer de ADC completado y seguro
-        uint8_t last_adc_idx = (adc_buf_write_idx == 0) ? (ADC_BUFFER_SIZE - 1) : (adc_buf_write_idx - 1);
-
-        // Convertir los 8 canales uint16_t a bytes (Little Endian)
+        // Obtener el valor filtrado (promedio móvil) para cada canal
         for (uint8_t i = 0; i < ADC_CHANNELS; i++)
         {
-            adc_buffer[idx++] = (uint8_t)(buf_adc[last_adc_idx][i] & 0xFF);        // Byte bajo
-            adc_buffer[idx++] = (uint8_t)((buf_adc[last_adc_idx][i] >> 8) & 0xFF); // Byte alto
+            // Llamar a la función de filtrado para el canal actual
+            uint16_t filtered_value = (uint16_t)Get_Filtered_ADC_Value(i);
+
+            // Convertir el valor uint16_t a bytes (Little Endian)
+            adc_buffer[idx++] = (uint8_t)(filtered_value & 0xFF);        // Byte bajo
+            adc_buffer[idx++] = (uint8_t)((filtered_value >> 8) & 0xFF); // Byte alto
         }
 
         UNERBUS_Write(aBus, adc_buffer, ADC_DATA_BYTES);
@@ -606,6 +613,8 @@ void DecodeCMD(struct UNERBUSHandle *aBus, uint8_t iStartData)
             if (menu_mode == MENU_MODE_FIND_CELLS || menu_mode == MENU_MODE_GO_TO_B)
             {
                 robot_state = STATE_CENTERING; // Aquí se inicia el movimiento
+                kick_start_active = true;
+                motion_confirm_counter = 0;
             }
             else
             {
@@ -643,6 +652,25 @@ void DecodeCMD(struct UNERBUSHandle *aBus, uint8_t iStartData)
         status_buffer[1] = (uint8_t)menu_mode;
         UNERBUS_Write(aBus, status_buffer, UNERBUS_ROBOT_STATUS_SIZE);
         length = UNERBUS_CMD_ID_SIZE + UNERBUS_ROBOT_STATUS_SIZE;
+        break;
+    case CMD_SET_CRUISE_PARAMS:
+        motor_cruise_speed = UNERBUS_GetUInt16(aBus);
+        accel_motion_threshold = UNERBUS_GetUInt16(aBus);
+        // Se recibe como u16 para alinear el paquete, pero se usa como u8.
+        accel_motion_confirm_ticks = (uint8_t)UNERBUS_GetUInt16(aBus);
+        UNERBUS_WriteByte(aBus, CMD_ACK);
+        length = UNERBUS_CMD_ID_SIZE + UNERBUS_ACK_SIZE;
+        break;
+    case CMD_GET_CRUISE_PARAMS:
+        uint8_t cruise_buffer[UNERBUS_CRUISE_PARAMS_SIZE];
+        cruise_buffer[0] = (uint8_t)(motor_cruise_speed & 0xFF);
+        cruise_buffer[1] = (uint8_t)((motor_cruise_speed >> 8) & 0xFF);
+        cruise_buffer[2] = (uint8_t)(accel_motion_threshold & 0xFF);
+        cruise_buffer[3] = (uint8_t)((accel_motion_threshold >> 8) & 0xFF);
+        cruise_buffer[4] = (uint8_t)(accel_motion_confirm_ticks);
+        cruise_buffer[5] = 0; // Padding para alinear a 16 bits
+        UNERBUS_Write(aBus, cruise_buffer, UNERBUS_CRUISE_PARAMS_SIZE);
+        length = UNERBUS_CMD_ID_SIZE + UNERBUS_CRUISE_PARAMS_SIZE;
         break;
     default:
         // Comando desconocido, enviar ACK de error
@@ -1009,6 +1037,11 @@ static void ManageButtonEvents(void)
                 PID_Reset(&centering_pid);
                 PID_Reset(&turn_pid);
                 robot_state = (menu_mode == MENU_MODE_FIND_CELLS) ? STATE_CENTERING : STATE_IDLE;
+                if (robot_state == STATE_CENTERING)
+                {
+                    kick_start_active = true;
+                    motion_confirm_counter = 0;
+                }
                 break;
             default:
                 break;
@@ -1107,6 +1140,11 @@ void App_Core_Init(void)
     /* UNERBUS */
     UNERBUS_Init(&unerbus_esp01_handle);
     UNERBUS_Init(&unerbus_pc_handle);
+
+    /* --- INICIALIZACIÓN DE PARÁMETROS DE CRUCERO --- */
+    motor_cruise_speed = MOTOR_CRUISE_SPEED_DEFAULT;
+    accel_motion_threshold = ACCEL_MOTION_THRESHOLD_DEFAULT;
+    accel_motion_confirm_ticks = ACCEL_MOTION_CONFIRM_TICKS_DEFAULT;
 
     /* --- INICIALIZACIÓN DE PARÁMETROS DE NAVEGACIÓN --- */
     wall_threshold_front = WALL_THRESHOLD_FRONT_DEFAULT;
@@ -1288,6 +1326,8 @@ static void Manage_Turn(void)
         robot_state = STATE_CENTERING;
         PID_Reset(&centering_pid);         // Reseteamos el PID de centrado para empezar de cero
         was_wall_following_active = false; // Olvidar el estado anterior al entrar en un nuevo pasillo
+        kick_start_active = true;
+        motion_confirm_counter = 0;
         return;
     }
 
@@ -1326,21 +1366,21 @@ static void Set_Motor_Speeds(int16_t right_speed, int16_t left_speed)
     // Lógica para motor derecho
     if (right_speed > 0)
     {
-        right_fwd = (right_speed > pwm_max_value) ? pwm_max_value : right_speed;
+        right_fwd = (right_speed > (pwm_max_value - 1)) ? (pwm_max_value - 1) : right_speed;
     }
     else
     {
-        right_rev = (-right_speed > pwm_max_value) ? pwm_max_value : -right_speed;
+        right_rev = (-right_speed > (pwm_max_value - 1)) ? (pwm_max_value - 1) : -right_speed;
     }
 
     // Lógica para motor izquierdo
     if (left_speed > 0)
     {
-        left_fwd = (left_speed > pwm_max_value) ? pwm_max_value : left_speed;
+        left_fwd = (left_speed > (pwm_max_value - 1)) ? (pwm_max_value - 1) : left_speed;
     }
     else
     {
-        left_rev = (-left_speed > pwm_max_value) ? pwm_max_value : -left_speed;
+        left_rev = (-left_speed > (pwm_max_value - 1)) ? (pwm_max_value - 1) : -left_speed;
     }
 
     // Motor derecho: ch2 adelante (TIM4_CH2), ch1 atrás (TIM4_CH1)
@@ -1391,21 +1431,89 @@ static void Handle_Idle(void)
     Set_Motor_Speeds(0, 0); // Asegurarse de que los motores estén parados
 }
 
+/**
+ * @brief Calcula el valor promedio de las últimas N muestras de un canal ADC.
+ * @param channel El canal del ADC del cual se quiere obtener el valor filtrado.
+ * @return El valor promedio (filtrado) de 32 bits.
+ */
+static int32_t Get_Filtered_ADC_Value(uint8_t channel)
+{
+    uint32_t sum = 0;
+    // El índice de escritura apunta a la siguiente posición vacía,
+    // por lo que empezamos desde la muestra anterior a la actual.
+    uint8_t read_idx = (adc_buf_write_idx == 0) ? (ADC_BUFFER_SIZE - 1) : (adc_buf_write_idx - 1);
+
+    // Iterar hacia atrás N veces para sumar las últimas N muestras
+    for (int i = 0; i < ADC_MOVING_AVERAGE_SAMPLES; i++)
+    {
+        sum += buf_adc[read_idx][channel];
+
+        // Manejar el búfer circular: si el índice es 0, salta al final
+        if (read_idx == 0)
+        {
+            read_idx = ADC_BUFFER_SIZE - 1;
+        }
+        else
+        {
+            read_idx--;
+        }
+    }
+
+    return sum / ADC_MOVING_AVERAGE_SAMPLES;
+}
+
 static void Handle_Centering(void)
 {
     // 1. Leer sensores
-    uint8_t last_adc_idx = (adc_buf_write_idx == 0) ? (ADC_BUFFER_SIZE - 1) : (adc_buf_write_idx - 1);
-    int32_t left_lat_val = buf_adc[last_adc_idx][SENSOR_LEFT_LAT_CH];
-    int32_t right_lat_val = buf_adc[last_adc_idx][SENSOR_RIGHT_LAT_CH];
-    int32_t front_left_val = buf_adc[last_adc_idx][SENSOR_FRONT_LEFT_CH];
-    int32_t front_right_val = buf_adc[last_adc_idx][SENSOR_FRONT_RIGHT_CH];
+    int32_t left_lat_val = Get_Filtered_ADC_Value(SENSOR_LEFT_LAT_CH);
+    int32_t right_lat_val = Get_Filtered_ADC_Value(SENSOR_RIGHT_LAT_CH);
+    int32_t front_left_val = Get_Filtered_ADC_Value(SENSOR_FRONT_LEFT_CH);
+    int32_t front_right_val = Get_Filtered_ADC_Value(SENSOR_FRONT_RIGHT_CH);
 
     // 2. Comprobar si hay una pared frontal para pasar a decidir
     if (front_left_val > wall_threshold_front || front_right_val > wall_threshold_front)
     {
         robot_state = STATE_DECIDING;
-        Set_Motor_Speeds(0, 0); // Detenerse antes de decidir
+        Set_Motor_Speeds(0, 0);    // Detenerse antes de decidir
+        kick_start_active = false; // Cancelar kick-start si vemos una pared
         return;
+    }
+
+    uint16_t current_right_base_speed;
+    uint16_t current_left_base_speed;
+
+    if (kick_start_active)
+    {
+        // Modo "kick-start": usar velocidad alta y comprobar acelerómetro.
+        int16_t ax;
+        MPU6050_GetCalibratedData(&hmpu, &ax, NULL, NULL, NULL, NULL, NULL);
+
+        // El eje de avance es X. Usamos valor absoluto.
+        if (abs(ax) > accel_motion_threshold)
+        {
+            motion_confirm_counter++;
+        }
+        else
+        {
+            motion_confirm_counter = 0; // Resetear si la lectura es baja
+        }
+
+        if (motion_confirm_counter >= accel_motion_confirm_ticks)
+        {
+            kick_start_active = false; // Movimiento confirmado, desactivar kick-start.
+            motion_confirm_counter = 0;
+        }
+
+        // Todavía en modo kick-start, usar velocidad base alta.
+        current_right_base_speed = right_motor_base_speed;
+        current_left_base_speed = left_motor_base_speed;
+    }
+
+    if (!kick_start_active)
+    {
+        // Si no estamos en kick-start, usamos la velocidad de crucero.
+        current_right_base_speed = motor_cruise_speed;
+        current_left_base_speed = motor_cruise_speed;
     }
 
     // 3. Determinar qué paredes laterales están presentes
@@ -1450,11 +1558,12 @@ static void Handle_Centering(void)
             // Si estábamos siguiendo una pared y ahora no hay ninguna, hemos llegado a un cruce.
             robot_state = STATE_DECIDING; // Forzar decisión
             Set_Motor_Speeds(0, 0);       // Detenerse
+            kick_start_active = false;    // Cancelar kick-start
         }
         else
         {
             // Si ya estábamos en un espacio abierto, continuar recto.
-            Set_Motor_Speeds(right_motor_base_speed, left_motor_base_speed);
+            Set_Motor_Speeds(current_right_base_speed, current_left_base_speed);
         }
         return;
     }
@@ -1465,8 +1574,8 @@ static void Handle_Centering(void)
 
     // 5. Aplicar corrección a los motores
     // Si la corrección es positiva, gira a la derecha. Si es negativa, a la izquierda.
-    int16_t right_motor_speed = right_motor_base_speed + correction;
-    int16_t left_motor_speed = left_motor_base_speed - correction;
+    int16_t right_motor_speed = current_right_base_speed + correction;
+    int16_t left_motor_speed = current_left_base_speed - correction;
 
     // 6. Limitar velocidades y aplicar
     Set_Motor_Speeds(right_motor_speed, left_motor_speed);
@@ -1475,9 +1584,8 @@ static void Handle_Centering(void)
 static void Handle_Deciding(void)
 {
     // Leer sensores laterales para ver qué caminos están abiertos
-    uint8_t last_adc_idx = (adc_buf_write_idx == 0) ? (ADC_BUFFER_SIZE - 1) : (adc_buf_write_idx - 1);
-    int32_t left_sensor_val = buf_adc[last_adc_idx][SENSOR_LEFT_LAT_CH];
-    int32_t right_sensor_val = buf_adc[last_adc_idx][SENSOR_RIGHT_LAT_CH];
+    int32_t left_sensor_val = Get_Filtered_ADC_Value(SENSOR_LEFT_LAT_CH);
+    int32_t right_sensor_val = Get_Filtered_ADC_Value(SENSOR_RIGHT_LAT_CH);
 
     bool left_path_is_open = left_sensor_val < wall_threshold_side;
     bool right_path_is_open = right_sensor_val < wall_threshold_side;
