@@ -72,6 +72,8 @@ uint16_t max_pwm_correction = 4000;     // Corrección máxima del PID
 uint16_t turn_max_speed = TURN_MAX_SPEED_DEFAULT;
 uint16_t turn_min_speed = TURN_MIN_SPEED_DEFAULT;
 uint16_t braking_max_speed = BRAKING_MAX_SPEED_DEFAULT; // PWM máximo de frenado
+uint16_t braking_min_speed = BRAKING_MIN_SPEED_DEFAULT;
+uint16_t braking_dead_zone = BRAKING_DEAD_ZONE_DEFAULT;
 
 static int32_t current_yaw_fixed = 0; // Yaw angle in Q16.16 fixed-point (degrees)
 static int32_t gyro_z_scaler;         // Factor de escala dinámico para el giroscopio
@@ -117,6 +119,8 @@ static void Manage_Turn(void);
 static void Update_Yaw(void);
 void Turn_Start(int16_t angle_degrees);
 static int32_t Get_Filtered_ADC_Value(uint8_t channel);
+static void Set_Robot_State(RobotStateTypeDef new_state);
+static void Update_Display_Content(void);
 
 //==============================================================================
 // IMPLEMENTACIÓN DE WRAPPERS DE CALLBACKS HAL
@@ -617,13 +621,13 @@ void DecodeCMD(struct UNERBUSHandle *aBus, uint8_t iStartData)
             // Esto replica el comportamiento del botón físico.
             if (menu_mode == MENU_MODE_FIND_CELLS || menu_mode == MENU_MODE_GO_TO_B)
             {
-                robot_state = STATE_CENTERING; // Aquí se inicia el movimiento
+                Set_Robot_State(STATE_CENTERING); // Aquí se inicia el movimiento
                 kick_start_active = true;
                 motion_confirm_counter = 0;
             }
             else
             {
-                robot_state = STATE_IDLE; // Para modos que no inician movimiento
+                Set_Robot_State(STATE_IDLE); // Para modos que no inician movimiento
             }
         }
         else if (new_state == APP_STATE_MENU && app_state == APP_STATE_RUNNING)
@@ -631,10 +635,10 @@ void DecodeCMD(struct UNERBUSHandle *aBus, uint8_t iStartData)
             // Transición de RUNNING a MENU
             app_state = APP_STATE_MENU;
             Set_Motor_Speeds(0, 0); // Detener motores por seguridad
-            robot_state = STATE_IDLE;
+            Set_Robot_State(STATE_IDLE);
         }
-        // Si el estado ya es el solicitado, no se hace nada.
-
+        Update_Display_Content();
+        SSD_UPDATE_REQUEST = true;
         UNERBUS_WriteByte(aBus, CMD_ACK);
         length = UNERBUS_CMD_ID_SIZE + UNERBUS_ACK_SIZE;
         break;
@@ -644,6 +648,8 @@ void DecodeCMD(struct UNERBUSHandle *aBus, uint8_t iStartData)
         break;
     case CMD_SET_MENU_MODE:
         menu_mode = (MenuModeTypeDef)UNERBUS_GetUInt8(aBus);
+        Update_Display_Content();
+        SSD_UPDATE_REQUEST = true;
         UNERBUS_WriteByte(aBus, CMD_ACK);
         length = UNERBUS_CMD_ID_SIZE + UNERBUS_ACK_SIZE;
         break;
@@ -729,6 +735,30 @@ void DecodeCMD(struct UNERBUSHandle *aBus, uint8_t iStartData)
         braking_speed_buffer[1] = (uint8_t)((braking_max_speed >> 8) & 0xFF);
         UNERBUS_Write(aBus, braking_speed_buffer, UNERBUS_BRAKING_MAX_SPEED_SIZE);
         length = UNERBUS_CMD_ID_SIZE + UNERBUS_BRAKING_MAX_SPEED_SIZE;
+        break;
+    case CMD_SET_BRAKING_MIN_SPEED:
+        braking_min_speed = UNERBUS_GetUInt16(aBus);
+        UNERBUS_WriteByte(aBus, CMD_ACK);
+        length = UNERBUS_CMD_ID_SIZE + UNERBUS_ACK_SIZE;
+        break;
+    case CMD_GET_BRAKING_MIN_SPEED:
+        uint8_t braking_min_speed_buffer[UNERBUS_BRAKING_MIN_SPEED_SIZE];
+        braking_min_speed_buffer[0] = (uint8_t)(braking_min_speed & 0xFF);
+        braking_min_speed_buffer[1] = (uint8_t)((braking_min_speed >> 8) & 0xFF);
+        UNERBUS_Write(aBus, braking_min_speed_buffer, UNERBUS_BRAKING_MIN_SPEED_SIZE);
+        length = UNERBUS_CMD_ID_SIZE + UNERBUS_BRAKING_MIN_SPEED_SIZE;
+        break;
+    case CMD_SET_BRAKING_DEAD_ZONE:
+        braking_dead_zone = UNERBUS_GetUInt16(aBus);
+        UNERBUS_WriteByte(aBus, CMD_ACK);
+        length = UNERBUS_CMD_ID_SIZE + UNERBUS_ACK_SIZE;
+        break;
+    case CMD_GET_BRAKING_DEAD_ZONE:
+        uint8_t braking_dead_zone_buffer[UNERBUS_BRAKING_DEAD_ZONE_SIZE];
+        braking_dead_zone_buffer[0] = (uint8_t)(braking_dead_zone & 0xFF);
+        braking_dead_zone_buffer[1] = (uint8_t)((braking_dead_zone >> 8) & 0xFF);
+        UNERBUS_Write(aBus, braking_dead_zone_buffer, UNERBUS_BRAKING_DEAD_ZONE_SIZE);
+        length = UNERBUS_CMD_ID_SIZE + UNERBUS_BRAKING_DEAD_ZONE_SIZE;
         break;
     default:
         // Comando desconocido, enviar ACK de error
@@ -821,68 +851,6 @@ void Do100ms()
 
     if (timeout_alive_udp)
         timeout_alive_udp--;
-
-    // --- Lógica de Display OLED ---
-    char text_line1[22];
-    char text_line2[22];
-    char text_line3[22];
-
-    SSD1306_Clear(&hssd);
-
-    if (app_state == APP_STATE_MENU)
-    {
-        snprintf(text_line1, sizeof(text_line1), "%s Idle", (menu_mode == MENU_MODE_IDLE) ? ">" : " ");
-        snprintf(text_line2, sizeof(text_line2), "%s Find Cells", (menu_mode == MENU_MODE_FIND_CELLS) ? ">" : " ");
-        snprintf(text_line3, sizeof(text_line3), "%s Go A->B", (menu_mode == MENU_MODE_GO_TO_B) ? ">" : " ");
-
-        SSD1306_DrawText(&hssd, 0, 0, "--- MENU ---", SSD1306_TEXT_ALIGN_LEFT);
-        SSD1306_DrawText(&hssd, 0, 10, text_line1, SSD1306_TEXT_ALIGN_LEFT);
-        SSD1306_DrawText(&hssd, 0, 20, text_line2, SSD1306_TEXT_ALIGN_LEFT);
-        SSD1306_DrawText(&hssd, 0, 30, text_line3, SSD1306_TEXT_ALIGN_LEFT);
-    }
-    else // APP_STATE_RUNNING
-    {
-        const char *current_mode_str = "Unknown";
-        switch (menu_mode) //
-        {
-        case MENU_MODE_IDLE:
-            current_mode_str = "Idle";
-            break;
-        case MENU_MODE_FIND_CELLS:
-            current_mode_str = "Finding Cells";
-            break;
-        case MENU_MODE_GO_TO_B:
-            current_mode_str = "Going A->B";
-            break;
-        }
-        snprintf(text_line1, sizeof(text_line1), "Mode: %s", current_mode_str);
-
-        // Mostrar estado específico del robot
-        const char *robot_state_str = "Stopped";
-        switch (robot_state)
-        {
-        case STATE_CENTERING:
-            robot_state_str = "Centering...";
-            break;
-        case STATE_BRAKING:
-            robot_state_str = "Braking...";
-            break;
-        case STATE_DECIDING:
-            robot_state_str = "Deciding...";
-            break;
-        case STATE_TURNING_LEFT:
-        case STATE_TURNING_RIGHT:
-        case STATE_TURN_AROUND:
-            robot_state_str = "Turning...";
-            break;
-        }
-        snprintf(text_line2, sizeof(text_line2), "State: %s", robot_state_str);
-
-        SSD1306_DrawText(&hssd, 0, 0, text_line1, SSD1306_TEXT_ALIGN_LEFT);
-        SSD1306_DrawText(&hssd, 0, 10, text_line2, SSD1306_TEXT_ALIGN_LEFT);
-    }
-
-    SSD_UPDATE_REQUEST = true;
 }
 
 uint8_t UART_TransmitByte(uint8_t value)
@@ -1089,6 +1057,8 @@ static void ManageButtonEvents(void)
                 menu_mode = (MenuModeTypeDef)((menu_mode + 1) % MENU_MODE_COUNT);
                 temporary_heartbeat = HEARTBEAT_BTN_SHORT_PRESS;
                 temporary_heartbeat_ticks = 5; // Duración del feedback (5 * 100ms = 0.5s)
+                Update_Display_Content();
+                SSD_UPDATE_REQUEST = true;
                 break;
             case EVENT_LONG_PRESS_RELEASED: // Pulsación larga: seleccionar y correr
                 app_state = APP_STATE_RUNNING;
@@ -1098,7 +1068,7 @@ static void ManageButtonEvents(void)
                 PID_Reset(&centering_pid);
                 PID_Reset(&turn_pid);
                 PID_Reset(&braking_pid);
-                robot_state = (menu_mode == MENU_MODE_FIND_CELLS) ? STATE_CENTERING : STATE_IDLE;
+                Set_Robot_State((menu_mode == MENU_MODE_FIND_CELLS) ? STATE_CENTERING : STATE_IDLE);
                 if (robot_state == STATE_CENTERING)
                 {
                     kick_start_active = true;
@@ -1115,10 +1085,13 @@ static void ManageButtonEvents(void)
             if (button_event == EVENT_LONG_PRESS_RELEASED)
             {
                 app_state = APP_STATE_MENU;
-                robot_state = STATE_IDLE;
+                Set_Robot_State(STATE_IDLE);
                 Set_Motor_Speeds(0, 0); // Detener motores
                 temporary_heartbeat = HEARTBEAT_BTN_LONG_PRESS;
                 temporary_heartbeat_ticks = 10;
+                // La llamada a Set_Robot_State ya activa la flag,
+                // pero el cambio de app_state también requiere actualizar el display.
+                Update_Display_Content();
             }
         }
     }
@@ -1367,15 +1340,15 @@ void Turn_Start(int16_t angle_degrees)
         // Asignar el estado de giro correcto
         if (angle_degrees == 90)
         {
-            robot_state = STATE_TURNING_RIGHT;
+            Set_Robot_State(STATE_TURNING_RIGHT);
         }
         else if (angle_degrees == -90)
         {
-            robot_state = STATE_TURNING_LEFT;
+            Set_Robot_State(STATE_TURNING_LEFT);
         }
         else // 180 o cualquier otro ángulo
         {
-            robot_state = STATE_TURN_AROUND;
+            Set_Robot_State(STATE_TURN_AROUND);
         }
     }
 }
@@ -1400,7 +1373,7 @@ static void Manage_Turn(void)
     if (abs(error_degrees) <= TURN_COMPLETION_DEAD_ZONE)
     {
         Set_Motor_Speeds(0, 0);
-        robot_state = STATE_CENTERING;
+        Set_Robot_State(STATE_CENTERING);
         PID_Reset(&centering_pid); // Reseteamos el PID de centrado para empezar de cero
         PID_Reset(&braking_pid);
         was_wall_following_active = false; // Olvidar el estado anterior al entrar en un nuevo pasillo
@@ -1551,7 +1524,7 @@ static void Handle_Centering(void)
     // 2. Comprobar si hay una pared frontal para pasar a decidir
     if (front_left_val > wall_threshold_front || front_right_val > wall_threshold_front)
     {
-        robot_state = STATE_BRAKING;
+        Set_Robot_State(STATE_BRAKING);
         PID_Reset(&braking_pid);   // Resetear el PID de freno al iniciar
         Set_Motor_Speeds(0, 0);    // Detener motores en la transición
         kick_start_active = false; // Cancelar kick-start si vemos una pared
@@ -1635,9 +1608,9 @@ static void Handle_Centering(void)
         if (was_wall_following_active)
         {
             // Si estábamos siguiendo una pared y ahora no hay ninguna, hemos llegado a un cruce.
-            robot_state = STATE_DECIDING; // Forzar decisión
-            Set_Motor_Speeds(0, 0);       // Detenerse
-            kick_start_active = false;    // Cancelar kick-start
+            Set_Robot_State(STATE_DECIDING); // Forzar decisión
+            Set_Motor_Speeds(0, 0);          // Detenerse
+            kick_start_active = false;       // Cancelar kick-start
         }
         else
         {
@@ -1675,10 +1648,10 @@ static void Handle_Braking(void)
     MPU6050_GetCalibratedData(&hmpu, &ax, NULL, NULL, NULL, NULL, NULL);
 
     // Condición de parada: error de distancia bajo Y aceleración casi nula
-    if (abs(error) < BRAKING_COMPLETION_DEAD_ZONE && abs(ax) < braking_accel_stop_threshold)
+    if (abs(error) < braking_dead_zone && abs(ax) < braking_accel_stop_threshold)
     {
         Set_Motor_Speeds(0, 0);
-        robot_state = STATE_DECIDING; // Transición a la toma de decisiones
+        Set_Robot_State(STATE_DECIDING);
         return;
     }
 
@@ -1692,7 +1665,17 @@ static void Handle_Braking(void)
     // Si el error es negativo (se pasó), la velocidad será negativa (reversa).
     int16_t motor_speed = (int16_t)FIXED_TO_INT(pid_output_fixed);
 
-    // 6. Aplicar la misma velocidad a ambos motores para frenar en línea recta.
+    // 6. Lógica de potencia mínima para vencer la inercia.
+    if (motor_speed > 0 && motor_speed < braking_min_speed)
+    {
+        motor_speed = braking_min_speed;
+    }
+    else if (motor_speed < 0 && motor_speed > -braking_min_speed)
+    {
+        motor_speed = -braking_min_speed;
+    }
+
+    // 7. Aplicar la misma velocidad a ambos motores para frenar en línea recta.
     Set_Motor_Speeds(motor_speed, motor_speed);
 }
 
@@ -1729,5 +1712,84 @@ static void Handle_Deciding(void)
     {
         // Callejón sin salida, dar la vuelta
         Turn_Start(180);
+    }
+}
+
+/**
+ * @brief  Establece un nuevo estado para el robot y solicita una actualización del display.
+ * @param  new_state El nuevo estado del robot.
+ * @retval None
+ */
+static void Set_Robot_State(RobotStateTypeDef new_state)
+{
+    if (robot_state != new_state)
+    {
+        robot_state = new_state;
+        SSD_UPDATE_REQUEST = true; // Solicitar actualización del display solo si el estado cambia
+    }
+}
+
+/**
+ * @brief Prepara el contenido del buffer del display OLED según el estado actual de la app.
+ * @retval None
+ */
+static void Update_Display_Content(void)
+{
+    char text_line1[22];
+    char text_line2[22];
+    char text_line3[22];
+
+    SSD1306_Clear(&hssd);
+
+    if (app_state == APP_STATE_MENU)
+    {
+        snprintf(text_line1, sizeof(text_line1), "%s Idle", (menu_mode == MENU_MODE_IDLE) ? ">" : " ");
+        snprintf(text_line2, sizeof(text_line2), "%s Find Cells", (menu_mode == MENU_MODE_FIND_CELLS) ? ">" : " ");
+        snprintf(text_line3, sizeof(text_line3), "%s Go A->B", (menu_mode == MENU_MODE_GO_TO_B) ? ">" : " ");
+
+        SSD1306_DrawText(&hssd, 0, 0, "--- MENU ---", SSD1306_TEXT_ALIGN_LEFT);
+        SSD1306_DrawText(&hssd, 0, 10, text_line1, SSD1306_TEXT_ALIGN_LEFT);
+        SSD1306_DrawText(&hssd, 0, 20, text_line2, SSD1306_TEXT_ALIGN_LEFT);
+        SSD1306_DrawText(&hssd, 0, 30, text_line3, SSD1306_TEXT_ALIGN_LEFT);
+    }
+    else // APP_STATE_RUNNING
+    {
+        const char *current_mode_str = "Unknown";
+        switch (menu_mode)
+        {
+        case MENU_MODE_IDLE:
+            current_mode_str = "Idle";
+            break;
+        case MENU_MODE_FIND_CELLS:
+            current_mode_str = "Finding Cells";
+            break;
+        case MENU_MODE_GO_TO_B:
+            current_mode_str = "Going A->B";
+            break;
+        }
+        snprintf(text_line1, sizeof(text_line1), "Mode: %s", current_mode_str);
+
+        const char *robot_state_str = "Stopped";
+        switch (robot_state)
+        {
+        case STATE_CENTERING:
+            robot_state_str = "Centering...";
+            break;
+        case STATE_BRAKING:
+            robot_state_str = "Braking...";
+            break;
+        case STATE_DECIDING:
+            robot_state_str = "Deciding...";
+            break;
+        case STATE_TURNING_LEFT:
+        case STATE_TURNING_RIGHT:
+        case STATE_TURN_AROUND:
+            robot_state_str = "Turning...";
+            break;
+        }
+        snprintf(text_line2, sizeof(text_line2), "State: %s", robot_state_str);
+
+        SSD1306_DrawText(&hssd, 0, 0, text_line1, SSD1306_TEXT_ALIGN_LEFT);
+        SSD1306_DrawText(&hssd, 0, 10, text_line2, SSD1306_TEXT_ALIGN_LEFT);
     }
 }

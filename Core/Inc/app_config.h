@@ -116,6 +116,10 @@ typedef enum
     CMD_GET_BRAKING_PARAMS = 0x67,
     CMD_SET_BRAKING_MAX_SPEED = 0x68,
     CMD_GET_BRAKING_MAX_SPEED = 0x69,
+    CMD_SET_BRAKING_MIN_SPEED = 0x6A, // Para configurar la velocidad mínima de frenado
+    CMD_GET_BRAKING_MIN_SPEED = 0x6B, // Para leer la velocidad mínima de frenado
+    CMD_SET_BRAKING_DEAD_ZONE = 0x6C, // Para configurar la zona muerta de frenado
+    CMD_GET_BRAKING_DEAD_ZONE = 0x6D, // Para leer la zona muerta de frenado
     CMD_OTHERS
 } CommandIdTypeDef;
 
@@ -212,6 +216,8 @@ extern uint16_t pwm_max_value;
 #define UNERBUS_BRAKING_PID_GAINS_SIZE (sizeof(uint16_t) * 3)
 #define UNERBUS_BRAKING_PARAMS_SIZE (sizeof(uint16_t) * 2)
 #define UNERBUS_BRAKING_MAX_SPEED_SIZE (sizeof(uint16_t))
+#define UNERBUS_BRAKING_MIN_SPEED_SIZE (sizeof(uint16_t))
+#define UNERBUS_BRAKING_DEAD_ZONE_SIZE (sizeof(uint16_t))
 
 /* USB CDC Buffer Sizes */
 #define USB_CDC_RX_BUFFER_SIZE 128
@@ -283,8 +289,9 @@ extern uint16_t pwm_max_value;
 #define BRAKING_PID_KP_DEFAULT 10.0f
 #define BRAKING_PID_KI_DEFAULT 0.1f
 #define BRAKING_PID_KD_DEFAULT 5.0f
-#define BRAKING_COMPLETION_DEAD_ZONE 50          // Tolerancia en ADC para considerar la parada
-#define BRAKING_ACCEL_STOP_THRESHOLD_DEFAULT 100 // Umbral de acelerómetro para confirmar detención
+#define BRAKING_DEAD_ZONE_DEFAULT 50             // Tolerancia en ADC para considerar la parada
+#define BRAKING_ACCEL_STOP_THRESHOLD_DEFAULT 400 // Umbral de acelerómetro para confirmar detención
 #define BRAKING_MAX_SPEED_DEFAULT 4000           // Velocidad máxima de frenado en PWM
+#define BRAKING_MIN_SPEED_DEFAULT 2200           // Velocidad mínima de frenado para vencer inercia
 
 #endif /* INC_APP_CONFIG_H_ */
