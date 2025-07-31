@@ -110,6 +110,12 @@ typedef enum
     CMD_GET_ROBOT_STATUS = 0x74,    // Para leer el estado completo (AppState y MenuMode)
     CMD_SET_CRUISE_PARAMS = 0x4E,   // Configurar velocidad crucero y umbral de aceleración
     CMD_GET_CRUISE_PARAMS = 0x4F,   // Leer velocidad crucero y umbral de aceleración
+    CMD_SET_BRAKING_PID_GAINS = 0x64,
+    CMD_GET_BRAKING_PID_GAINS = 0x65,
+    CMD_SET_BRAKING_PARAMS = 0x66,
+    CMD_GET_BRAKING_PARAMS = 0x67,
+    CMD_SET_BRAKING_MAX_SPEED = 0x68,
+    CMD_GET_BRAKING_MAX_SPEED = 0x69,
     CMD_OTHERS
 } CommandIdTypeDef;
 
@@ -127,6 +133,7 @@ typedef enum
 {
     STATE_IDLE,
     STATE_CENTERING,
+    STATE_BRAKING,
     STATE_DECIDING,
     STATE_TURNING_LEFT,
     STATE_TURNING_RIGHT,
@@ -202,6 +209,9 @@ extern uint16_t pwm_max_value;
 #define UNERBUS_MENU_MODE_SIZE (sizeof(uint8_t))
 #define UNERBUS_ROBOT_STATUS_SIZE (sizeof(uint8_t) * 2)
 #define UNERBUS_CRUISE_PARAMS_SIZE (sizeof(uint16_t) * 3) // cruise_speed, accel_threshold, confirm_ticks
+#define UNERBUS_BRAKING_PID_GAINS_SIZE (sizeof(uint16_t) * 3)
+#define UNERBUS_BRAKING_PARAMS_SIZE (sizeof(uint16_t) * 2)
+#define UNERBUS_BRAKING_MAX_SPEED_SIZE (sizeof(uint16_t))
 
 /* USB CDC Buffer Sizes */
 #define USB_CDC_RX_BUFFER_SIZE 128
@@ -259,13 +269,22 @@ extern uint16_t pwm_max_value;
 #define SENSOR_FRONT_RIGHT_CH 2
 #define SENSOR_FRONT_LEFT_CH 4
 #define SENSOR_LEFT_LAT_CH 6
-#define WALL_THRESHOLD_FRONT_DEFAULT 1500 // Umbral ADC para detectar pared frontal
+#define WALL_THRESHOLD_FRONT_DEFAULT 200  // Umbral ADC para detectar pared frontal
 #define WALL_THRESHOLD_SIDE_DEFAULT 1000  // Umbral ADC para detectar pared lateral
 #define WALL_TARGET_ADC_DEFAULT 2000      // Valor ADC objetivo al seguir una sola pared
+#define WALL_STOP_TARGET_ADC_DEFAULT 1000 // Distancia de parada objetivo
 
 /* --- Cruise Control --- */
 #define MOTOR_CRUISE_SPEED_DEFAULT 2600      // Velocidad PWM para navegación en rectas
 #define ACCEL_MOTION_THRESHOLD_DEFAULT 1000  // Umbral de aceleración (raw) para detectar movimiento
 #define ACCEL_MOTION_CONFIRM_TICKS_DEFAULT 2 // Nº de ciclos de 10ms para confirmar movimiento
+
+/* --- Braking PID Controller --- */
+#define BRAKING_PID_KP_DEFAULT 10.0f
+#define BRAKING_PID_KI_DEFAULT 0.1f
+#define BRAKING_PID_KD_DEFAULT 5.0f
+#define BRAKING_COMPLETION_DEAD_ZONE 50          // Tolerancia en ADC para considerar la parada
+#define BRAKING_ACCEL_STOP_THRESHOLD_DEFAULT 100 // Umbral de acelerómetro para confirmar detención
+#define BRAKING_MAX_SPEED_DEFAULT 4000           // Velocidad máxima de frenado en PWM
 
 #endif /* INC_APP_CONFIG_H_ */

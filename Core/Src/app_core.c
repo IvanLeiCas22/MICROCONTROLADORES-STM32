@@ -60,14 +60,18 @@ static uint8_t temporary_heartbeat_ticks = 0;
 // --- Variables de PID y Control del Robot ---
 PID_Controller_t centering_pid;
 PID_Controller_t turn_pid;
+PID_Controller_t braking_pid;
 uint16_t right_motor_base_speed = 3500; // Velocidad base motor derecho
 uint16_t left_motor_base_speed = 3500;  // Velocidad base motor izquierdo
 uint16_t wall_threshold_front;          // Umbral ADC para detectar pared frontal
 uint16_t wall_threshold_side;           // Umbral ADC para detectar pared lateral
 uint16_t wall_target_adc;               // Valor ADC objetivo al seguir solo una pared
+uint16_t wall_stop_target_adc;          // Distancia de parada objetivo
+uint16_t braking_accel_stop_threshold;  // Umbral de aceleración para confirmar detención
 uint16_t max_pwm_correction = 4000;     // Corrección máxima del PID
 uint16_t turn_max_speed = TURN_MAX_SPEED_DEFAULT;
 uint16_t turn_min_speed = TURN_MIN_SPEED_DEFAULT;
+uint16_t braking_max_speed = BRAKING_MAX_SPEED_DEFAULT; // PWM máximo de frenado
 
 static int32_t current_yaw_fixed = 0; // Yaw angle in Q16.16 fixed-point (degrees)
 static int32_t gyro_z_scaler;         // Factor de escala dinámico para el giroscopio
@@ -107,6 +111,7 @@ static void Set_Motor_Speeds(int16_t right_speed, int16_t left_speed);
 
 static void Handle_Idle(void);
 static void Handle_Centering(void);
+static void Handle_Braking(void);
 static void Handle_Deciding(void);
 static void Manage_Turn(void);
 static void Update_Yaw(void);
@@ -672,6 +677,59 @@ void DecodeCMD(struct UNERBUSHandle *aBus, uint8_t iStartData)
         UNERBUS_Write(aBus, cruise_buffer, UNERBUS_CRUISE_PARAMS_SIZE);
         length = UNERBUS_CMD_ID_SIZE + UNERBUS_CRUISE_PARAMS_SIZE;
         break;
+    case CMD_SET_BRAKING_PID_GAINS:
+        kp_int = UNERBUS_GetUInt16(aBus);
+        ki_int = UNERBUS_GetUInt16(aBus);
+        kd_int = UNERBUS_GetUInt16(aBus);
+        braking_pid.kp = (int32_t)(((int64_t)kp_int << FIXED_POINT_SHIFT) / 1000);
+        braking_pid.ki = (int32_t)(((int64_t)ki_int << FIXED_POINT_SHIFT) / 1000);
+        braking_pid.kd = (int32_t)(((int64_t)kd_int << FIXED_POINT_SHIFT) / 1000);
+        UNERBUS_WriteByte(aBus, CMD_ACK);
+        length = UNERBUS_CMD_ID_SIZE + UNERBUS_ACK_SIZE;
+        break;
+    case CMD_GET_BRAKING_PID_GAINS:
+        uint8_t braking_pid_buffer[UNERBUS_BRAKING_PID_GAINS_SIZE];
+        kp_int = (uint16_t)(((int64_t)braking_pid.kp * 1000) >> FIXED_POINT_SHIFT);
+        ki_int = (uint16_t)(((int64_t)braking_pid.ki * 1000) >> FIXED_POINT_SHIFT);
+        kd_int = (uint16_t)(((int64_t)braking_pid.kd * 1000) >> FIXED_POINT_SHIFT);
+        braking_pid_buffer[0] = (uint8_t)(kp_int & 0xFF);
+        braking_pid_buffer[1] = (uint8_t)((kp_int >> 8) & 0xFF);
+        braking_pid_buffer[2] = (uint8_t)(ki_int & 0xFF);
+        braking_pid_buffer[3] = (uint8_t)((ki_int >> 8) & 0xFF);
+        braking_pid_buffer[4] = (uint8_t)(kd_int & 0xFF);
+        braking_pid_buffer[5] = (uint8_t)((kd_int >> 8) & 0xFF);
+        UNERBUS_Write(aBus, braking_pid_buffer, UNERBUS_BRAKING_PID_GAINS_SIZE);
+        length = UNERBUS_CMD_ID_SIZE + UNERBUS_BRAKING_PID_GAINS_SIZE;
+        break;
+    case CMD_SET_BRAKING_PARAMS:
+        wall_stop_target_adc = UNERBUS_GetUInt16(aBus);
+        braking_accel_stop_threshold = UNERBUS_GetUInt16(aBus);
+        PID_Set_Setpoint(&braking_pid, wall_stop_target_adc);
+        UNERBUS_WriteByte(aBus, CMD_ACK);
+        length = UNERBUS_CMD_ID_SIZE + UNERBUS_ACK_SIZE;
+        break;
+    case CMD_GET_BRAKING_PARAMS:
+        uint8_t braking_params_buffer[UNERBUS_BRAKING_PARAMS_SIZE];
+        braking_params_buffer[0] = (uint8_t)(wall_stop_target_adc & 0xFF);
+        braking_params_buffer[1] = (uint8_t)((wall_stop_target_adc >> 8) & 0xFF);
+        braking_params_buffer[2] = (uint8_t)(braking_accel_stop_threshold & 0xFF);
+        braking_params_buffer[3] = (uint8_t)((braking_accel_stop_threshold >> 8) & 0xFF);
+        UNERBUS_Write(aBus, braking_params_buffer, UNERBUS_BRAKING_PARAMS_SIZE);
+        length = UNERBUS_CMD_ID_SIZE + UNERBUS_BRAKING_PARAMS_SIZE;
+        break;
+    case CMD_SET_BRAKING_MAX_SPEED:
+        braking_max_speed = UNERBUS_GetUInt16(aBus);
+        PID_Set_Output_Limits(&braking_pid, INT_TO_FIXED(-braking_max_speed), INT_TO_FIXED(braking_max_speed));
+        UNERBUS_WriteByte(aBus, CMD_ACK);
+        length = UNERBUS_CMD_ID_SIZE + UNERBUS_ACK_SIZE;
+        break;
+    case CMD_GET_BRAKING_MAX_SPEED:
+        uint8_t braking_speed_buffer[UNERBUS_BRAKING_MAX_SPEED_SIZE];
+        braking_speed_buffer[0] = (uint8_t)(braking_max_speed & 0xFF);
+        braking_speed_buffer[1] = (uint8_t)((braking_max_speed >> 8) & 0xFF);
+        UNERBUS_Write(aBus, braking_speed_buffer, UNERBUS_BRAKING_MAX_SPEED_SIZE);
+        length = UNERBUS_CMD_ID_SIZE + UNERBUS_BRAKING_MAX_SPEED_SIZE;
+        break;
     default:
         // Comando desconocido, enviar ACK de error
         /*         UNERBUS_WriteByte(aBus, CMD_NACK);
@@ -805,6 +863,9 @@ void Do100ms()
         {
         case STATE_CENTERING:
             robot_state_str = "Centering...";
+            break;
+        case STATE_BRAKING:
+            robot_state_str = "Braking...";
             break;
         case STATE_DECIDING:
             robot_state_str = "Deciding...";
@@ -1036,6 +1097,7 @@ static void ManageButtonEvents(void)
                 // Resetear PIDs y estados al iniciar un modo
                 PID_Reset(&centering_pid);
                 PID_Reset(&turn_pid);
+                PID_Reset(&braking_pid);
                 robot_state = (menu_mode == MENU_MODE_FIND_CELLS) ? STATE_CENTERING : STATE_IDLE;
                 if (robot_state == STATE_CENTERING)
                 {
@@ -1150,11 +1212,23 @@ void App_Core_Init(void)
     wall_threshold_front = WALL_THRESHOLD_FRONT_DEFAULT;
     wall_threshold_side = WALL_THRESHOLD_SIDE_DEFAULT;
     wall_target_adc = WALL_TARGET_ADC_DEFAULT;
+    wall_stop_target_adc = WALL_STOP_TARGET_ADC_DEFAULT;
+    braking_accel_stop_threshold = BRAKING_ACCEL_STOP_THRESHOLD_DEFAULT;
 
     /* --- INICIALIZACIÓN DEL PID DE SEGUIMIENTO DE PARED --- */
     PID_Init(&centering_pid, FLOAT_TO_FIXED(0.8f), FLOAT_TO_FIXED(0.0f), FLOAT_TO_FIXED(0.2f)); // Kp, Ki, Kd
     PID_Set_Setpoint(&centering_pid, 0);                                                        // El setpoint se ajustará dinámicamente
     PID_Set_Output_Limits(&centering_pid, INT_TO_FIXED(-max_pwm_correction), INT_TO_FIXED(max_pwm_correction));
+
+    /* --- INICIALIZACIÓN DEL PID DE FRENADO --- */
+    braking_max_speed = BRAKING_MAX_SPEED_DEFAULT;
+    PID_Init(&braking_pid,
+             FLOAT_TO_FIXED(BRAKING_PID_KP_DEFAULT),
+             FLOAT_TO_FIXED(BRAKING_PID_KI_DEFAULT),
+             FLOAT_TO_FIXED(BRAKING_PID_KD_DEFAULT));
+    PID_Set_Setpoint(&braking_pid, wall_stop_target_adc);
+    // La salida es la velocidad, así que el límite es el PWM máximo.
+    PID_Set_Output_Limits(&braking_pid, INT_TO_FIXED(-braking_max_speed), INT_TO_FIXED(braking_max_speed));
 
     /* --- INICIALIZACIÓN DEL PID DE GIRO --- */
     PID_Init(&turn_pid,
@@ -1219,6 +1293,9 @@ void App_Core_Loop(void)
                 {
                 case STATE_CENTERING:
                     Handle_Centering();
+                    break;
+                case STATE_BRAKING:
+                    Handle_Braking();
                     break;
                 case STATE_DECIDING:
                     Handle_Deciding();
@@ -1324,7 +1401,8 @@ static void Manage_Turn(void)
     {
         Set_Motor_Speeds(0, 0);
         robot_state = STATE_CENTERING;
-        PID_Reset(&centering_pid);         // Reseteamos el PID de centrado para empezar de cero
+        PID_Reset(&centering_pid); // Reseteamos el PID de centrado para empezar de cero
+        PID_Reset(&braking_pid);
         was_wall_following_active = false; // Olvidar el estado anterior al entrar en un nuevo pasillo
         kick_start_active = true;
         motion_confirm_counter = 0;
@@ -1473,8 +1551,9 @@ static void Handle_Centering(void)
     // 2. Comprobar si hay una pared frontal para pasar a decidir
     if (front_left_val > wall_threshold_front || front_right_val > wall_threshold_front)
     {
-        robot_state = STATE_DECIDING;
-        Set_Motor_Speeds(0, 0);    // Detenerse antes de decidir
+        robot_state = STATE_BRAKING;
+        PID_Reset(&braking_pid);   // Resetear el PID de freno al iniciar
+        Set_Motor_Speeds(0, 0);    // Detener motores en la transición
         kick_start_active = false; // Cancelar kick-start si vemos una pared
         return;
     }
@@ -1579,6 +1658,42 @@ static void Handle_Centering(void)
 
     // 6. Limitar velocidades y aplicar
     Set_Motor_Speeds(right_motor_speed, left_motor_speed);
+}
+
+static void Handle_Braking(void)
+{
+    // 1. Leer y promediar los sensores frontales para mayor estabilidad
+    int32_t front_left_val = Get_Filtered_ADC_Value(SENSOR_FRONT_LEFT_CH);
+    int32_t front_right_val = Get_Filtered_ADC_Value(SENSOR_FRONT_RIGHT_CH);
+    int32_t front_avg_val = (front_left_val + front_right_val) / 2;
+
+    // 2. Calcular el error respecto a la distancia de parada objetivo
+    int32_t error = wall_stop_target_adc - front_avg_val;
+
+    // 3. Comprobar si el frenado ha terminado
+    int16_t ax;
+    MPU6050_GetCalibratedData(&hmpu, &ax, NULL, NULL, NULL, NULL, NULL);
+
+    // Condición de parada: error de distancia bajo Y aceleración casi nula
+    if (abs(error) < BRAKING_COMPLETION_DEAD_ZONE && abs(ax) < braking_accel_stop_threshold)
+    {
+        Set_Motor_Speeds(0, 0);
+        robot_state = STATE_DECIDING; // Transición a la toma de decisiones
+        return;
+    }
+
+    // 4. Calcular la salida del PID. La entrada es el valor promedio del sensor.
+    // El setpoint se configura en la inicialización del PID.
+    int32_t pid_output_fixed = PID_Update(&braking_pid, front_avg_val, 10); // dt = 10ms
+
+    // 5. Convertir la salida del PID a velocidad del motor.
+    // La salida del PID será la velocidad. Si el error es grande (lejos), la velocidad será alta.
+    // Si el error es pequeño (cerca), la velocidad será baja.
+    // Si el error es negativo (se pasó), la velocidad será negativa (reversa).
+    int16_t motor_speed = (int16_t)FIXED_TO_INT(pid_output_fixed);
+
+    // 6. Aplicar la misma velocidad a ambos motores para frenar en línea recta.
+    Set_Motor_Speeds(motor_speed, motor_speed);
 }
 
 static void Handle_Deciding(void)
