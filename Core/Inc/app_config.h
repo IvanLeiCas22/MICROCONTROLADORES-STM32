@@ -46,6 +46,7 @@ typedef enum
     MENU_MODE_IDLE,
     MENU_MODE_FIND_CELLS,
     MENU_MODE_GO_TO_B,
+    MENU_MODE_MANUAL_CONTROL,
     MENU_MODE_COUNT // Mantener este último para ciclar fácilmente
 } MenuModeTypeDef;
 
@@ -238,19 +239,21 @@ extern uint16_t pwm_max_value;
 #define HEARTBEAT_BTN_LONG_PRESS 0xFFFFFFFF  // Sólido ON
 
 // Modos de Menú (en APP_STATE_MENU)
-#define HEARTBEAT_MENU_IDLE 0x88880000       // Doble blink lento
-#define HEARTBEAT_MENU_FIND_CELLS 0xCCCCCCCC // Triple blink rápido
-#define HEARTBEAT_MENU_GO_TO_B 0xF0F00000    // Blink alternado
+#define HEARTBEAT_MENU_IDLE 0x88880000           // Doble blink lento
+#define HEARTBEAT_MENU_FIND_CELLS 0xCCCCCCCC     // Triple blink rápido
+#define HEARTBEAT_MENU_GO_TO_B 0xF0F00000        // Blink alternado
+#define HEARTBEAT_MENU_MANUAL_CONTROL 0xAAAA0000 // Blink corto y rápido
 
 // Modos en Ejecución (en APP_STATE_RUNNING)
-#define HEARTBEAT_RUNNING_IDLE 0x80808080       // Blink regular lento
-#define HEARTBEAT_RUNNING_FIND_CELLS 0xFEFE0000 // Blink "corriendo" rápido
-#define HEARTBEAT_RUNNING_GO_TO_B 0xFAFA0000    // Blink "corriendo" diferente
+#define HEARTBEAT_RUNNING_IDLE 0x80808080           // Blink regular lento
+#define HEARTBEAT_RUNNING_FIND_CELLS 0xFEFE0000     // Blink "corriendo" rápido
+#define HEARTBEAT_RUNNING_GO_TO_B 0xFAFA0000        // Blink "corriendo" diferente
+#define HEARTBEAT_RUNNING_MANUAL_CONTROL 0xF0F0F0F0 // <--- AÑADIR ESTA LÍNEA (Blink constante y rápido)
 
 /* Wifi Settings */
-#define WIFI_SSID "InternetPlus_403ea8"
-#define WIFI_PASSWORD "Fenofinalform01"
-#define WIFI_UDP_REMOTE_IP "192.168.1.100"
+#define WIFI_SSID "InternetPlus_8e2fbb"
+#define WIFI_PASSWORD "Akhantos2340"
+#define WIFI_UDP_REMOTE_IP "192.168.1.3"
 #define WIFI_UDP_REMOTE_PORT 30010
 #define WIFI_UDP_LOCAL_PORT 30000
 
@@ -265,20 +268,24 @@ extern uint16_t pwm_max_value;
 #define TURN_PID_KP_DEFAULT 80.0f   // Ganancia Proporcional inicial
 #define TURN_PID_KI_DEFAULT 0.0f    // Ganancia Integral (iniciamos en 0)
 #define TURN_PID_KD_DEFAULT 150.0f  // Ganancia Derivativa inicial (NOTA: estos valores probablemente necesiten reajuste)
-#define TURN_PID_MAX_EFFORT 1000    // Esfuerzo máximo de giro (rango de -1000 a 1000)
 #define TURN_COMPLETION_DEAD_ZONE 1 // Zona muerta en grados para considerar el giro completo
 #define TURN_MAX_SPEED_DEFAULT 6500 // Velocidad máxima de giro en PWM
 #define TURN_MIN_SPEED_DEFAULT 2600 // Velocidad mínima de giro para vencer la inercia
 
 /* --- Sensores --- */
 #define SENSOR_RIGHT_LAT_CH 0
+#define SENSOR_DIAGONAL_RIGHT_CH 1
 #define SENSOR_FRONT_RIGHT_CH 2
+#define SENSOR_FLOOR_FRONT_CH 3
 #define SENSOR_FRONT_LEFT_CH 4
+#define SENSOR_DIAGONAL_LEFT_CH 5
 #define SENSOR_LEFT_LAT_CH 6
-#define WALL_THRESHOLD_FRONT_DEFAULT 200  // Umbral ADC para detectar pared frontal
-#define WALL_THRESHOLD_SIDE_DEFAULT 1000  // Umbral ADC para detectar pared lateral
-#define WALL_TARGET_ADC_DEFAULT 2000      // Valor ADC objetivo al seguir una sola pared
-#define WALL_STOP_TARGET_ADC_DEFAULT 1000 // Distancia de parada objetivo
+#define SENSOR_FLOOR_REAR_CH 7
+
+#define WALL_PRESENCE_THRESHOLD_MM_FRONT 70 // Distancia (mm) para detectar una pared en frente.
+#define WALL_PRESENCE_THRESHOLD_MM_SIDE 100 // Distancia (mm) para detectar una pared lateral.
+#define WALL_FOLLOW_TARGET_MM 50            // Distancia (mm) objetivo para el seguimiento de pared.
+#define WALL_BRAKING_TARGET_MM 20           // Distancia (mm) objetivo para terminar el frenado.
 
 /* --- Cruise Control --- */
 #define MOTOR_CRUISE_SPEED_DEFAULT 2600      // Velocidad PWM para navegación en rectas
@@ -289,7 +296,7 @@ extern uint16_t pwm_max_value;
 #define BRAKING_PID_KP_DEFAULT 10.0f
 #define BRAKING_PID_KI_DEFAULT 0.1f
 #define BRAKING_PID_KD_DEFAULT 5.0f
-#define BRAKING_DEAD_ZONE_DEFAULT 50             // Tolerancia en ADC para considerar la parada
+#define BRAKING_DEAD_ZONE_DEFAULT 5              // Tolerancia en ADC para considerar la parada
 #define BRAKING_ACCEL_STOP_THRESHOLD_DEFAULT 400 // Umbral de acelerómetro para confirmar detención
 #define BRAKING_MAX_SPEED_DEFAULT 4000           // Velocidad máxima de frenado en PWM
 #define BRAKING_MIN_SPEED_DEFAULT 2200           // Velocidad mínima de frenado para vencer inercia

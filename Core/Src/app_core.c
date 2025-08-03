@@ -26,8 +26,25 @@ extern DMA_HandleTypeDef hdma_i2c2_rx;
 extern DMA_HandleTypeDef hdma_i2c2_tx;
 
 //==============================================================================
+// Typedefs y Estructuras
+//==============================================================================
+
+// Tabla de consulta (LUT) para linealización de sensores IR
+typedef struct
+{
+    uint16_t adc;
+    uint16_t dist_mm;
+} SensorLutEntry;
+
+static const SensorLutEntry sensor_lut[] = {
+    {30, 150}, {65, 140}, {106, 130}, {135, 120}, {169, 110}, {208, 100}, {260, 90}, {337, 80}, {441, 70}, {511, 65}, {590, 60}, {711, 55}, {827, 50}, {1020, 45}, {1305, 40}, {1613, 35}, {2130, 30}, {2870, 25}, {3760, 20}};
+
+//==============================================================================
 // VARIABLES GLOBALES DEL MÓDULO
 //==============================================================================
+
+static const uint8_t sensor_lut_size = sizeof(sensor_lut) / sizeof(sensor_lut[0]);
+
 SystemFlagTypeDef flags0;
 uint16_t pwm_max_value = 6500; // Valor máximo del PWM
 
@@ -61,17 +78,17 @@ static uint8_t temporary_heartbeat_ticks = 0;
 PID_Controller_t centering_pid;
 PID_Controller_t turn_pid;
 PID_Controller_t braking_pid;
-uint16_t right_motor_base_speed = 3500; // Velocidad base motor derecho
-uint16_t left_motor_base_speed = 3500;  // Velocidad base motor izquierdo
-uint16_t wall_threshold_front;          // Umbral ADC para detectar pared frontal
-uint16_t wall_threshold_side;           // Umbral ADC para detectar pared lateral
-uint16_t wall_target_adc;               // Valor ADC objetivo al seguir solo una pared
-uint16_t wall_stop_target_adc;          // Distancia de parada objetivo
+uint16_t right_motor_base_speed = 3575; // Velocidad base motor derecho
+uint16_t left_motor_base_speed = 4550;  // Velocidad base motor izquierdo
+uint16_t wall_threshold_mm_front;       // Umbral en mm para detectar pared frontal
+uint16_t wall_threshold_mm_side;        // Umbral en mm para detectar pared lateral
+uint16_t wall_target_mm;                // Distancia objetivo en mm para seguimiento de pared
+uint16_t wall_braking_target_mm;        // Distancia de parada objetivo
 uint16_t braking_accel_stop_threshold;  // Umbral de aceleración para confirmar detención
 uint16_t max_pwm_correction = 4000;     // Corrección máxima del PID
-uint16_t turn_max_speed = TURN_MAX_SPEED_DEFAULT;
+uint16_t turn_max_pwm = TURN_MAX_SPEED_DEFAULT;
 uint16_t turn_min_speed = TURN_MIN_SPEED_DEFAULT;
-uint16_t braking_max_speed = BRAKING_MAX_SPEED_DEFAULT; // PWM máximo de frenado
+uint16_t braking_max_pwm_offset = BRAKING_MAX_SPEED_DEFAULT; // PWM máximo de frenado
 uint16_t braking_min_speed = BRAKING_MIN_SPEED_DEFAULT;
 uint16_t braking_dead_zone = BRAKING_DEAD_ZONE_DEFAULT;
 
@@ -79,7 +96,6 @@ static int32_t current_yaw_fixed = 0; // Yaw angle in Q16.16 fixed-point (degree
 static int32_t gyro_z_scaler;         // Factor de escala dinámico para el giroscopio
 
 static volatile RobotStateTypeDef robot_state = STATE_IDLE;
-static bool was_wall_following_active = false;
 uint16_t motor_cruise_speed;
 uint16_t accel_motion_threshold;
 uint8_t accel_motion_confirm_ticks;
@@ -121,6 +137,7 @@ void Turn_Start(int16_t angle_degrees);
 static int32_t Get_Filtered_ADC_Value(uint8_t channel);
 static void Set_Robot_State(RobotStateTypeDef new_state);
 static void Update_Display_Content(void);
+static int32_t ADC_To_Distance_mm(uint16_t adc_value);
 
 //==============================================================================
 // IMPLEMENTACIÓN DE WRAPPERS DE CALLBACKS HAL
@@ -265,10 +282,11 @@ void DecodeCMD(struct UNERBUSHandle *aBus, uint8_t iStartData)
         {
             // Llamar a la función de filtrado para el canal actual
             uint16_t filtered_value = (uint16_t)Get_Filtered_ADC_Value(i);
+            uint16_t distance_value = ADC_To_Distance_mm(filtered_value);
 
             // Convertir el valor uint16_t a bytes (Little Endian)
-            adc_buffer[idx++] = (uint8_t)(filtered_value & 0xFF);        // Byte bajo
-            adc_buffer[idx++] = (uint8_t)((filtered_value >> 8) & 0xFF); // Byte alto
+            adc_buffer[idx++] = (uint8_t)(distance_value & 0xFF);        // Byte bajo
+            adc_buffer[idx++] = (uint8_t)((distance_value >> 8) & 0xFF); // Byte alto
         }
 
         UNERBUS_Write(aBus, adc_buffer, ADC_DATA_BYTES);
@@ -427,17 +445,16 @@ void DecodeCMD(struct UNERBUSHandle *aBus, uint8_t iStartData)
         length = UNERBUS_CMD_ID_SIZE + UNERBUS_MPU_CONFIG_SIZE;
         break;
     case CMD_SET_PID_GAINS: // Configurar Kp, Ki, Kd
-        // Se esperan 3 valores uint16_t: Kp*1000, Ki*1000, Kd*1000
+        // Se esperan 3 valores uint16_t: Kp*100, Ki*100, Kd*100
         kp_int = UNERBUS_GetUInt16(aBus);
         ki_int = UNERBUS_GetUInt16(aBus);
         kd_int = UNERBUS_GetUInt16(aBus);
 
-        // Convertir de entero a punto fijo (dividiendo por 1000.0)
-        // Para evitar floats, hacemos la división en punto fijo:
-        // value_fixed = (value_int * 2^16) / 1000
-        centering_pid.kp = (int32_t)(((int64_t)kp_int << FIXED_POINT_SHIFT) / 1000);
-        centering_pid.ki = (int32_t)(((int64_t)ki_int << FIXED_POINT_SHIFT) / 1000);
-        centering_pid.kd = (int32_t)(((int64_t)kd_int << FIXED_POINT_SHIFT) / 1000);
+        // Convertir de entero a punto fijo (dividiendo por 100.0)
+        // Se usa 100 para ampliar el rango de Kp hasta ~655
+        centering_pid.kp = (int32_t)(((int64_t)kp_int << FIXED_POINT_SHIFT) / 100);
+        centering_pid.ki = (int32_t)(((int64_t)ki_int << FIXED_POINT_SHIFT) / 100);
+        centering_pid.kd = (int32_t)(((int64_t)kd_int << FIXED_POINT_SHIFT) / 100);
 
         // Enviar confirmación (ACK)
         UNERBUS_WriteByte(aBus, CMD_ACK);
@@ -446,10 +463,10 @@ void DecodeCMD(struct UNERBUSHandle *aBus, uint8_t iStartData)
     case CMD_GET_PID_GAINS: // Leer Kp, Ki, Kd
         uint8_t response_buffer[UNERBUS_PID_GAINS_SIZE];
 
-        // Convertir de punto fijo a entero para enviar
-        kp_int = (uint16_t)(((int64_t)centering_pid.kp * 1000) >> FIXED_POINT_SHIFT);
-        ki_int = (uint16_t)(((int64_t)centering_pid.ki * 1000) >> FIXED_POINT_SHIFT);
-        kd_int = (uint16_t)(((int64_t)centering_pid.kd * 1000) >> FIXED_POINT_SHIFT);
+        // Convertir de punto fijo a entero para enviar (multiplicando por 100)
+        kp_int = (uint16_t)(((int64_t)centering_pid.kp * 100) >> FIXED_POINT_SHIFT);
+        ki_int = (uint16_t)(((int64_t)centering_pid.ki * 100) >> FIXED_POINT_SHIFT);
+        kd_int = (uint16_t)(((int64_t)centering_pid.kd * 100) >> FIXED_POINT_SHIFT);
 
         response_buffer[0] = (uint8_t)(kp_int & 0xFF);
         response_buffer[1] = (uint8_t)((kp_int >> 8) & 0xFF);
@@ -553,23 +570,24 @@ void DecodeCMD(struct UNERBUSHandle *aBus, uint8_t iStartData)
         length = UNERBUS_CMD_ID_SIZE + UNERBUS_TURN_PID_GAINS_SIZE;
         break;
     case CMD_SET_TURN_MAX_SPEED:
-        turn_max_speed = UNERBUS_GetUInt16(aBus);
-        if (turn_max_speed > pwm_max_value)
-            turn_max_speed = pwm_max_value; // Limitar al máximo global
+        turn_max_pwm = UNERBUS_GetUInt16(aBus);
+        if (turn_max_pwm > pwm_max_value)
+            turn_max_pwm = pwm_max_value; // Limitar al máximo global
+        PID_Set_Output_Limits(&centering_pid, INT_TO_FIXED(-turn_max_pwm), INT_TO_FIXED(turn_max_pwm));
         UNERBUS_WriteByte(aBus, CMD_ACK);
         length = UNERBUS_CMD_ID_SIZE + UNERBUS_ACK_SIZE;
         break;
     case CMD_GET_TURN_MAX_SPEED:
         uint8_t speed_buffer[UNERBUS_TURN_MAX_SPEED_SIZE];
-        speed_buffer[0] = (uint8_t)(turn_max_speed & 0xFF);
-        speed_buffer[1] = (uint8_t)((turn_max_speed >> 8) & 0xFF);
+        speed_buffer[0] = (uint8_t)(turn_max_pwm & 0xFF);
+        speed_buffer[1] = (uint8_t)((turn_max_pwm >> 8) & 0xFF);
         UNERBUS_Write(aBus, speed_buffer, UNERBUS_TURN_MAX_SPEED_SIZE);
         length = UNERBUS_CMD_ID_SIZE + UNERBUS_TURN_MAX_SPEED_SIZE;
         break;
     case CMD_SET_TURN_MIN_SPEED:
         turn_min_speed = UNERBUS_GetUInt16(aBus);
-        if (turn_min_speed > turn_max_speed)
-            turn_min_speed = turn_max_speed; // No puede ser mayor que la máxima
+        if (turn_min_speed > turn_max_pwm)
+            turn_min_speed = turn_max_pwm; // No puede ser mayor que la máxima
         UNERBUS_WriteByte(aBus, CMD_ACK);
         length = UNERBUS_CMD_ID_SIZE + UNERBUS_ACK_SIZE;
         break;
@@ -581,29 +599,29 @@ void DecodeCMD(struct UNERBUSHandle *aBus, uint8_t iStartData)
         length = UNERBUS_CMD_ID_SIZE + UNERBUS_TURN_MIN_SPEED_SIZE;
         break;
     case CMD_SET_WALL_THRESHOLDS:
-        wall_threshold_front = UNERBUS_GetUInt16(aBus);
-        wall_threshold_side = UNERBUS_GetUInt16(aBus);
+        wall_threshold_mm_front = UNERBUS_GetUInt16(aBus);
+        wall_threshold_mm_side = UNERBUS_GetUInt16(aBus);
         UNERBUS_WriteByte(aBus, CMD_ACK);
         length = UNERBUS_CMD_ID_SIZE + UNERBUS_ACK_SIZE;
         break;
     case CMD_GET_WALL_THRESHOLDS:
         uint8_t thresholds_buffer[UNERBUS_WALL_THRESHOLDS_SIZE];
-        thresholds_buffer[0] = (uint8_t)(wall_threshold_front & 0xFF);
-        thresholds_buffer[1] = (uint8_t)((wall_threshold_front >> 8) & 0xFF);
-        thresholds_buffer[2] = (uint8_t)(wall_threshold_side & 0xFF);
-        thresholds_buffer[3] = (uint8_t)((wall_threshold_side >> 8) & 0xFF);
+        thresholds_buffer[0] = (uint8_t)(wall_threshold_mm_front & 0xFF);
+        thresholds_buffer[1] = (uint8_t)((wall_threshold_mm_front >> 8) & 0xFF);
+        thresholds_buffer[2] = (uint8_t)(wall_threshold_mm_side & 0xFF);
+        thresholds_buffer[3] = (uint8_t)((wall_threshold_mm_side >> 8) & 0xFF);
         UNERBUS_Write(aBus, thresholds_buffer, UNERBUS_WALL_THRESHOLDS_SIZE);
         length = UNERBUS_CMD_ID_SIZE + UNERBUS_WALL_THRESHOLDS_SIZE;
         break;
     case CMD_SET_WALL_TARGET_ADC:
-        wall_target_adc = UNERBUS_GetUInt16(aBus);
+        wall_target_mm = UNERBUS_GetUInt16(aBus);
         UNERBUS_WriteByte(aBus, CMD_ACK);
         length = UNERBUS_CMD_ID_SIZE + UNERBUS_ACK_SIZE;
         break;
     case CMD_GET_WALL_TARGET_ADC:
         uint8_t target_buffer[UNERBUS_WALL_TARGET_ADC_SIZE];
-        target_buffer[0] = (uint8_t)(wall_target_adc & 0xFF);
-        target_buffer[1] = (uint8_t)((wall_target_adc >> 8) & 0xFF);
+        target_buffer[0] = (uint8_t)(wall_target_mm & 0xFF);
+        target_buffer[1] = (uint8_t)((wall_target_mm >> 8) & 0xFF);
         UNERBUS_Write(aBus, target_buffer, UNERBUS_WALL_TARGET_ADC_SIZE);
         length = UNERBUS_CMD_ID_SIZE + UNERBUS_WALL_TARGET_ADC_SIZE;
         break;
@@ -687,17 +705,19 @@ void DecodeCMD(struct UNERBUSHandle *aBus, uint8_t iStartData)
         kp_int = UNERBUS_GetUInt16(aBus);
         ki_int = UNERBUS_GetUInt16(aBus);
         kd_int = UNERBUS_GetUInt16(aBus);
-        braking_pid.kp = (int32_t)(((int64_t)kp_int << FIXED_POINT_SHIFT) / 1000);
-        braking_pid.ki = (int32_t)(((int64_t)ki_int << FIXED_POINT_SHIFT) / 1000);
-        braking_pid.kd = (int32_t)(((int64_t)kd_int << FIXED_POINT_SHIFT) / 1000);
+        // Se usa 100 para ampliar el rango de Kp hasta ~655
+        braking_pid.kp = (int32_t)(((int64_t)kp_int << FIXED_POINT_SHIFT) / 100);
+        braking_pid.ki = (int32_t)(((int64_t)ki_int << FIXED_POINT_SHIFT) / 100);
+        braking_pid.kd = (int32_t)(((int64_t)kd_int << FIXED_POINT_SHIFT) / 100);
         UNERBUS_WriteByte(aBus, CMD_ACK);
         length = UNERBUS_CMD_ID_SIZE + UNERBUS_ACK_SIZE;
         break;
     case CMD_GET_BRAKING_PID_GAINS:
         uint8_t braking_pid_buffer[UNERBUS_BRAKING_PID_GAINS_SIZE];
-        kp_int = (uint16_t)(((int64_t)braking_pid.kp * 1000) >> FIXED_POINT_SHIFT);
-        ki_int = (uint16_t)(((int64_t)braking_pid.ki * 1000) >> FIXED_POINT_SHIFT);
-        kd_int = (uint16_t)(((int64_t)braking_pid.kd * 1000) >> FIXED_POINT_SHIFT);
+        // Se multiplica por 100 para coincidir con el SET
+        kp_int = (uint16_t)(((int64_t)braking_pid.kp * 100) >> FIXED_POINT_SHIFT);
+        ki_int = (uint16_t)(((int64_t)braking_pid.ki * 100) >> FIXED_POINT_SHIFT);
+        kd_int = (uint16_t)(((int64_t)braking_pid.kd * 100) >> FIXED_POINT_SHIFT);
         braking_pid_buffer[0] = (uint8_t)(kp_int & 0xFF);
         braking_pid_buffer[1] = (uint8_t)((kp_int >> 8) & 0xFF);
         braking_pid_buffer[2] = (uint8_t)(ki_int & 0xFF);
@@ -708,31 +728,31 @@ void DecodeCMD(struct UNERBUSHandle *aBus, uint8_t iStartData)
         length = UNERBUS_CMD_ID_SIZE + UNERBUS_BRAKING_PID_GAINS_SIZE;
         break;
     case CMD_SET_BRAKING_PARAMS:
-        wall_stop_target_adc = UNERBUS_GetUInt16(aBus);
+        wall_braking_target_mm = UNERBUS_GetUInt16(aBus);
         braking_accel_stop_threshold = UNERBUS_GetUInt16(aBus);
-        PID_Set_Setpoint(&braking_pid, wall_stop_target_adc);
+        PID_Set_Setpoint(&braking_pid, wall_braking_target_mm);
         UNERBUS_WriteByte(aBus, CMD_ACK);
         length = UNERBUS_CMD_ID_SIZE + UNERBUS_ACK_SIZE;
         break;
     case CMD_GET_BRAKING_PARAMS:
         uint8_t braking_params_buffer[UNERBUS_BRAKING_PARAMS_SIZE];
-        braking_params_buffer[0] = (uint8_t)(wall_stop_target_adc & 0xFF);
-        braking_params_buffer[1] = (uint8_t)((wall_stop_target_adc >> 8) & 0xFF);
+        braking_params_buffer[0] = (uint8_t)(wall_braking_target_mm & 0xFF);
+        braking_params_buffer[1] = (uint8_t)((wall_braking_target_mm >> 8) & 0xFF);
         braking_params_buffer[2] = (uint8_t)(braking_accel_stop_threshold & 0xFF);
         braking_params_buffer[3] = (uint8_t)((braking_accel_stop_threshold >> 8) & 0xFF);
         UNERBUS_Write(aBus, braking_params_buffer, UNERBUS_BRAKING_PARAMS_SIZE);
         length = UNERBUS_CMD_ID_SIZE + UNERBUS_BRAKING_PARAMS_SIZE;
         break;
     case CMD_SET_BRAKING_MAX_SPEED:
-        braking_max_speed = UNERBUS_GetUInt16(aBus);
-        PID_Set_Output_Limits(&braking_pid, INT_TO_FIXED(-braking_max_speed), INT_TO_FIXED(braking_max_speed));
+        braking_max_pwm_offset = UNERBUS_GetUInt16(aBus);
+        PID_Set_Output_Limits(&braking_pid, INT_TO_FIXED(-braking_max_pwm_offset), INT_TO_FIXED(braking_max_pwm_offset));
         UNERBUS_WriteByte(aBus, CMD_ACK);
         length = UNERBUS_CMD_ID_SIZE + UNERBUS_ACK_SIZE;
         break;
     case CMD_GET_BRAKING_MAX_SPEED:
         uint8_t braking_speed_buffer[UNERBUS_BRAKING_MAX_SPEED_SIZE];
-        braking_speed_buffer[0] = (uint8_t)(braking_max_speed & 0xFF);
-        braking_speed_buffer[1] = (uint8_t)((braking_max_speed >> 8) & 0xFF);
+        braking_speed_buffer[0] = (uint8_t)(braking_max_pwm_offset & 0xFF);
+        braking_speed_buffer[1] = (uint8_t)((braking_max_pwm_offset >> 8) & 0xFF);
         UNERBUS_Write(aBus, braking_speed_buffer, UNERBUS_BRAKING_MAX_SPEED_SIZE);
         length = UNERBUS_CMD_ID_SIZE + UNERBUS_BRAKING_MAX_SPEED_SIZE;
         break;
@@ -794,6 +814,13 @@ void Do100ms()
 {
     time_100ms = TIME_100MS_PEDIOD_COUNT;
 
+    if (menu_mode == MENU_MODE_MANUAL_CONTROL)
+    {
+        char aux[16];
+        snprintf(aux, sizeof(aux), "Yaw %li", current_yaw_fixed);
+        SSD1306_DrawText(&hssd, 0, 0, aux, SSD1306_TEXT_ALIGN_LEFT);
+    }
+
     // --- Lógica de Heartbeat Dinámico ---
     if (temporary_heartbeat_ticks > 0)
     {
@@ -815,6 +842,9 @@ void Do100ms()
             case MENU_MODE_GO_TO_B:
                 heartbeat_counter = HEARTBEAT_MENU_GO_TO_B;
                 break;
+            case MENU_MODE_MANUAL_CONTROL:
+                heartbeat_counter = HEARTBEAT_MENU_MANUAL_CONTROL;
+                break;
             default:
                 heartbeat_counter = HEARTBEAT_IDLE;
                 break;
@@ -832,6 +862,9 @@ void Do100ms()
                 break;
             case MENU_MODE_GO_TO_B:
                 heartbeat_counter = HEARTBEAT_RUNNING_GO_TO_B;
+                break;
+            case MENU_MODE_MANUAL_CONTROL:
+                heartbeat_counter = HEARTBEAT_RUNNING_MANUAL_CONTROL;
                 break;
             default:
                 heartbeat_counter = HEARTBEAT_IDLE;
@@ -1182,10 +1215,10 @@ void App_Core_Init(void)
     accel_motion_confirm_ticks = ACCEL_MOTION_CONFIRM_TICKS_DEFAULT;
 
     /* --- INICIALIZACIÓN DE PARÁMETROS DE NAVEGACIÓN --- */
-    wall_threshold_front = WALL_THRESHOLD_FRONT_DEFAULT;
-    wall_threshold_side = WALL_THRESHOLD_SIDE_DEFAULT;
-    wall_target_adc = WALL_TARGET_ADC_DEFAULT;
-    wall_stop_target_adc = WALL_STOP_TARGET_ADC_DEFAULT;
+    wall_threshold_mm_front = WALL_PRESENCE_THRESHOLD_MM_FRONT;
+    wall_threshold_mm_side = WALL_PRESENCE_THRESHOLD_MM_SIDE;
+    wall_target_mm = WALL_FOLLOW_TARGET_MM;
+    wall_braking_target_mm = WALL_BRAKING_TARGET_MM;
     braking_accel_stop_threshold = BRAKING_ACCEL_STOP_THRESHOLD_DEFAULT;
 
     /* --- INICIALIZACIÓN DEL PID DE SEGUIMIENTO DE PARED --- */
@@ -1194,21 +1227,21 @@ void App_Core_Init(void)
     PID_Set_Output_Limits(&centering_pid, INT_TO_FIXED(-max_pwm_correction), INT_TO_FIXED(max_pwm_correction));
 
     /* --- INICIALIZACIÓN DEL PID DE FRENADO --- */
-    braking_max_speed = BRAKING_MAX_SPEED_DEFAULT;
+    braking_max_pwm_offset = BRAKING_MAX_SPEED_DEFAULT;
     PID_Init(&braking_pid,
              FLOAT_TO_FIXED(BRAKING_PID_KP_DEFAULT),
              FLOAT_TO_FIXED(BRAKING_PID_KI_DEFAULT),
              FLOAT_TO_FIXED(BRAKING_PID_KD_DEFAULT));
-    PID_Set_Setpoint(&braking_pid, wall_stop_target_adc);
+    PID_Set_Setpoint(&braking_pid, wall_braking_target_mm);
     // La salida es la velocidad, así que el límite es el PWM máximo.
-    PID_Set_Output_Limits(&braking_pid, INT_TO_FIXED(-braking_max_speed), INT_TO_FIXED(braking_max_speed));
+    PID_Set_Output_Limits(&braking_pid, INT_TO_FIXED(-braking_max_pwm_offset), INT_TO_FIXED(braking_max_pwm_offset));
 
     /* --- INICIALIZACIÓN DEL PID DE GIRO --- */
     PID_Init(&turn_pid,
              FLOAT_TO_FIXED(TURN_PID_KP_DEFAULT),
              FLOAT_TO_FIXED(TURN_PID_KI_DEFAULT),
              FLOAT_TO_FIXED(TURN_PID_KD_DEFAULT));
-    PID_Set_Output_Limits(&turn_pid, INT_TO_FIXED(-TURN_PID_MAX_EFFORT), INT_TO_FIXED(TURN_PID_MAX_EFFORT));
+    PID_Set_Output_Limits(&turn_pid, INT_TO_FIXED(-turn_max_pwm), INT_TO_FIXED(turn_max_pwm));
 
     srand(1); // Inicializa la semilla para rand()
 
@@ -1283,7 +1316,23 @@ void App_Core_Loop(void)
                     break;
                 }
                 break;
-
+            case MENU_MODE_MANUAL_CONTROL:
+                // En modo manual, solo gestionamos los giros.
+                // El control de motores se hace directamente por comandos.
+                switch (robot_state)
+                {
+                case STATE_TURNING_LEFT:
+                case STATE_TURNING_RIGHT:
+                case STATE_TURN_AROUND:
+                    Manage_Turn();
+                    break;
+                case STATE_IDLE:
+                default:
+                    // No hacer nada, permite que los comandos externos
+                    // controlen los motores sin que Handle_Idle() los detenga.
+                    break;
+                }
+                break;
             case MENU_MODE_IDLE:
             case MENU_MODE_GO_TO_B:
             default:
@@ -1319,7 +1368,10 @@ static void Update_Yaw(void)
 
     // Integrar para obtener el ángulo en punto fijo (Q16.16)
     // El escalador convierte el valor raw del giroscopio a un cambio de ángulo en grados (formato Q16.16) para un dt de 10ms.
-    current_yaw_fixed -= (int32_t)gz * gyro_z_scaler;
+    if (abs(gz) > 500)
+    {
+        current_yaw_fixed -= (int32_t)gz * gyro_z_scaler;
+    }
 }
 
 /**
@@ -1328,7 +1380,8 @@ static void Update_Yaw(void)
  */
 void Turn_Start(int16_t angle_degrees)
 {
-    if (robot_state == STATE_CENTERING || robot_state == STATE_DECIDING)
+    if ((robot_state == STATE_CENTERING || robot_state == STATE_DECIDING) ||
+        (robot_state == STATE_IDLE && menu_mode == MENU_MODE_MANUAL_CONTROL))
     {
         PID_Reset(&turn_pid);
 
@@ -1355,7 +1408,7 @@ void Turn_Start(int16_t angle_degrees)
 
 /**
  * @brief Gestiona el estado de giro del robot usando un controlador PID.
- *        Debe ser llamada periódicamente mientras se está girando.
+ *        Utiliza una potencia de giro independiente y compensación mecánica.
  */
 static void Manage_Turn(void)
 {
@@ -1365,7 +1418,6 @@ static void Manage_Turn(void)
     }
 
     int32_t current_yaw_degrees = FIXED_TO_INT(current_yaw_fixed);
-    // Obtenemos el objetivo directamente del setpoint del PID
     int32_t target_yaw_degrees = FIXED_TO_INT(turn_pid.setpoint);
     int32_t error_degrees = target_yaw_degrees - current_yaw_degrees;
 
@@ -1373,36 +1425,75 @@ static void Manage_Turn(void)
     if (abs(error_degrees) <= TURN_COMPLETION_DEAD_ZONE)
     {
         Set_Motor_Speeds(0, 0);
-        Set_Robot_State(STATE_CENTERING);
-        PID_Reset(&centering_pid); // Reseteamos el PID de centrado para empezar de cero
-        PID_Reset(&braking_pid);
-        was_wall_following_active = false; // Olvidar el estado anterior al entrar en un nuevo pasillo
-        kick_start_active = true;
-        motion_confirm_counter = 0;
+        if (menu_mode == MENU_MODE_MANUAL_CONTROL)
+        {
+            Set_Robot_State(STATE_IDLE);
+        }
+        else
+        {
+            Set_Robot_State(STATE_CENTERING);
+            PID_Reset(&centering_pid);
+            PID_Reset(&braking_pid);
+            kick_start_active = true;
+            motion_confirm_counter = 0;
+        }
         return;
     }
 
-    // 1. Calcular la salida del PID. Ahora usará el setpoint correcto internamente.
+    // 1. Calcular la salida del PID. Está limitada por `turn_max_pwm`.
     int32_t pid_output_fixed = PID_Update(&turn_pid, current_yaw_degrees, 10);
+    int16_t correction_pwm = (int16_t)FIXED_TO_INT(pid_output_fixed);
 
-    // 2. Convertir la salida del PID a un "esfuerzo de giro" entero.
-    int16_t turn_effort = (int16_t)FIXED_TO_INT(pid_output_fixed);
-
-    // 3. Escalar el esfuerzo a los PWM de cada motor.
-    int16_t motor_speed = ((int32_t)turn_effort * turn_max_speed) / TURN_PID_MAX_EFFORT;
-
-    // 4. Lógica de potencia mínima para vencer la inercia.
-    if (motor_speed > 0 && motor_speed < turn_min_speed)
+    // 2. Calcular un ratio de giro de [-1.0, 1.0]
+    int32_t turn_ratio_fixed = 0;
+    if (turn_max_pwm != 0)
     {
-        motor_speed = turn_min_speed;
-    }
-    else if (motor_speed < 0 && motor_speed > -turn_min_speed)
-    {
-        motor_speed = -turn_min_speed;
+        turn_ratio_fixed = FIXED_DIV(INT_TO_FIXED(correction_pwm), INT_TO_FIXED(turn_max_pwm));
     }
 
-    // 5. Aplicar velocidades a los motores para girar en el sitio.
-    Set_Motor_Speeds(-motor_speed, motor_speed);
+    // 3. Aplicar la potencia de giro MANTENIENDO LA COMPENSACIÓN MECÁNICA
+    int16_t left_speed, right_speed;
+
+    // Se asume que las velocidades base están calibradas para ir recto.
+    // El ratio entre ellas nos da el factor de compensación.
+    if (left_motor_base_speed > right_motor_base_speed)
+    {
+        // El motor izquierdo es el de referencia (el más rápido).
+        int32_t compensation_ratio = FIXED_DIV(INT_TO_FIXED(right_motor_base_speed), INT_TO_FIXED(left_motor_base_speed));
+
+        // La velocidad del motor de referencia se escala directamente con la potencia de giro.
+        int32_t base_left_speed_fixed = FIXED_MUL(INT_TO_FIXED(turn_max_pwm), turn_ratio_fixed);
+        // La velocidad del motor más lento se compensa.
+        int32_t base_right_speed_fixed = FIXED_MUL(base_left_speed_fixed, compensation_ratio);
+
+        left_speed = (int16_t)FIXED_TO_INT(base_left_speed_fixed);
+        right_speed = -(int16_t)FIXED_TO_INT(base_right_speed_fixed);
+    }
+    else // El motor derecho es más rápido o son iguales
+    {
+        // El motor derecho es el de referencia.
+        int32_t compensation_ratio = FIXED_DIV(INT_TO_FIXED(left_motor_base_speed), INT_TO_FIXED(right_motor_base_speed));
+
+        int32_t base_right_speed_fixed = FIXED_MUL(INT_TO_FIXED(turn_max_pwm), turn_ratio_fixed);
+        int32_t base_left_speed_fixed = FIXED_MUL(base_right_speed_fixed, compensation_ratio);
+
+        left_speed = (int16_t)FIXED_TO_INT(base_left_speed_fixed);
+        right_speed = -(int16_t)FIXED_TO_INT(base_right_speed_fixed);
+    }
+
+    // 4. Aplicar la velocidad mínima para vencer la inercia (lógica sin cambios)
+    if (right_speed > 0 && right_speed < turn_min_speed)
+        right_speed = turn_min_speed;
+    else if (right_speed < 0 && right_speed > -turn_min_speed)
+        right_speed = -turn_min_speed;
+
+    if (left_speed > 0 && left_speed < turn_min_speed)
+        left_speed = turn_min_speed;
+    else if (left_speed < 0 && left_speed > -turn_min_speed)
+        left_speed = -turn_min_speed;
+
+    // 5. Aplicar las velocidades calculadas a los motores.
+    Set_Motor_Speeds(right_speed, left_speed);
 }
 
 /**
@@ -1515,203 +1606,152 @@ static int32_t Get_Filtered_ADC_Value(uint8_t channel)
 
 static void Handle_Centering(void)
 {
-    // 1. Leer sensores
-    int32_t left_lat_val = Get_Filtered_ADC_Value(SENSOR_LEFT_LAT_CH);
-    int32_t right_lat_val = Get_Filtered_ADC_Value(SENSOR_RIGHT_LAT_CH);
-    int32_t front_left_val = Get_Filtered_ADC_Value(SENSOR_FRONT_LEFT_CH);
-    int32_t front_right_val = Get_Filtered_ADC_Value(SENSOR_FRONT_RIGHT_CH);
+    /*     int32_t dist_left_lat_adc = Get_Filtered_ADC_Value(SENSOR_LEFT_LAT_CH);
+        int32_t dist_right_lat_adc = Get_Filtered_ADC_Value(SENSOR_RIGHT_LAT_CH);
+        int32_t dist_front_left_adc = Get_Filtered_ADC_Value(SENSOR_FRONT_LEFT_CH);
+        int32_t dist_front_right_adc = Get_Filtered_ADC_Value(SENSOR_FRONT_RIGHT_CH); */
 
-    // 2. Comprobar si hay una pared frontal para pasar a decidir
-    if (front_left_val > wall_threshold_front || front_right_val > wall_threshold_front)
+    // 1. Leer y convertir sensores a mm
+    int32_t dist_left_lat_mm = ADC_To_Distance_mm(Get_Filtered_ADC_Value(SENSOR_LEFT_LAT_CH));
+    int32_t dist_right_lat_mm = ADC_To_Distance_mm(Get_Filtered_ADC_Value(SENSOR_RIGHT_LAT_CH));
+    int32_t dist_front_left_mm = ADC_To_Distance_mm(Get_Filtered_ADC_Value(SENSOR_FRONT_LEFT_CH));
+    int32_t dist_front_right_mm = ADC_To_Distance_mm(Get_Filtered_ADC_Value(SENSOR_FRONT_RIGHT_CH));
+    /*     int32_t dist_left_lat_mm = ADC_To_Distance_mm(dist_left_lat_adc);
+        int32_t dist_right_lat_mm = ADC_To_Distance_mm(dist_right_lat_adc);
+        int32_t dist_front_left_mm = ADC_To_Distance_mm(dist_front_left_adc);
+        int32_t dist_front_right_mm = ADC_To_Distance_mm(dist_front_right_adc); */
+
+    // 2. Comprobar pared frontal
+    if (dist_front_left_mm < wall_threshold_mm_front || dist_front_right_mm < wall_threshold_mm_front)
     {
         Set_Robot_State(STATE_BRAKING);
-        PID_Reset(&braking_pid);   // Resetear el PID de freno al iniciar
-        Set_Motor_Speeds(0, 0);    // Detener motores en la transición
-        kick_start_active = false; // Cancelar kick-start si vemos una pared
+        PID_Reset(&braking_pid);
+        Set_Motor_Speeds(0, 0);
+        kick_start_active = false;
         return;
     }
 
-    uint16_t current_right_base_speed;
-    uint16_t current_left_base_speed;
-
+    // (Lógica de kick-start se mantiene)
     if (kick_start_active)
     {
-        // Modo "kick-start": usar velocidad alta y comprobar acelerómetro.
         int16_t ax;
         MPU6050_GetCalibratedData(&hmpu, &ax, NULL, NULL, NULL, NULL, NULL);
-
-        // El eje de avance es X. Usamos valor absoluto.
         if (abs(ax) > accel_motion_threshold)
-        {
             motion_confirm_counter++;
-        }
         else
-        {
-            motion_confirm_counter = 0; // Resetear si la lectura es baja
-        }
-
+            motion_confirm_counter = 0;
         if (motion_confirm_counter >= accel_motion_confirm_ticks)
         {
-            kick_start_active = false; // Movimiento confirmado, desactivar kick-start.
+            kick_start_active = false;
             motion_confirm_counter = 0;
         }
-
-        // Todavía en modo kick-start, usar velocidad base alta.
-        current_right_base_speed = right_motor_base_speed;
-        current_left_base_speed = left_motor_base_speed;
     }
+    uint16_t current_left_base_speed = kick_start_active ? (left_motor_base_speed + motor_cruise_speed) : left_motor_base_speed;
+    uint16_t current_right_base_speed = kick_start_active ? (right_motor_base_speed + motor_cruise_speed) : right_motor_base_speed;
 
-    if (!kick_start_active)
-    {
-        // Si no estamos en kick-start, usamos la velocidad de crucero.
-        current_right_base_speed = motor_cruise_speed;
-        current_left_base_speed = motor_cruise_speed;
-    }
-
-    // 3. Determinar qué paredes laterales están presentes
-    bool left_wall_present = left_lat_val > wall_threshold_side;
-    bool right_wall_present = right_lat_val > wall_threshold_side;
-
-    int32_t pid_input = 0;
-    int16_t correction_inversion = 1; // Para invertir la corrección si seguimos la pared izquierda
+    // 3. Determinar paredes laterales y calcular la salida del PID
+    bool left_wall_present = dist_left_lat_mm < wall_threshold_mm_side;
+    bool right_wall_present = dist_right_lat_mm < wall_threshold_mm_side;
+    int32_t pid_output_fixed = 0;
 
     if (left_wall_present && right_wall_present)
     {
-        // CASO 1: Ambas paredes presentes. Centrarse entre ellas.
-        PID_Set_Setpoint(&centering_pid, 0); // El objetivo es que la diferencia sea 0
-        pid_input = left_lat_val - right_lat_val;
-        was_wall_following_active = true; // Recordar que estábamos siguiendo pared
+        // CASO 1: Ambas paredes.
+        // El "valor medido" es la diferencia. Si es positivo, estamos desviados a la derecha.
+        int32_t measured_diff = dist_left_lat_mm - dist_right_lat_mm;
+        PID_Set_Setpoint(&centering_pid, 0);
+        pid_output_fixed = PID_Update(&centering_pid, measured_diff, 10);
+        // Si measured_diff es positivo (desviado a la derecha), el error (0 - diff) es negativo, la salida PID es negativa.
+        // Necesitamos girar a la IZQUIERDA (correction negativa). La salida ya es correcta.
     }
     else if (right_wall_present)
     {
-        // CASO 2: Solo pared derecha. Mantener distancia objetivo.
-        PID_Set_Setpoint(&centering_pid, wall_target_adc);
-        pid_input = right_lat_val;
-        // Si estamos muy cerca (error negativo), necesitamos una corrección positiva (girar izquierda).
-        // Por lo tanto, invertimos la salida del PID.
-        correction_inversion = -1;
-        was_wall_following_active = true; // Recordar que estábamos siguiendo pared
+        // CASO 2: Solo pared derecha.
+        PID_Set_Setpoint(&centering_pid, wall_target_mm);
+        pid_output_fixed = PID_Update(&centering_pid, dist_right_lat_mm, 10);
+        // Si estamos muy cerca (dist < target), el error (target - dist) es positivo, la salida PID es positiva.
+        // Necesitamos girar a la IZQUIERDA (correction negativa). Por tanto, invertimos.
+        pid_output_fixed = -pid_output_fixed;
     }
     else if (left_wall_present)
     {
-        // CASO 3: Solo pared izquierda. Mantener distancia objetivo.
-        PID_Set_Setpoint(&centering_pid, wall_target_adc);
-        pid_input = left_lat_val;
-        // Si estamos muy cerca (error negativo), necesitamos una corrección negativa (girar derecha).
-        // Por lo tanto, NO invertimos la salida del PID.
-        correction_inversion = 1;         // Invertir la salida del PID
-        was_wall_following_active = true; // Recordar que estábamos siguiendo pared
+        // CASO 3: Solo pared izquierda.
+        PID_Set_Setpoint(&centering_pid, wall_target_mm);
+        pid_output_fixed = PID_Update(&centering_pid, dist_left_lat_mm, 10);
+        // Si estamos muy cerca (dist < target), el error (target - dist) es positivo, la salida PID es positiva.
+        // Necesitamos girar a la DERECHA (correction positiva). La salida ya es correcta.
     }
     else
     {
-        // CASO 4: Sin paredes laterales.
-        if (was_wall_following_active)
-        {
-            // Si estábamos siguiendo una pared y ahora no hay ninguna, hemos llegado a un cruce.
-            Set_Robot_State(STATE_DECIDING); // Forzar decisión
-            Set_Motor_Speeds(0, 0);          // Detenerse
-            kick_start_active = false;       // Cancelar kick-start
-        }
-        else
-        {
-            // Si ya estábamos en un espacio abierto, continuar recto.
-            Set_Motor_Speeds(current_right_base_speed, current_left_base_speed);
-        }
+        // CASO 4: Sin paredes.
+        Set_Motor_Speeds(current_right_base_speed, current_left_base_speed);
         return;
     }
-
-    // 4. Calcular la salida del PID
-    int32_t pid_output_fixed = PID_Update(&centering_pid, pid_input, 10); // dt = 10ms
-    int16_t correction = (int16_t)FIXED_TO_INT(pid_output_fixed) * correction_inversion;
-
-    // 5. Aplicar corrección a los motores
-    // Si la corrección es positiva, gira a la derecha. Si es negativa, a la izquierda.
-    int16_t right_motor_speed = current_right_base_speed + correction;
-    int16_t left_motor_speed = current_left_base_speed - correction;
-
-    // 6. Limitar velocidades y aplicar
-    Set_Motor_Speeds(right_motor_speed, left_motor_speed);
+    // 4. Aplicar corrección a los motores
+    int16_t correction = (int16_t)FIXED_TO_INT(pid_output_fixed);
+    Set_Motor_Speeds(current_right_base_speed - correction, current_left_base_speed + correction);
 }
 
 static void Handle_Braking(void)
 {
-    // 1. Leer y promediar los sensores frontales para mayor estabilidad
-    int32_t front_left_val = Get_Filtered_ADC_Value(SENSOR_FRONT_LEFT_CH);
-    int32_t front_right_val = Get_Filtered_ADC_Value(SENSOR_FRONT_RIGHT_CH);
-    int32_t front_avg_val = (front_left_val + front_right_val) / 2;
+    // 1. Leer y convertir sensores frontales a mm
+    int32_t dist_front_avg_mm = (ADC_To_Distance_mm(Get_Filtered_ADC_Value(SENSOR_FRONT_LEFT_CH)) +
+                                 ADC_To_Distance_mm(Get_Filtered_ADC_Value(SENSOR_FRONT_RIGHT_CH))) /
+                                2;
 
-    // 2. Calcular el error respecto a la distancia de parada objetivo
-    int32_t error = wall_stop_target_adc - front_avg_val;
-
-    // 3. Comprobar si el frenado ha terminado
+    // 2. Comprobar si el frenado ha terminado
     int16_t ax;
     MPU6050_GetCalibratedData(&hmpu, &ax, NULL, NULL, NULL, NULL, NULL);
 
-    // Condición de parada: error de distancia bajo Y aceleración casi nula
-    if (abs(error) < braking_dead_zone && abs(ax) < braking_accel_stop_threshold)
+    // La condición de parada usa el error absoluto en mm y la aceleración
+    if (abs(dist_front_avg_mm - wall_braking_target_mm) < braking_dead_zone && abs(ax) < braking_accel_stop_threshold)
     {
         Set_Motor_Speeds(0, 0);
         Set_Robot_State(STATE_DECIDING);
         return;
     }
 
-    // 4. Calcular la salida del PID. La entrada es el valor promedio del sensor.
-    // El setpoint se configura en la inicialización del PID.
-    int32_t pid_output_fixed = PID_Update(&braking_pid, front_avg_val, 10); // dt = 10ms
+    // 3. Calcular la salida del PID. El setpoint ya está configurado.
+    int32_t pid_output_fixed = PID_Update(&braking_pid, dist_front_avg_mm, 10);
 
-    // 5. Convertir la salida del PID a velocidad del motor.
-    // La salida del PID será la velocidad. Si el error es grande (lejos), la velocidad será alta.
-    // Si el error es pequeño (cerca), la velocidad será baja.
-    // Si el error es negativo (se pasó), la velocidad será negativa (reversa).
-    int16_t motor_speed = (int16_t)FIXED_TO_INT(pid_output_fixed);
+    // 4. Invertir la salida del PID para obtener la velocidad.
+    //    Si estamos lejos (dist > target), el PID da una salida negativa.
+    //    Necesitamos una velocidad POSITIVA para avanzar.
+    int16_t motor_speed = -(int16_t)FIXED_TO_INT(pid_output_fixed);
 
-    // 6. Lógica de potencia mínima para vencer la inercia.
+    // 5. Lógica de potencia mínima para vencer la inercia.
     if (motor_speed > 0 && motor_speed < braking_min_speed)
-    {
         motor_speed = braking_min_speed;
-    }
     else if (motor_speed < 0 && motor_speed > -braking_min_speed)
-    {
         motor_speed = -braking_min_speed;
-    }
 
-    // 7. Aplicar la misma velocidad a ambos motores para frenar en línea recta.
+    // 6. Aplicar la MISMA velocidad a ambos motores para un frenado recto.
     Set_Motor_Speeds(motor_speed, motor_speed);
 }
 
 static void Handle_Deciding(void)
 {
-    // Leer sensores laterales para ver qué caminos están abiertos
-    int32_t left_sensor_val = Get_Filtered_ADC_Value(SENSOR_LEFT_LAT_CH);
-    int32_t right_sensor_val = Get_Filtered_ADC_Value(SENSOR_RIGHT_LAT_CH);
+    // Leer y convertir sensores laterales a mm
+    int32_t adc_left = Get_Filtered_ADC_Value(SENSOR_LEFT_LAT_CH);
+    int32_t adc_right = Get_Filtered_ADC_Value(SENSOR_RIGHT_LAT_CH);
+    int32_t dist_left_mm = ADC_To_Distance_mm(adc_left);
+    int32_t dist_right_mm = ADC_To_Distance_mm(adc_right);
 
-    bool left_path_is_open = left_sensor_val < wall_threshold_side;
-    bool right_path_is_open = right_sensor_val < wall_threshold_side;
+    // Tomar decisiones basadas en distancias en mm
+    bool left_path_is_open = dist_left_mm > wall_threshold_mm_side;
+    bool right_path_is_open = dist_right_mm > wall_threshold_mm_side;
 
-    if (left_path_is_open && right_path_is_open)
+    if (left_path_is_open)
     {
-        // Ambos caminos abiertos, elegir aleatoriamente
-        if (rand() % 2 == 0)
-        {
-            Turn_Start(-90); // Girar a la izquierda
-        }
-        else
-        {
-            Turn_Start(90); // Girar a la derecha
-        }
-    }
-    else if (left_path_is_open)
-    {
-        Turn_Start(-90); // Solo izquierda abierta
+        Turn_Start(-90); // Prioridad a la izquierda
     }
     else if (right_path_is_open)
     {
-        Turn_Start(90); // Solo derecha abierta
+        Turn_Start(90); // Luego a la derecha
     }
     else
     {
-        // Callejón sin salida, dar la vuelta
-        Turn_Start(180);
+        Turn_Start(180); // Callejón sin salida
     }
 }
 
@@ -1738,6 +1778,7 @@ static void Update_Display_Content(void)
     char text_line1[22];
     char text_line2[22];
     char text_line3[22];
+    char text_line4[22];
 
     SSD1306_Clear(&hssd);
 
@@ -1746,11 +1787,13 @@ static void Update_Display_Content(void)
         snprintf(text_line1, sizeof(text_line1), "%s Idle", (menu_mode == MENU_MODE_IDLE) ? ">" : " ");
         snprintf(text_line2, sizeof(text_line2), "%s Find Cells", (menu_mode == MENU_MODE_FIND_CELLS) ? ">" : " ");
         snprintf(text_line3, sizeof(text_line3), "%s Go A->B", (menu_mode == MENU_MODE_GO_TO_B) ? ">" : " ");
+        snprintf(text_line4, sizeof(text_line4), "%s Manual", (menu_mode == MENU_MODE_MANUAL_CONTROL) ? ">" : " ");
 
         SSD1306_DrawText(&hssd, 0, 0, "--- MENU ---", SSD1306_TEXT_ALIGN_LEFT);
         SSD1306_DrawText(&hssd, 0, 10, text_line1, SSD1306_TEXT_ALIGN_LEFT);
         SSD1306_DrawText(&hssd, 0, 20, text_line2, SSD1306_TEXT_ALIGN_LEFT);
         SSD1306_DrawText(&hssd, 0, 30, text_line3, SSD1306_TEXT_ALIGN_LEFT);
+        SSD1306_DrawText(&hssd, 0, 40, text_line4, SSD1306_TEXT_ALIGN_LEFT);
     }
     else // APP_STATE_RUNNING
     {
@@ -1765,6 +1808,9 @@ static void Update_Display_Content(void)
             break;
         case MENU_MODE_GO_TO_B:
             current_mode_str = "Going A->B";
+            break;
+        case MENU_MODE_MANUAL_CONTROL:
+            current_mode_str = "Manual Control";
             break;
         }
         snprintf(text_line1, sizeof(text_line1), "Mode: %s", current_mode_str);
@@ -1792,4 +1838,71 @@ static void Update_Display_Content(void)
         SSD1306_DrawText(&hssd, 0, 0, text_line1, SSD1306_TEXT_ALIGN_LEFT);
         SSD1306_DrawText(&hssd, 0, 10, text_line2, SSD1306_TEXT_ALIGN_LEFT);
     }
+}
+
+/**
+ * @brief Convierte un valor ADC a distancia en milímetros usando una LUT con
+ *        interpolación/extrapolación lineal. El resultado final se limita
+ *        al rango de 20mm a 120mm.
+ * @param adc_value El valor ADC filtrado del sensor.
+ * @return La distancia calculada y limitada en milímetros.
+ */
+static int32_t ADC_To_Distance_mm(uint16_t adc_value)
+{
+    const SensorLutEntry *p1 = NULL, *p2 = NULL;
+
+    // Caso 1: El valor ADC es menor que el primer punto de la tabla (extrapolar)
+    if (adc_value <= sensor_lut[0].adc)
+    {
+        p1 = &sensor_lut[0];
+        p2 = &sensor_lut[1];
+    }
+    // Caso 2: El valor ADC es mayor que el último punto de la tabla (extrapolar)
+    else if (adc_value >= sensor_lut[sensor_lut_size - 1].adc)
+    {
+        p1 = &sensor_lut[sensor_lut_size - 2];
+        p2 = &sensor_lut[sensor_lut_size - 1];
+    }
+    // Caso 3: El valor ADC está dentro de la tabla (interpolar)
+    else
+    {
+        for (uint8_t i = 0; i < sensor_lut_size - 1; i++)
+        {
+            if (adc_value >= sensor_lut[i].adc && adc_value <= sensor_lut[i + 1].adc)
+            {
+                p1 = &sensor_lut[i];
+                p2 = &sensor_lut[i + 1];
+                break;
+            }
+        }
+    }
+
+    // Si por alguna razón no se encontraron los puntos, devuelve un valor seguro.
+    if (p1 == NULL || p2 == NULL)
+    {
+        return WALL_FOLLOW_TARGET_MM;
+    }
+
+    // Interpolación/extrapolación lineal con aritmética de enteros:
+    // y = y1 + (x - x1) * (y2 - y1) / (x2 - x1)
+    int32_t adc_diff = p2->adc - p1->adc;
+    if (adc_diff == 0)
+    { // Evitar división por cero
+        return p1->dist_mm;
+    }
+
+    int32_t dist_diff = p2->dist_mm - p1->dist_mm;
+    int32_t calculated_dist = (int32_t)p1->dist_mm + ((int32_t)(adc_value - p1->adc) * dist_diff) / adc_diff;
+
+    // Limitar (clamp) el resultado final al rango de operación seguro
+    if (calculated_dist < 20)
+    {
+        return 20;
+    }
+    if (calculated_dist > 150)
+    {
+        return 150;
+    }
+
+    return calculated_dist;
 }
