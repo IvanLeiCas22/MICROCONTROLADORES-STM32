@@ -47,6 +47,7 @@ typedef enum
     MENU_MODE_FIND_CELLS,
     MENU_MODE_GO_TO_B,
     MENU_MODE_MANUAL_CONTROL,
+    MENU_MODE_DRIVE_STRAIGHT,
     MENU_MODE_COUNT // Mantener este último para ciclar fácilmente
 } MenuModeTypeDef;
 
@@ -121,6 +122,7 @@ typedef enum
     CMD_GET_BRAKING_MIN_SPEED = 0x6B, // Para leer la velocidad mínima de frenado
     CMD_SET_BRAKING_DEAD_ZONE = 0x6C, // Para configurar la zona muerta de frenado
     CMD_GET_BRAKING_DEAD_ZONE = 0x6D, // Para leer la zona muerta de frenado
+    CMD_GET_YAW_ANGLE = 0x75,         // Para leer el ángulo de guiñada actual
     CMD_OTHERS
 } CommandIdTypeDef;
 
@@ -142,7 +144,8 @@ typedef enum
     STATE_DECIDING,
     STATE_TURNING_LEFT,
     STATE_TURNING_RIGHT,
-    STATE_TURN_AROUND
+    STATE_TURN_AROUND,
+    STATE_STRAIGHT_DRIVE
 } RobotStateTypeDef;
 
 //==============================================================================
@@ -219,6 +222,7 @@ extern uint16_t pwm_max_value;
 #define UNERBUS_BRAKING_MAX_SPEED_SIZE (sizeof(uint16_t))
 #define UNERBUS_BRAKING_MIN_SPEED_SIZE (sizeof(uint16_t))
 #define UNERBUS_BRAKING_DEAD_ZONE_SIZE (sizeof(uint16_t))
+#define UNERBUS_YAW_ANGLE_SIZE (sizeof(int32_t)) // Yaw angle como int32_t
 
 /* USB CDC Buffer Sizes */
 #define USB_CDC_RX_BUFFER_SIZE 128
@@ -243,6 +247,7 @@ extern uint16_t pwm_max_value;
 #define HEARTBEAT_MENU_FIND_CELLS 0xCCCCCCCC     // Triple blink rápido
 #define HEARTBEAT_MENU_GO_TO_B 0xF0F00000        // Blink alternado
 #define HEARTBEAT_MENU_MANUAL_CONTROL 0xAAAA0000 // Blink corto y rápido
+#define HEARTBEAT_MENU_DRIVE_STRAIGHT 0x0F0F0F0F // Blink alternado rápido
 
 // Modos en Ejecución (en APP_STATE_RUNNING)
 #define HEARTBEAT_RUNNING_IDLE 0x80808080           // Blink regular lento
@@ -300,5 +305,8 @@ extern uint16_t pwm_max_value;
 #define BRAKING_ACCEL_STOP_THRESHOLD_DEFAULT 400 // Umbral de acelerómetro para confirmar detención
 #define BRAKING_MAX_SPEED_DEFAULT 4000           // Velocidad máxima de frenado en PWM
 #define BRAKING_MIN_SPEED_DEFAULT 2200           // Velocidad mínima de frenado para vencer inercia
+
+/* --- Go straight --- */
+#define FRONT_OBSTACLE_STOP_DISTANCE_MM 50
 
 #endif /* INC_APP_CONFIG_H_ */

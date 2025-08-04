@@ -46,7 +46,7 @@ static const SensorLutEntry sensor_lut[] = {
 static const uint8_t sensor_lut_size = sizeof(sensor_lut) / sizeof(sensor_lut[0]);
 
 SystemFlagTypeDef flags0;
-uint16_t pwm_max_value = 6500; // Valor máximo del PWM
+uint16_t pwm_max_value = 10000; // Valor máximo del PWM
 
 _sESP01Handle esp01_handle;
 _sUNERBUSHandle unerbus_pc_handle;
@@ -138,6 +138,7 @@ static int32_t Get_Filtered_ADC_Value(uint8_t channel);
 static void Set_Robot_State(RobotStateTypeDef new_state);
 static void Update_Display_Content(void);
 static int32_t ADC_To_Distance_mm(uint16_t adc_value);
+static void Handle_Straight_Drive(void);
 
 //==============================================================================
 // IMPLEMENTACIÓN DE WRAPPERS DE CALLBACKS HAL
@@ -780,6 +781,16 @@ void DecodeCMD(struct UNERBUSHandle *aBus, uint8_t iStartData)
         UNERBUS_Write(aBus, braking_dead_zone_buffer, UNERBUS_BRAKING_DEAD_ZONE_SIZE);
         length = UNERBUS_CMD_ID_SIZE + UNERBUS_BRAKING_DEAD_ZONE_SIZE;
         break;
+    case CMD_GET_YAW_ANGLE:
+        uint8_t yaw_buffer[UNERBUS_YAW_ANGLE_SIZE];
+        int32_t yaw_angle = FIXED_TO_INT(current_yaw_fixed);
+        yaw_buffer[0] = (uint8_t)(yaw_angle & 0xFF);
+        yaw_buffer[1] = (uint8_t)((yaw_angle >> 8) & 0xFF);
+        yaw_buffer[2] = (uint8_t)((yaw_angle >> 16) & 0xFF);
+        yaw_buffer[3] = (uint8_t)((yaw_angle >> 24) & 0xFF);
+        UNERBUS_Write(aBus, yaw_buffer, UNERBUS_YAW_ANGLE_SIZE);
+        length = UNERBUS_CMD_ID_SIZE + UNERBUS_YAW_ANGLE_SIZE;
+        break;
     default:
         // Comando desconocido, enviar ACK de error
         /*         UNERBUS_WriteByte(aBus, CMD_NACK);
@@ -817,8 +828,9 @@ void Do100ms()
     if (menu_mode == MENU_MODE_MANUAL_CONTROL)
     {
         char aux[16];
-        snprintf(aux, sizeof(aux), "Yaw %li", current_yaw_fixed);
-        SSD1306_DrawText(&hssd, 0, 0, aux, SSD1306_TEXT_ALIGN_LEFT);
+        snprintf(aux, sizeof(aux), "Yaw %li", FIXED_TO_INT(current_yaw_fixed));
+        SSD1306_DrawText(&hssd, 0, 50, aux, SSD1306_TEXT_ALIGN_LEFT);
+        Update_Display_Content();
     }
 
     // --- Lógica de Heartbeat Dinámico ---
@@ -1107,6 +1119,11 @@ static void ManageButtonEvents(void)
                     kick_start_active = true;
                     motion_confirm_counter = 0;
                 }
+                if (menu_mode == MENU_MODE_DRIVE_STRAIGHT)
+                {
+                    Set_Robot_State(STATE_STRAIGHT_DRIVE);
+                    PID_Set_Setpoint(&centering_pid, FIXED_TO_INT(current_yaw_fixed));
+                }
                 break;
             default:
                 break;
@@ -1327,6 +1344,21 @@ void App_Core_Loop(void)
                     Manage_Turn();
                     break;
                 case STATE_IDLE:
+                default:
+                    // No hacer nada, permite que los comandos externos
+                    // controlen los motores sin que Handle_Idle() los detenga.
+                    break;
+                }
+                break;
+            case MENU_MODE_DRIVE_STRAIGHT:
+                switch (robot_state)
+                {
+                case STATE_BRAKING:
+                    Handle_Braking();
+                    break;
+                case STATE_STRAIGHT_DRIVE:
+                    Handle_Straight_Drive();
+                    break;
                 default:
                     // No hacer nada, permite que los comandos externos
                     // controlen los motores sin que Handle_Idle() los detenga.
@@ -1606,20 +1638,11 @@ static int32_t Get_Filtered_ADC_Value(uint8_t channel)
 
 static void Handle_Centering(void)
 {
-    /*     int32_t dist_left_lat_adc = Get_Filtered_ADC_Value(SENSOR_LEFT_LAT_CH);
-        int32_t dist_right_lat_adc = Get_Filtered_ADC_Value(SENSOR_RIGHT_LAT_CH);
-        int32_t dist_front_left_adc = Get_Filtered_ADC_Value(SENSOR_FRONT_LEFT_CH);
-        int32_t dist_front_right_adc = Get_Filtered_ADC_Value(SENSOR_FRONT_RIGHT_CH); */
-
     // 1. Leer y convertir sensores a mm
     int32_t dist_left_lat_mm = ADC_To_Distance_mm(Get_Filtered_ADC_Value(SENSOR_LEFT_LAT_CH));
     int32_t dist_right_lat_mm = ADC_To_Distance_mm(Get_Filtered_ADC_Value(SENSOR_RIGHT_LAT_CH));
     int32_t dist_front_left_mm = ADC_To_Distance_mm(Get_Filtered_ADC_Value(SENSOR_FRONT_LEFT_CH));
     int32_t dist_front_right_mm = ADC_To_Distance_mm(Get_Filtered_ADC_Value(SENSOR_FRONT_RIGHT_CH));
-    /*     int32_t dist_left_lat_mm = ADC_To_Distance_mm(dist_left_lat_adc);
-        int32_t dist_right_lat_mm = ADC_To_Distance_mm(dist_right_lat_adc);
-        int32_t dist_front_left_mm = ADC_To_Distance_mm(dist_front_left_adc);
-        int32_t dist_front_right_mm = ADC_To_Distance_mm(dist_front_right_adc); */
 
     // 2. Comprobar pared frontal
     if (dist_front_left_mm < wall_threshold_mm_front || dist_front_right_mm < wall_threshold_mm_front)
@@ -1779,6 +1802,7 @@ static void Update_Display_Content(void)
     char text_line2[22];
     char text_line3[22];
     char text_line4[22];
+    char text_line5[22];
 
     SSD1306_Clear(&hssd);
 
@@ -1788,12 +1812,14 @@ static void Update_Display_Content(void)
         snprintf(text_line2, sizeof(text_line2), "%s Find Cells", (menu_mode == MENU_MODE_FIND_CELLS) ? ">" : " ");
         snprintf(text_line3, sizeof(text_line3), "%s Go A->B", (menu_mode == MENU_MODE_GO_TO_B) ? ">" : " ");
         snprintf(text_line4, sizeof(text_line4), "%s Manual", (menu_mode == MENU_MODE_MANUAL_CONTROL) ? ">" : " ");
+        snprintf(text_line5, sizeof(text_line5), "%s Drive Straight", (menu_mode == MENU_MODE_DRIVE_STRAIGHT) ? ">" : " ");
 
         SSD1306_DrawText(&hssd, 0, 0, "--- MENU ---", SSD1306_TEXT_ALIGN_LEFT);
         SSD1306_DrawText(&hssd, 0, 10, text_line1, SSD1306_TEXT_ALIGN_LEFT);
         SSD1306_DrawText(&hssd, 0, 20, text_line2, SSD1306_TEXT_ALIGN_LEFT);
         SSD1306_DrawText(&hssd, 0, 30, text_line3, SSD1306_TEXT_ALIGN_LEFT);
         SSD1306_DrawText(&hssd, 0, 40, text_line4, SSD1306_TEXT_ALIGN_LEFT);
+        SSD1306_DrawText(&hssd, 0, 50, text_line5, SSD1306_TEXT_ALIGN_LEFT);
     }
     else // APP_STATE_RUNNING
     {
@@ -1812,7 +1838,7 @@ static void Update_Display_Content(void)
         case MENU_MODE_MANUAL_CONTROL:
             current_mode_str = "Manual Control";
             break;
-        }
+        } //
         snprintf(text_line1, sizeof(text_line1), "Mode: %s", current_mode_str);
 
         const char *robot_state_str = "Stopped";
@@ -1905,4 +1931,43 @@ static int32_t ADC_To_Distance_mm(uint16_t adc_value)
     }
 
     return calculated_dist;
+}
+
+/**
+ * @brief Maneja el estado de avance recto usando el PID de guiñada.
+ *        Se detiene si detecta un obstáculo frontal.
+ */
+static void Handle_Straight_Drive(void)
+{
+    // 1. Comprobar si hay un obstáculo en frente
+    int32_t front_left_dist_mm = ADC_To_Distance_mm(Get_Filtered_ADC_Value(SENSOR_FRONT_LEFT_CH));
+    int32_t front_right_dist_mm = ADC_To_Distance_mm(Get_Filtered_ADC_Value(SENSOR_FRONT_RIGHT_CH));
+
+    // Si cualquiera de los sensores frontales detecta una pared demasiado cerca
+    if (front_left_dist_mm < FRONT_OBSTACLE_STOP_DISTANCE_MM || front_right_dist_mm < FRONT_OBSTACLE_STOP_DISTANCE_MM)
+    {
+        Set_Robot_State(STATE_BRAKING); // Frenar y detenerse
+        Set_Motor_Speeds(0, 0);
+        return;
+    }
+
+    // 2. Calcular la corrección del PID de guiñada
+    // El setpoint fue fijado al entrar en este estado
+    // El dt es 10ms, que es la frecuencia con la que se llama esta lógica (vía Do10ms)
+    int32_t correction_fixed = PID_Update(&centering_pid, FIXED_TO_INT(current_yaw_fixed), 10);
+    int16_t pwm_correction = (int16_t)(FIXED_TO_INT(correction_fixed));
+
+    // 3. Aplicar la corrección a la velocidad de crucero de los motores
+    int16_t right_speed = right_motor_base_speed - pwm_correction;
+    int16_t left_speed = left_motor_base_speed + pwm_correction;
+
+    Set_Motor_Speeds(right_speed, left_speed);
+}
+
+/**
+ * @brief Maneja el estado de giro suave en intersecciones.
+ *
+ */
+static void Handle_Smooth_Turn(void)
+{
 }
