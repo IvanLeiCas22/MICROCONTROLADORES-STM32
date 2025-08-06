@@ -118,11 +118,13 @@ typedef enum
     CMD_GET_BRAKING_PARAMS = 0x67,
     CMD_SET_BRAKING_MAX_SPEED = 0x68,
     CMD_GET_BRAKING_MAX_SPEED = 0x69,
-    CMD_SET_BRAKING_MIN_SPEED = 0x6A, // Para configurar la velocidad mínima de frenado
-    CMD_GET_BRAKING_MIN_SPEED = 0x6B, // Para leer la velocidad mínima de frenado
-    CMD_SET_BRAKING_DEAD_ZONE = 0x6C, // Para configurar la zona muerta de frenado
-    CMD_GET_BRAKING_DEAD_ZONE = 0x6D, // Para leer la zona muerta de frenado
-    CMD_GET_YAW_ANGLE = 0x75,         // Para leer el ángulo de guiñada actual
+    CMD_SET_BRAKING_MIN_SPEED = 0x6A,  // Para configurar la velocidad mínima de frenado
+    CMD_GET_BRAKING_MIN_SPEED = 0x6B,  // Para leer la velocidad mínima de frenado
+    CMD_SET_BRAKING_DEAD_ZONE = 0x6C,  // Para configurar la zona muerta de frenado
+    CMD_GET_BRAKING_DEAD_ZONE = 0x6D,  // Para leer la zona muerta de frenado
+    CMD_GET_YAW_ANGLE = 0x75,          // Para leer el ángulo de guiñada actual
+    CMD_GET_SMOOTH_TURN_CONFIG = 0x80, // Para leer la configuración de giro suave
+    CMD_SET_SMOOTH_TURN_CONFIG = 0x81, // Para configurar el giro suave
     CMD_OTHERS
 } CommandIdTypeDef;
 
@@ -144,6 +146,8 @@ typedef enum
     STATE_DECIDING,
     STATE_TURNING_LEFT,
     STATE_TURNING_RIGHT,
+    STATE_SMOOTH_TURN_LEFT,
+    STATE_SMOOTH_TURN_RIGHT,
     STATE_TURN_AROUND,
     STATE_STRAIGHT_DRIVE
 } RobotStateTypeDef;
@@ -211,7 +215,7 @@ extern uint16_t pwm_max_value;
 #define UNERBUS_TURN_MIN_SPEED_SIZE (sizeof(uint16_t))
 #define UNERBUS_PWM_PERIOD_SIZE (sizeof(uint16_t))
 #define UNERBUS_MPU_CONFIG_SIZE (sizeof(uint8_t) * 3) // Accel, Gyro, DLPF
-#define UNERBUS_WALL_THRESHOLDS_SIZE (sizeof(uint16_t) * 2)
+#define UNERBUS_WALL_THRESHOLDS_SIZE (sizeof(uint16_t) * 3)
 #define UNERBUS_WALL_TARGET_ADC_SIZE (sizeof(uint16_t))
 #define UNERBUS_APP_STATE_SIZE (sizeof(uint8_t))
 #define UNERBUS_MENU_MODE_SIZE (sizeof(uint8_t))
@@ -223,6 +227,7 @@ extern uint16_t pwm_max_value;
 #define UNERBUS_BRAKING_MIN_SPEED_SIZE (sizeof(uint16_t))
 #define UNERBUS_BRAKING_DEAD_ZONE_SIZE (sizeof(uint16_t))
 #define UNERBUS_YAW_ANGLE_SIZE (sizeof(int32_t)) // Yaw angle como int32_t
+#define UNERBUS_SMOOTH_TURN_CONFIG_SIZE (sizeof(uint16_t) * 2)
 
 /* USB CDC Buffer Sizes */
 #define USB_CDC_RX_BUFFER_SIZE 128
@@ -287,10 +292,12 @@ extern uint16_t pwm_max_value;
 #define SENSOR_LEFT_LAT_CH 6
 #define SENSOR_FLOOR_REAR_CH 7
 
-#define WALL_PRESENCE_THRESHOLD_MM_FRONT 70 // Distancia (mm) para detectar una pared en frente.
-#define WALL_PRESENCE_THRESHOLD_MM_SIDE 100 // Distancia (mm) para detectar una pared lateral.
-#define WALL_FOLLOW_TARGET_MM 50            // Distancia (mm) objetivo para el seguimiento de pared.
-#define WALL_BRAKING_TARGET_MM 20           // Distancia (mm) objetivo para terminar el frenado.
+#define WALL_PRESENCE_THRESHOLD_MM_SIDE 100     // Distancia (mm) para detectar una pared lateral.
+#define WALL_PRESENCE_THRESHOLD_MM_DIAGONAL 140 // Distancia (mm) para detectar una pared diagonal derecha.
+#define WALL_PRESENCE_THRESHOLD_MM_FRONT 70     // Distancia (mm) para detectar una pared frontal.
+#define WALL_FOLLOW_TARGET_MM 50                // Distancia (mm) objetivo para el seguimiento de pared.
+#define WALL_BRAKING_TARGET_MM 20               // Distancia (mm) objetivo para terminar el frenado.
+#define WALL_FADE_TICKS 2                       // Ticks para desvanecer la detección de pared
 
 /* --- Cruise Control --- */
 #define MOTOR_CRUISE_SPEED_DEFAULT 2600      // Velocidad PWM para navegación en rectas

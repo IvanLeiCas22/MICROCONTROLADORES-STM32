@@ -60,7 +60,7 @@ uint32_t heartbeat_counter, heartbeat_mask;
 uint8_t time_10ms, time_100ms, timeout_alive_udp;
 
 uint16_t buf_adc[ADC_BUFFER_SIZE][ADC_CHANNELS];
-uint8_t adc_buf_write_idx, adc_buf_read_idx;
+volatile uint8_t adc_buf_write_idx, adc_buf_read_idx;
 
 static MPU6050_HandleTypeDef hmpu;
 static SSD1306_HandleTypeDef hssd;
@@ -78,19 +78,31 @@ static uint8_t temporary_heartbeat_ticks = 0;
 PID_Controller_t centering_pid;
 PID_Controller_t turn_pid;
 PID_Controller_t braking_pid;
-uint16_t right_motor_base_speed = 3575; // Velocidad base motor derecho
-uint16_t left_motor_base_speed = 4550;  // Velocidad base motor izquierdo
-uint16_t wall_threshold_mm_front;       // Umbral en mm para detectar pared frontal
-uint16_t wall_threshold_mm_side;        // Umbral en mm para detectar pared lateral
-uint16_t wall_target_mm;                // Distancia objetivo en mm para seguimiento de pared
-uint16_t wall_braking_target_mm;        // Distancia de parada objetivo
-uint16_t braking_accel_stop_threshold;  // Umbral de aceleración para confirmar detención
-uint16_t max_pwm_correction = 4000;     // Corrección máxima del PID
+uint16_t right_motor_base_speed = 3575;         // Velocidad base motor derecho
+uint16_t left_motor_base_speed = 4550;          // Velocidad base motor izquierdo
+uint16_t faster_motor_smooth_turn_speed = 6000; // Velocidad del motor más rápido en giro suave
+uint16_t slower_motor_smooth_turn_speed = 2500; // Velocidad del motor más lento en giro suave
+uint16_t wall_threshold_mm_front = 70;          // Umbral en mm para detectar pared frontal
+uint16_t wall_threshold_mm_diagonal = 130;      // Umbral en mm para detectar pared diagonal
+uint16_t wall_threshold_mm_side = 100;          // Umbral en mm para detectar pared lateral
+uint16_t wall_target_mm = 55;                   // Distancia objetivo en mm para seguimiento de pared
+uint16_t wall_braking_target_mm = 30;           // Distancia de parada objetivo
+uint16_t braking_accel_stop_threshold = 2000;   // Umbral de aceleración para confirmar detención
+uint16_t max_pwm_correction = 4000;             // Corrección máxima del PID
 uint16_t turn_max_pwm = TURN_MAX_SPEED_DEFAULT;
 uint16_t turn_min_speed = TURN_MIN_SPEED_DEFAULT;
 uint16_t braking_max_pwm_offset = BRAKING_MAX_SPEED_DEFAULT; // PWM máximo de frenado
 uint16_t braking_min_speed = BRAKING_MIN_SPEED_DEFAULT;
 uint16_t braking_dead_zone = BRAKING_DEAD_ZONE_DEFAULT;
+
+bool left_wall_detected = false, right_wall_detected = false, front_wall_detected = false;
+uint16_t dist_diagonal_left_mm = 0;
+uint16_t dist_diagonal_right_mm = 0;
+uint16_t dist_front_left_mm = 0;
+uint16_t dist_front_right_mm = 0;
+uint16_t dist_left_lat_mm = 0;
+uint16_t dist_right_lat_mm = 0;
+uint8_t wall_fade_counter = 0;
 
 static int32_t current_yaw_fixed = 0; // Yaw angle in Q16.16 fixed-point (degrees)
 static int32_t gyro_z_scaler;         // Factor de escala dinámico para el giroscopio
@@ -130,7 +142,7 @@ static void Set_Motor_Speeds(int16_t right_speed, int16_t left_speed);
 static void Handle_Idle(void);
 static void Handle_Centering(void);
 static void Handle_Braking(void);
-static void Handle_Deciding(void);
+static void Handle_Deciding();
 static void Manage_Turn(void);
 static void Update_Yaw(void);
 void Turn_Start(int16_t angle_degrees);
@@ -139,6 +151,7 @@ static void Set_Robot_State(RobotStateTypeDef new_state);
 static void Update_Display_Content(void);
 static int32_t ADC_To_Distance_mm(uint16_t adc_value);
 static void Handle_Straight_Drive(void);
+static void Modes_State_Machine(void);
 
 //==============================================================================
 // IMPLEMENTACIÓN DE WRAPPERS DE CALLBACKS HAL
@@ -535,7 +548,7 @@ void DecodeCMD(struct UNERBUSHandle *aBus, uint8_t iStartData)
         int16_t angle = (int16_t)UNERBUS_GetUInt16(aBus);
         Turn_Start(angle);
         UNERBUS_WriteByte(aBus, CMD_ACK);
-        length = UNERBUS_CMD_ID_SIZE + UNERBUS_ACK_SIZE + UNERBUS_TURN_DEGREES_SIZE;
+        length = UNERBUS_CMD_ID_SIZE + UNERBUS_ACK_SIZE;
         break;
     case CMD_SET_TURN_PID_GAINS: // Configurar Kp, Ki, Kd del PID de giro
         // Se esperan 3 valores uint16_t: Kp*100, Ki*100, Kd*100
@@ -574,7 +587,7 @@ void DecodeCMD(struct UNERBUSHandle *aBus, uint8_t iStartData)
         turn_max_pwm = UNERBUS_GetUInt16(aBus);
         if (turn_max_pwm > pwm_max_value)
             turn_max_pwm = pwm_max_value; // Limitar al máximo global
-        PID_Set_Output_Limits(&centering_pid, INT_TO_FIXED(-turn_max_pwm), INT_TO_FIXED(turn_max_pwm));
+        PID_Set_Output_Limits(&turn_pid, INT_TO_FIXED(-turn_max_pwm), INT_TO_FIXED(turn_max_pwm));
         UNERBUS_WriteByte(aBus, CMD_ACK);
         length = UNERBUS_CMD_ID_SIZE + UNERBUS_ACK_SIZE;
         break;
@@ -602,6 +615,7 @@ void DecodeCMD(struct UNERBUSHandle *aBus, uint8_t iStartData)
     case CMD_SET_WALL_THRESHOLDS:
         wall_threshold_mm_front = UNERBUS_GetUInt16(aBus);
         wall_threshold_mm_side = UNERBUS_GetUInt16(aBus);
+        wall_threshold_mm_diagonal = UNERBUS_GetUInt16(aBus);
         UNERBUS_WriteByte(aBus, CMD_ACK);
         length = UNERBUS_CMD_ID_SIZE + UNERBUS_ACK_SIZE;
         break;
@@ -611,6 +625,8 @@ void DecodeCMD(struct UNERBUSHandle *aBus, uint8_t iStartData)
         thresholds_buffer[1] = (uint8_t)((wall_threshold_mm_front >> 8) & 0xFF);
         thresholds_buffer[2] = (uint8_t)(wall_threshold_mm_side & 0xFF);
         thresholds_buffer[3] = (uint8_t)((wall_threshold_mm_side >> 8) & 0xFF);
+        thresholds_buffer[4] = (uint8_t)(wall_threshold_mm_diagonal & 0xFF);
+        thresholds_buffer[5] = (uint8_t)((wall_threshold_mm_diagonal >> 8) & 0xFF);
         UNERBUS_Write(aBus, thresholds_buffer, UNERBUS_WALL_THRESHOLDS_SIZE);
         length = UNERBUS_CMD_ID_SIZE + UNERBUS_WALL_THRESHOLDS_SIZE;
         break;
@@ -790,6 +806,30 @@ void DecodeCMD(struct UNERBUSHandle *aBus, uint8_t iStartData)
         yaw_buffer[3] = (uint8_t)((yaw_angle >> 24) & 0xFF);
         UNERBUS_Write(aBus, yaw_buffer, UNERBUS_YAW_ANGLE_SIZE);
         length = UNERBUS_CMD_ID_SIZE + UNERBUS_YAW_ANGLE_SIZE;
+        break;
+    case CMD_GET_SMOOTH_TURN_CONFIG:
+        uint8_t smooth_turn_config_buffer[UNERBUS_SMOOTH_TURN_CONFIG_SIZE];
+
+        smooth_turn_config_buffer[0] = (uint8_t)(faster_motor_smooth_turn_speed & 0xFF);
+        smooth_turn_config_buffer[1] = (uint8_t)((faster_motor_smooth_turn_speed >> 8) & 0xFF);
+        smooth_turn_config_buffer[2] = (uint8_t)(slower_motor_smooth_turn_speed & 0xFF);
+        smooth_turn_config_buffer[3] = (uint8_t)((slower_motor_smooth_turn_speed >> 8) & 0xFF);
+
+        UNERBUS_Write(aBus, smooth_turn_config_buffer, UNERBUS_SMOOTH_TURN_CONFIG_SIZE);
+        length = UNERBUS_CMD_ID_SIZE + UNERBUS_SMOOTH_TURN_CONFIG_SIZE;
+        break;
+    case CMD_SET_SMOOTH_TURN_CONFIG:
+        faster_motor_smooth_turn_speed = UNERBUS_GetUInt16(aBus);
+        slower_motor_smooth_turn_speed = UNERBUS_GetUInt16(aBus);
+
+        if (faster_motor_smooth_turn_speed > (pwm_max_value - 1))
+            faster_motor_smooth_turn_speed = (pwm_max_value - 1); // Limitar al máximo global
+
+        if (slower_motor_smooth_turn_speed > (pwm_max_value - 1))
+            slower_motor_smooth_turn_speed = (pwm_max_value - 1); // Limitar al máximo global
+
+        UNERBUS_WriteByte(aBus, CMD_ACK);
+        length = UNERBUS_CMD_ID_SIZE + UNERBUS_ACK_SIZE;
         break;
     default:
         // Comando desconocido, enviar ACK de error
@@ -1233,10 +1273,10 @@ void App_Core_Init(void)
 
     /* --- INICIALIZACIÓN DE PARÁMETROS DE NAVEGACIÓN --- */
     wall_threshold_mm_front = WALL_PRESENCE_THRESHOLD_MM_FRONT;
+    wall_threshold_mm_diagonal = WALL_PRESENCE_THRESHOLD_MM_DIAGONAL;
     wall_threshold_mm_side = WALL_PRESENCE_THRESHOLD_MM_SIDE;
     wall_target_mm = WALL_FOLLOW_TARGET_MM;
     wall_braking_target_mm = WALL_BRAKING_TARGET_MM;
-    braking_accel_stop_threshold = BRAKING_ACCEL_STOP_THRESHOLD_DEFAULT;
 
     /* --- INICIALIZACIÓN DEL PID DE SEGUIMIENTO DE PARED --- */
     PID_Init(&centering_pid, FLOAT_TO_FIXED(0.8f), FLOAT_TO_FIXED(0.0f), FLOAT_TO_FIXED(0.2f)); // Kp, Ki, Kd
@@ -1304,80 +1344,7 @@ void App_Core_Loop(void)
     if (ON10MS)
     {
         Do10ms();
-
-        // Maquina de estados del robot
-        if (app_state == APP_STATE_RUNNING)
-        {
-            switch (menu_mode)
-            {
-            case MENU_MODE_FIND_CELLS:
-                // Ejecutar la lógica de resolución de laberintos
-                switch (robot_state)
-                {
-                case STATE_CENTERING:
-                    Handle_Centering();
-                    break;
-                case STATE_BRAKING:
-                    Handle_Braking();
-                    break;
-                case STATE_DECIDING:
-                    Handle_Deciding();
-                    break;
-                case STATE_TURNING_LEFT:
-                case STATE_TURNING_RIGHT:
-                case STATE_TURN_AROUND:
-                    Manage_Turn();
-                    break;
-                default:
-                    Handle_Idle();
-                    break;
-                }
-                break;
-            case MENU_MODE_MANUAL_CONTROL:
-                // En modo manual, solo gestionamos los giros.
-                // El control de motores se hace directamente por comandos.
-                switch (robot_state)
-                {
-                case STATE_TURNING_LEFT:
-                case STATE_TURNING_RIGHT:
-                case STATE_TURN_AROUND:
-                    Manage_Turn();
-                    break;
-                case STATE_IDLE:
-                default:
-                    // No hacer nada, permite que los comandos externos
-                    // controlen los motores sin que Handle_Idle() los detenga.
-                    break;
-                }
-                break;
-            case MENU_MODE_DRIVE_STRAIGHT:
-                switch (robot_state)
-                {
-                case STATE_BRAKING:
-                    Handle_Braking();
-                    break;
-                case STATE_STRAIGHT_DRIVE:
-                    Handle_Straight_Drive();
-                    break;
-                default:
-                    // No hacer nada, permite que los comandos externos
-                    // controlen los motores sin que Handle_Idle() los detenga.
-                    break;
-                }
-                break;
-            case MENU_MODE_IDLE:
-            case MENU_MODE_GO_TO_B:
-            default:
-                // Para otros modos, por ahora, solo estar en reposo.
-                Handle_Idle();
-                break;
-            }
-        }
-        else // APP_STATE_MENU
-        {
-            // En el menú, los motores siempre están parados.
-            Handle_Idle();
-        }
+        Modes_State_Machine();
     }
 
     ManageTransmission();
@@ -1638,23 +1605,45 @@ static int32_t Get_Filtered_ADC_Value(uint8_t channel)
 
 static void Handle_Centering(void)
 {
-    // 1. Leer y convertir sensores a mm
-    int32_t dist_left_lat_mm = ADC_To_Distance_mm(Get_Filtered_ADC_Value(SENSOR_LEFT_LAT_CH));
-    int32_t dist_right_lat_mm = ADC_To_Distance_mm(Get_Filtered_ADC_Value(SENSOR_RIGHT_LAT_CH));
-    int32_t dist_front_left_mm = ADC_To_Distance_mm(Get_Filtered_ADC_Value(SENSOR_FRONT_LEFT_CH));
-    int32_t dist_front_right_mm = ADC_To_Distance_mm(Get_Filtered_ADC_Value(SENSOR_FRONT_RIGHT_CH));
+    dist_diagonal_left_mm = (uint16_t)ADC_To_Distance_mm((uint16_t)Get_Filtered_ADC_Value(SENSOR_DIAGONAL_LEFT_CH));
+    dist_diagonal_right_mm = (uint16_t)ADC_To_Distance_mm((uint16_t)Get_Filtered_ADC_Value(SENSOR_DIAGONAL_RIGHT_CH));
+    dist_front_left_mm = (uint16_t)ADC_To_Distance_mm((uint16_t)Get_Filtered_ADC_Value(SENSOR_FRONT_LEFT_CH));
+    dist_front_right_mm = (uint16_t)ADC_To_Distance_mm((uint16_t)Get_Filtered_ADC_Value(SENSOR_FRONT_RIGHT_CH));
+    dist_left_lat_mm = (uint16_t)ADC_To_Distance_mm((uint16_t)Get_Filtered_ADC_Value(SENSOR_LEFT_LAT_CH));
+    dist_right_lat_mm = (uint16_t)ADC_To_Distance_mm((uint16_t)Get_Filtered_ADC_Value(SENSOR_RIGHT_LAT_CH));
 
-    // 2. Comprobar pared frontal
-    if (dist_front_left_mm < wall_threshold_mm_front || dist_front_right_mm < wall_threshold_mm_front)
+    // 2. Comprobar sensores diagonales
+    left_wall_detected = dist_diagonal_left_mm < wall_threshold_mm_diagonal;
+    right_wall_detected = dist_diagonal_right_mm < wall_threshold_mm_diagonal;
+    front_wall_detected = dist_front_left_mm < wall_threshold_mm_front || dist_front_right_mm < wall_threshold_mm_front;
+
+    if (!left_wall_detected || !right_wall_detected)
     {
+
+        wall_fade_counter++;
+        if (wall_fade_counter >= WALL_FADE_TICKS)
+        {
+            wall_fade_counter = 0;
+            Set_Robot_State(STATE_STRAIGHT_DRIVE);
+            PID_Reset(&centering_pid);
+            PID_Set_Setpoint(&centering_pid, FIXED_TO_INT(current_yaw_fixed));
+            return;
+        }
+    }
+    else
+    {
+        wall_fade_counter = 0; // Resetear contador si hay paredes detectadas
+    }
+
+    if (front_wall_detected)
+    {
+        Set_Motor_Speeds(0, 0);
         Set_Robot_State(STATE_BRAKING);
         PID_Reset(&braking_pid);
-        Set_Motor_Speeds(0, 0);
-        kick_start_active = false;
         return;
     }
 
-    // (Lógica de kick-start se mantiene)
+    // (Lógica de kick-start)
     if (kick_start_active)
     {
         int16_t ax;
@@ -1672,12 +1661,9 @@ static void Handle_Centering(void)
     uint16_t current_left_base_speed = kick_start_active ? (left_motor_base_speed + motor_cruise_speed) : left_motor_base_speed;
     uint16_t current_right_base_speed = kick_start_active ? (right_motor_base_speed + motor_cruise_speed) : right_motor_base_speed;
 
-    // 3. Determinar paredes laterales y calcular la salida del PID
-    bool left_wall_present = dist_left_lat_mm < wall_threshold_mm_side;
-    bool right_wall_present = dist_right_lat_mm < wall_threshold_mm_side;
     int32_t pid_output_fixed = 0;
 
-    if (left_wall_present && right_wall_present)
+    if (dist_left_lat_mm < wall_threshold_mm_side && dist_right_lat_mm < wall_threshold_mm_side)
     {
         // CASO 1: Ambas paredes.
         // El "valor medido" es la diferencia. Si es positivo, estamos desviados a la derecha.
@@ -1687,7 +1673,7 @@ static void Handle_Centering(void)
         // Si measured_diff es positivo (desviado a la derecha), el error (0 - diff) es negativo, la salida PID es negativa.
         // Necesitamos girar a la IZQUIERDA (correction negativa). La salida ya es correcta.
     }
-    else if (right_wall_present)
+    else if (dist_right_lat_mm < wall_threshold_mm_side)
     {
         // CASO 2: Solo pared derecha.
         PID_Set_Setpoint(&centering_pid, wall_target_mm);
@@ -1696,7 +1682,7 @@ static void Handle_Centering(void)
         // Necesitamos girar a la IZQUIERDA (correction negativa). Por tanto, invertimos.
         pid_output_fixed = -pid_output_fixed;
     }
-    else if (left_wall_present)
+    else if (dist_left_lat_mm < wall_threshold_mm_side)
     {
         // CASO 3: Solo pared izquierda.
         PID_Set_Setpoint(&centering_pid, wall_target_mm);
@@ -1707,7 +1693,6 @@ static void Handle_Centering(void)
     else
     {
         // CASO 4: Sin paredes.
-        Set_Motor_Speeds(current_right_base_speed, current_left_base_speed);
         return;
     }
     // 4. Aplicar corrección a los motores
@@ -1715,12 +1700,91 @@ static void Handle_Centering(void)
     Set_Motor_Speeds(current_right_base_speed - correction, current_left_base_speed + correction);
 }
 
+/**
+ * @brief Maneja el estado de avance recto usando el PID de yaw.
+ *        Se detiene si detecta un obstáculo frontal.
+ */
+static void Handle_Straight_Drive(void)
+{
+    if (menu_mode == MENU_MODE_DRIVE_STRAIGHT)
+    {
+        dist_front_left_mm = (uint16_t)ADC_To_Distance_mm((uint16_t)Get_Filtered_ADC_Value(SENSOR_FRONT_LEFT_CH));
+        dist_front_right_mm = (uint16_t)ADC_To_Distance_mm((uint16_t)Get_Filtered_ADC_Value(SENSOR_FRONT_RIGHT_CH));
+        front_wall_detected = (dist_front_left_mm < wall_threshold_mm_front || dist_front_right_mm < wall_threshold_mm_front);
+        if (front_wall_detected)
+        {
+            Set_Motor_Speeds(0, 0);
+            app_state = APP_STATE_MENU;  // Volver al menú
+            Set_Robot_State(STATE_IDLE); // Volver al estado de espera
+        }
+        return;
+    }
+    else
+    {
+        // En otros modos, no se detiene por obstáculos frontales.
+        dist_left_lat_mm = (uint16_t)ADC_To_Distance_mm((uint16_t)Get_Filtered_ADC_Value(SENSOR_LEFT_LAT_CH));
+        dist_right_lat_mm = (uint16_t)ADC_To_Distance_mm((uint16_t)Get_Filtered_ADC_Value(SENSOR_RIGHT_LAT_CH));
+        left_wall_detected = (dist_left_lat_mm < wall_threshold_mm_side);
+        right_wall_detected = (dist_right_lat_mm < wall_threshold_mm_side);
+
+        if (!left_wall_detected || !right_wall_detected)
+        {
+            wall_fade_counter++;
+            if (wall_fade_counter >= WALL_FADE_TICKS)
+            {
+                wall_fade_counter = 0;
+                // Handle_Deciding();
+                Set_Robot_State(STATE_DECIDING);
+            }
+        }
+        else
+        {
+            wall_fade_counter = 0; // Resetear contador si ambas paredes están presentes
+        }
+    }
+
+    // Calcular la corrección del PID de guiñada
+    // El setpoint fue fijado al entrar en este estado
+    // El dt es 10ms, que es la frecuencia con la que se llama esta lógica (vía Do10ms)
+    int16_t pwm_correction = (int16_t)(FIXED_TO_INT(PID_Update(&centering_pid, FIXED_TO_INT(current_yaw_fixed), 10)));
+
+    // Aplicar la corrección a la velocidad base de los motores
+    Set_Motor_Speeds(right_motor_base_speed - pwm_correction, left_motor_base_speed + pwm_correction);
+}
+
+static void Handle_Deciding(void)
+{
+    dist_left_lat_mm = (uint16_t)ADC_To_Distance_mm((uint16_t)Get_Filtered_ADC_Value(SENSOR_LEFT_LAT_CH));
+    dist_right_lat_mm = (uint16_t)ADC_To_Distance_mm((uint16_t)Get_Filtered_ADC_Value(SENSOR_RIGHT_LAT_CH));
+    dist_front_left_mm = (uint16_t)ADC_To_Distance_mm((uint16_t)Get_Filtered_ADC_Value(SENSOR_FRONT_LEFT_CH));
+    dist_front_right_mm = (uint16_t)ADC_To_Distance_mm((uint16_t)Get_Filtered_ADC_Value(SENSOR_FRONT_RIGHT_CH));
+
+    left_wall_detected = (dist_left_lat_mm < wall_threshold_mm_side);
+    right_wall_detected = (dist_right_lat_mm < wall_threshold_mm_side);
+    front_wall_detected = (dist_front_left_mm < wall_threshold_mm_front || dist_front_right_mm < wall_threshold_mm_front);
+
+    if (!left_wall_detected)
+    {
+        Set_Robot_State(STATE_SMOOTH_TURN_LEFT); // Prioridad a la izquierda
+        current_yaw_fixed = 0;
+    }
+    else if (!right_wall_detected)
+    {
+        Set_Robot_State(STATE_SMOOTH_TURN_RIGHT);
+        current_yaw_fixed = 0;
+    }
+    else
+    {
+        Turn_Start(180); // Callejón sin salida
+    }
+}
+
 static void Handle_Braking(void)
 {
     // 1. Leer y convertir sensores frontales a mm
-    int32_t dist_front_avg_mm = (ADC_To_Distance_mm(Get_Filtered_ADC_Value(SENSOR_FRONT_LEFT_CH)) +
-                                 ADC_To_Distance_mm(Get_Filtered_ADC_Value(SENSOR_FRONT_RIGHT_CH))) /
-                                2;
+    uint16_t dist_front_avg_mm = ((uint16_t)ADC_To_Distance_mm((uint16_t)Get_Filtered_ADC_Value(SENSOR_FRONT_LEFT_CH)) +
+                                  (uint16_t)ADC_To_Distance_mm((uint16_t)Get_Filtered_ADC_Value(SENSOR_FRONT_RIGHT_CH))) /
+                                 2;
 
     // 2. Comprobar si el frenado ha terminado
     int16_t ax;
@@ -1750,32 +1814,6 @@ static void Handle_Braking(void)
 
     // 6. Aplicar la MISMA velocidad a ambos motores para un frenado recto.
     Set_Motor_Speeds(motor_speed, motor_speed);
-}
-
-static void Handle_Deciding(void)
-{
-    // Leer y convertir sensores laterales a mm
-    int32_t adc_left = Get_Filtered_ADC_Value(SENSOR_LEFT_LAT_CH);
-    int32_t adc_right = Get_Filtered_ADC_Value(SENSOR_RIGHT_LAT_CH);
-    int32_t dist_left_mm = ADC_To_Distance_mm(adc_left);
-    int32_t dist_right_mm = ADC_To_Distance_mm(adc_right);
-
-    // Tomar decisiones basadas en distancias en mm
-    bool left_path_is_open = dist_left_mm > wall_threshold_mm_side;
-    bool right_path_is_open = dist_right_mm > wall_threshold_mm_side;
-
-    if (left_path_is_open)
-    {
-        Turn_Start(-90); // Prioridad a la izquierda
-    }
-    else if (right_path_is_open)
-    {
-        Turn_Start(90); // Luego a la derecha
-    }
-    else
-    {
-        Turn_Start(180); // Callejón sin salida
-    }
 }
 
 /**
@@ -1934,40 +1972,129 @@ static int32_t ADC_To_Distance_mm(uint16_t adc_value)
 }
 
 /**
- * @brief Maneja el estado de avance recto usando el PID de guiñada.
- *        Se detiene si detecta un obstáculo frontal.
- */
-static void Handle_Straight_Drive(void)
-{
-    // 1. Comprobar si hay un obstáculo en frente
-    int32_t front_left_dist_mm = ADC_To_Distance_mm(Get_Filtered_ADC_Value(SENSOR_FRONT_LEFT_CH));
-    int32_t front_right_dist_mm = ADC_To_Distance_mm(Get_Filtered_ADC_Value(SENSOR_FRONT_RIGHT_CH));
-
-    // Si cualquiera de los sensores frontales detecta una pared demasiado cerca
-    if (front_left_dist_mm < FRONT_OBSTACLE_STOP_DISTANCE_MM || front_right_dist_mm < FRONT_OBSTACLE_STOP_DISTANCE_MM)
-    {
-        Set_Robot_State(STATE_BRAKING); // Frenar y detenerse
-        Set_Motor_Speeds(0, 0);
-        return;
-    }
-
-    // 2. Calcular la corrección del PID de guiñada
-    // El setpoint fue fijado al entrar en este estado
-    // El dt es 10ms, que es la frecuencia con la que se llama esta lógica (vía Do10ms)
-    int32_t correction_fixed = PID_Update(&centering_pid, FIXED_TO_INT(current_yaw_fixed), 10);
-    int16_t pwm_correction = (int16_t)(FIXED_TO_INT(correction_fixed));
-
-    // 3. Aplicar la corrección a la velocidad de crucero de los motores
-    int16_t right_speed = right_motor_base_speed - pwm_correction;
-    int16_t left_speed = left_motor_base_speed + pwm_correction;
-
-    Set_Motor_Speeds(right_speed, left_speed);
-}
-
-/**
  * @brief Maneja el estado de giro suave en intersecciones.
  *
  */
 static void Handle_Smooth_Turn(void)
 {
+    bool wall_detected = false; //
+    if (robot_state == STATE_SMOOTH_TURN_LEFT)
+    {
+        dist_diagonal_left_mm = (uint16_t)ADC_To_Distance_mm((uint16_t)Get_Filtered_ADC_Value(SENSOR_DIAGONAL_LEFT_CH));
+        dist_left_lat_mm = (uint16_t)ADC_To_Distance_mm((uint16_t)Get_Filtered_ADC_Value(SENSOR_LEFT_LAT_CH));
+        wall_detected = (dist_left_lat_mm < wall_threshold_mm_side && dist_diagonal_left_mm < wall_threshold_mm_diagonal);
+        Set_Motor_Speeds(faster_motor_smooth_turn_speed, slower_motor_smooth_turn_speed);
+    }
+    else if (robot_state == STATE_SMOOTH_TURN_RIGHT)
+    {
+        dist_diagonal_right_mm = (uint16_t)ADC_To_Distance_mm((uint16_t)Get_Filtered_ADC_Value(SENSOR_DIAGONAL_RIGHT_CH));
+        dist_right_lat_mm = (uint16_t)ADC_To_Distance_mm((uint16_t)Get_Filtered_ADC_Value(SENSOR_RIGHT_LAT_CH));
+        wall_detected = (dist_right_lat_mm < wall_threshold_mm_side && dist_diagonal_right_mm < wall_threshold_mm_diagonal);
+        Set_Motor_Speeds(slower_motor_smooth_turn_speed, faster_motor_smooth_turn_speed);
+    }
+
+    if (abs(FIXED_TO_INT(current_yaw_fixed)) < 75)
+    {
+        wall_detected = false; // No considerar paredes si el giro es pequeño
+    }
+
+    if (!wall_detected)
+    {
+        dist_front_left_mm = (uint16_t)ADC_To_Distance_mm((uint16_t)Get_Filtered_ADC_Value(SENSOR_FRONT_LEFT_CH));
+        dist_front_right_mm = (uint16_t)ADC_To_Distance_mm((uint16_t)Get_Filtered_ADC_Value(SENSOR_FRONT_RIGHT_CH));
+        wall_detected = (dist_front_left_mm < (wall_threshold_mm_front / 2) || dist_front_right_mm < (wall_threshold_mm_front / 2));
+    }
+
+    if (abs(FIXED_TO_INT(current_yaw_fixed)) >= (90 - TURN_COMPLETION_DEAD_ZONE) || wall_detected)
+    {
+        Set_Motor_Speeds(0, 0);
+        Set_Robot_State(STATE_CENTERING);
+        PID_Reset(&centering_pid);
+        kick_start_active = true;
+        motion_confirm_counter = 0;
+    }
+}
+
+static void Modes_State_Machine(void)
+{
+    // Maquina de estados del robot
+    if (app_state == APP_STATE_RUNNING)
+    {
+        switch (menu_mode)
+        {
+        case MENU_MODE_FIND_CELLS:
+            // Ejecutar la lógica de resolución de laberintos
+            switch (robot_state)
+            {
+            case STATE_CENTERING:
+                Handle_Centering();
+                break;
+            case STATE_BRAKING:
+                Handle_Braking();
+                break;
+            case STATE_DECIDING:
+                Handle_Deciding();
+                break;
+            case STATE_STRAIGHT_DRIVE:
+                Handle_Straight_Drive();
+                break;
+            case STATE_TURNING_LEFT:
+            case STATE_TURNING_RIGHT:
+            case STATE_TURN_AROUND:
+                Manage_Turn();
+                break;
+            case STATE_SMOOTH_TURN_LEFT:
+            case STATE_SMOOTH_TURN_RIGHT:
+                Handle_Smooth_Turn();
+                break;
+            default:
+                Handle_Idle();
+                break;
+            }
+            break;
+        case MENU_MODE_MANUAL_CONTROL:
+            // En modo manual, solo gestionamos los giros.
+            // El control de motores se hace directamente por comandos.
+            switch (robot_state)
+            {
+            case STATE_TURNING_LEFT:
+            case STATE_TURNING_RIGHT:
+            case STATE_TURN_AROUND:
+                Manage_Turn();
+                break;
+            case STATE_IDLE:
+            default:
+                // No hacer nada, permite que los comandos externos
+                // controlen los motores sin que Handle_Idle() los detenga.
+                break;
+            }
+            break;
+        case MENU_MODE_DRIVE_STRAIGHT:
+            switch (robot_state)
+            {
+            case STATE_BRAKING:
+                Handle_Braking();
+                break;
+            case STATE_STRAIGHT_DRIVE:
+                Handle_Straight_Drive();
+                break;
+            default:
+                // No hacer nada, permite que los comandos externos
+                // controlen los motores sin que Handle_Idle() los detenga.
+                break;
+            }
+            break;
+        case MENU_MODE_IDLE:
+        case MENU_MODE_GO_TO_B:
+        default:
+            // Para otros modos, por ahora, solo estar en reposo.
+            Handle_Idle();
+            break;
+        }
+    }
+    else // APP_STATE_MENU
+    {
+        // En el menú, los motores siempre están parados.
+        Handle_Idle();
+    }
 }
