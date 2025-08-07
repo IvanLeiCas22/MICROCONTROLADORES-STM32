@@ -118,13 +118,19 @@ typedef enum
     CMD_GET_BRAKING_PARAMS = 0x67,
     CMD_SET_BRAKING_MAX_SPEED = 0x68,
     CMD_GET_BRAKING_MAX_SPEED = 0x69,
-    CMD_SET_BRAKING_MIN_SPEED = 0x6A,  // Para configurar la velocidad mínima de frenado
-    CMD_GET_BRAKING_MIN_SPEED = 0x6B,  // Para leer la velocidad mínima de frenado
-    CMD_SET_BRAKING_DEAD_ZONE = 0x6C,  // Para configurar la zona muerta de frenado
-    CMD_GET_BRAKING_DEAD_ZONE = 0x6D,  // Para leer la zona muerta de frenado
-    CMD_GET_YAW_ANGLE = 0x75,          // Para leer el ángulo de guiñada actual
-    CMD_GET_SMOOTH_TURN_CONFIG = 0x80, // Para leer la configuración de giro suave
-    CMD_SET_SMOOTH_TURN_CONFIG = 0x81, // Para configurar el giro suave
+    CMD_SET_BRAKING_MIN_SPEED = 0x6A,       // Para configurar la velocidad mínima de frenado
+    CMD_GET_BRAKING_MIN_SPEED = 0x6B,       // Para leer la velocidad mínima de frenado
+    CMD_SET_BRAKING_DEAD_ZONE = 0x6C,       // Para configurar la zona muerta de frenado
+    CMD_GET_BRAKING_DEAD_ZONE = 0x6D,       // Para leer la zona muerta de frenado
+    CMD_GET_YAW_ANGLE = 0x75,               // Para leer el ángulo de guiñada actual
+    CMD_GET_SMOOTH_TURN_CONFIG = 0x80,      // Para leer la configuración de giro suave
+    CMD_SET_SMOOTH_TURN_CONFIG = 0x81,      // Para configurar el giro suave
+    CMD_SET_TURN_VELOCITY_PID_GAINS = 0x82, // Configurar Kp, Ki, Kd del PID de velocidad de giro
+    CMD_GET_TURN_VELOCITY_PID_GAINS = 0x83, // Leer Kp, Ki, Kd del PID de velocidad de giro
+    CMD_SET_TURN_TARGET_DPS = 0x84,         // Configurar la velocidad angular objetivo para giros
+    CMD_GET_TURN_TARGET_DPS = 0x85,         // Leer la velocidad angular objetivo
+    CMD_GET_DELAY_TICKS = 0X90,             // Leer el número de ticks de retardo
+    CMD_SET_DELAY_TICKS = 0X91,             // Configurar el número de ticks de retardo
     CMD_OTHERS
 } CommandIdTypeDef;
 
@@ -215,7 +221,7 @@ extern uint16_t pwm_max_value;
 #define UNERBUS_TURN_MIN_SPEED_SIZE (sizeof(uint16_t))
 #define UNERBUS_PWM_PERIOD_SIZE (sizeof(uint16_t))
 #define UNERBUS_MPU_CONFIG_SIZE (sizeof(uint8_t) * 3) // Accel, Gyro, DLPF
-#define UNERBUS_WALL_THRESHOLDS_SIZE (sizeof(uint16_t) * 3)
+#define UNERBUS_WALL_THRESHOLDS_SIZE (sizeof(uint16_t) * 4)
 #define UNERBUS_WALL_TARGET_ADC_SIZE (sizeof(uint16_t))
 #define UNERBUS_APP_STATE_SIZE (sizeof(uint8_t))
 #define UNERBUS_MENU_MODE_SIZE (sizeof(uint8_t))
@@ -228,6 +234,9 @@ extern uint16_t pwm_max_value;
 #define UNERBUS_BRAKING_DEAD_ZONE_SIZE (sizeof(uint16_t))
 #define UNERBUS_YAW_ANGLE_SIZE (sizeof(int32_t)) // Yaw angle como int32_t
 #define UNERBUS_SMOOTH_TURN_CONFIG_SIZE (sizeof(uint16_t) * 2)
+#define UNERBUS_TURN_VELOCITY_PID_GAINS_SIZE (sizeof(uint16_t) * 3)
+#define UNERBUS_TURN_TARGET_DPS_SIZE (sizeof(uint16_t))
+#define UNERBUS_DELAY_TICKS_SIZE (sizeof(uint8_t)) // Número de ticks de retardo como uint8_t
 
 /* USB CDC Buffer Sizes */
 #define USB_CDC_RX_BUFFER_SIZE 128
@@ -282,6 +291,11 @@ extern uint16_t pwm_max_value;
 #define TURN_MAX_SPEED_DEFAULT 6500 // Velocidad máxima de giro en PWM
 #define TURN_MIN_SPEED_DEFAULT 2600 // Velocidad mínima de giro para vencer la inercia
 
+#define TURN_VELOCITY_PID_KP_DEFAULT 20.0f // Kp para el control de velocidad angular
+#define TURN_VELOCITY_PID_KI_DEFAULT 5.0f  // Ki para el control de velocidad angular
+#define TURN_VELOCITY_PID_KD_DEFAULT 2.0f  // Kd para el control de velocidad angular
+#define TURN_TARGET_DPS_DEFAULT 360        // Velocidad angular objetivo en grados/segundo
+
 /* --- Sensores --- */
 #define SENSOR_RIGHT_LAT_CH 0
 #define SENSOR_DIAGONAL_RIGHT_CH 1
@@ -297,7 +311,7 @@ extern uint16_t pwm_max_value;
 #define WALL_PRESENCE_THRESHOLD_MM_FRONT 70     // Distancia (mm) para detectar una pared frontal.
 #define WALL_FOLLOW_TARGET_MM 50                // Distancia (mm) objetivo para el seguimiento de pared.
 #define WALL_BRAKING_TARGET_MM 20               // Distancia (mm) objetivo para terminar el frenado.
-#define WALL_FADE_TICKS 2                       // Ticks para desvanecer la detección de pared
+#define WALL_FADE_TICKS_DEFAULT 2               // Ticks para desvanecer la detección de pared
 
 /* --- Cruise Control --- */
 #define MOTOR_CRUISE_SPEED_DEFAULT 2600      // Velocidad PWM para navegación en rectas

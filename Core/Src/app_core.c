@@ -13,6 +13,9 @@
 #include "SSD1306.h"
 #include "pid_controller.h"
 
+/* --- Smooth Turn --- */
+#define GYRO_SENSITIVITY FLOAT_TO_FIXED(65.5f)
+
 //==============================================================================
 // DECLARACIONES EXTERN DE HANDLES DE PERIFÉRICOS (definidos en main.c)
 //==============================================================================
@@ -77,6 +80,7 @@ static uint8_t temporary_heartbeat_ticks = 0;
 // --- Variables de PID y Control del Robot ---
 PID_Controller_t centering_pid;
 PID_Controller_t turn_pid;
+PID_Controller_t turn_velocity_pid;
 PID_Controller_t braking_pid;
 uint16_t right_motor_base_speed = 3575;         // Velocidad base motor derecho
 uint16_t left_motor_base_speed = 4550;          // Velocidad base motor izquierdo
@@ -85,12 +89,14 @@ uint16_t slower_motor_smooth_turn_speed = 2500; // Velocidad del motor más lent
 uint16_t wall_threshold_mm_front = 70;          // Umbral en mm para detectar pared frontal
 uint16_t wall_threshold_mm_diagonal = 130;      // Umbral en mm para detectar pared diagonal
 uint16_t wall_threshold_mm_side = 100;          // Umbral en mm para detectar pared lateral
+uint16_t after_turn_wall_threshold_mm = 80;     // Umbral en mm para pared después de un giro
 uint16_t wall_target_mm = 55;                   // Distancia objetivo en mm para seguimiento de pared
 uint16_t wall_braking_target_mm = 30;           // Distancia de parada objetivo
 uint16_t braking_accel_stop_threshold = 2000;   // Umbral de aceleración para confirmar detención
 uint16_t max_pwm_correction = 4000;             // Corrección máxima del PID
 uint16_t turn_max_pwm = TURN_MAX_SPEED_DEFAULT;
 uint16_t turn_min_speed = TURN_MIN_SPEED_DEFAULT;
+uint16_t turn_target_dps = TURN_TARGET_DPS_DEFAULT;
 uint16_t braking_max_pwm_offset = BRAKING_MAX_SPEED_DEFAULT; // PWM máximo de frenado
 uint16_t braking_min_speed = BRAKING_MIN_SPEED_DEFAULT;
 uint16_t braking_dead_zone = BRAKING_DEAD_ZONE_DEFAULT;
@@ -103,6 +109,7 @@ uint16_t dist_front_right_mm = 0;
 uint16_t dist_left_lat_mm = 0;
 uint16_t dist_right_lat_mm = 0;
 uint8_t wall_fade_counter = 0;
+uint8_t wall_fade_ticks = WALL_FADE_TICKS_DEFAULT;
 
 static int32_t current_yaw_fixed = 0; // Yaw angle in Q16.16 fixed-point (degrees)
 static int32_t gyro_z_scaler;         // Factor de escala dinámico para el giroscopio
@@ -276,6 +283,10 @@ void DecodeCMD(struct UNERBUSHandle *aBus, uint8_t iStartData)
     uint16_t turn_kp_int = 0;
     uint16_t turn_ki_int = 0;
     uint16_t turn_kd_int = 0;
+
+    uint16_t vel_kp_int = 0;
+    uint16_t vel_ki_int = 0;
+    uint16_t vel_kd_int = 0;
 
     id = UNERBUS_GetUInt8(aBus);
     switch ((CommandIdTypeDef)id)
@@ -616,6 +627,7 @@ void DecodeCMD(struct UNERBUSHandle *aBus, uint8_t iStartData)
         wall_threshold_mm_front = UNERBUS_GetUInt16(aBus);
         wall_threshold_mm_side = UNERBUS_GetUInt16(aBus);
         wall_threshold_mm_diagonal = UNERBUS_GetUInt16(aBus);
+        after_turn_wall_threshold_mm = UNERBUS_GetUInt16(aBus);
         UNERBUS_WriteByte(aBus, CMD_ACK);
         length = UNERBUS_CMD_ID_SIZE + UNERBUS_ACK_SIZE;
         break;
@@ -627,6 +639,8 @@ void DecodeCMD(struct UNERBUSHandle *aBus, uint8_t iStartData)
         thresholds_buffer[3] = (uint8_t)((wall_threshold_mm_side >> 8) & 0xFF);
         thresholds_buffer[4] = (uint8_t)(wall_threshold_mm_diagonal & 0xFF);
         thresholds_buffer[5] = (uint8_t)((wall_threshold_mm_diagonal >> 8) & 0xFF);
+        thresholds_buffer[6] = (uint8_t)(after_turn_wall_threshold_mm & 0xFF);
+        thresholds_buffer[7] = (uint8_t)((after_turn_wall_threshold_mm >> 8) & 0xFF);
         UNERBUS_Write(aBus, thresholds_buffer, UNERBUS_WALL_THRESHOLDS_SIZE);
         length = UNERBUS_CMD_ID_SIZE + UNERBUS_WALL_THRESHOLDS_SIZE;
         break;
@@ -828,6 +842,54 @@ void DecodeCMD(struct UNERBUSHandle *aBus, uint8_t iStartData)
         if (slower_motor_smooth_turn_speed > (pwm_max_value - 1))
             slower_motor_smooth_turn_speed = (pwm_max_value - 1); // Limitar al máximo global
 
+        UNERBUS_WriteByte(aBus, CMD_ACK);
+        length = UNERBUS_CMD_ID_SIZE + UNERBUS_ACK_SIZE;
+        break;
+    case CMD_SET_TURN_VELOCITY_PID_GAINS:
+        vel_kp_int = UNERBUS_GetUInt16(aBus);
+        vel_ki_int = UNERBUS_GetUInt16(aBus);
+        vel_kd_int = UNERBUS_GetUInt16(aBus);
+        turn_velocity_pid.kp = (int32_t)(((int64_t)vel_kp_int << FIXED_POINT_SHIFT) / 100);
+        turn_velocity_pid.ki = (int32_t)(((int64_t)vel_ki_int << FIXED_POINT_SHIFT) / 100);
+        turn_velocity_pid.kd = (int32_t)(((int64_t)vel_kd_int << FIXED_POINT_SHIFT) / 100);
+        UNERBUS_WriteByte(aBus, CMD_ACK);
+        length = UNERBUS_CMD_ID_SIZE + UNERBUS_ACK_SIZE;
+        break;
+    case CMD_GET_TURN_VELOCITY_PID_GAINS:
+        uint8_t vel_pid_buffer[UNERBUS_TURN_VELOCITY_PID_GAINS_SIZE];
+        vel_kp_int = (uint16_t)(((int64_t)turn_velocity_pid.kp * 100) >> FIXED_POINT_SHIFT);
+        vel_ki_int = (uint16_t)(((int64_t)turn_velocity_pid.ki * 100) >> FIXED_POINT_SHIFT);
+        vel_kd_int = (uint16_t)(((int64_t)turn_velocity_pid.kd * 100) >> FIXED_POINT_SHIFT);
+        vel_pid_buffer[0] = (uint8_t)(vel_kp_int & 0xFF);
+        vel_pid_buffer[1] = (uint8_t)((vel_kp_int >> 8) & 0xFF);
+        vel_pid_buffer[2] = (uint8_t)(vel_ki_int & 0xFF);
+        vel_pid_buffer[3] = (uint8_t)((vel_ki_int >> 8) & 0xFF);
+        vel_pid_buffer[4] = (uint8_t)(vel_kd_int & 0xFF);
+        vel_pid_buffer[5] = (uint8_t)((vel_kd_int >> 8) & 0xFF);
+        UNERBUS_Write(aBus, vel_pid_buffer, UNERBUS_TURN_VELOCITY_PID_GAINS_SIZE);
+        length = UNERBUS_CMD_ID_SIZE + UNERBUS_TURN_VELOCITY_PID_GAINS_SIZE;
+        break;
+    case CMD_SET_TURN_TARGET_DPS:
+        turn_target_dps = UNERBUS_GetUInt16(aBus);
+        UNERBUS_WriteByte(aBus, CMD_ACK);
+        length = UNERBUS_CMD_ID_SIZE + UNERBUS_ACK_SIZE;
+        break;
+    case CMD_GET_TURN_TARGET_DPS:
+        uint8_t dps_buffer[UNERBUS_TURN_TARGET_DPS_SIZE];
+        dps_buffer[0] = (uint8_t)(turn_target_dps & 0xFF);
+        dps_buffer[1] = (uint8_t)((turn_target_dps >> 8) & 0xFF);
+        UNERBUS_Write(aBus, dps_buffer, UNERBUS_TURN_TARGET_DPS_SIZE);
+        length = UNERBUS_CMD_ID_SIZE + UNERBUS_TURN_TARGET_DPS_SIZE;
+        break;
+    case CMD_GET_DELAY_TICKS:
+        uint8_t delays_buffer[UNERBUS_DELAY_TICKS_SIZE];
+
+        delays_buffer[0] = wall_fade_ticks;
+        UNERBUS_Write(aBus, delays_buffer, UNERBUS_DELAY_TICKS_SIZE);
+        length = UNERBUS_CMD_ID_SIZE + UNERBUS_DELAY_TICKS_SIZE;
+        break;
+    case CMD_SET_DELAY_TICKS:
+        wall_fade_ticks = UNERBUS_GetUInt8(aBus);
         UNERBUS_WriteByte(aBus, CMD_ACK);
         length = UNERBUS_CMD_ID_SIZE + UNERBUS_ACK_SIZE;
         break;
@@ -1300,6 +1362,15 @@ void App_Core_Init(void)
              FLOAT_TO_FIXED(TURN_PID_KD_DEFAULT));
     PID_Set_Output_Limits(&turn_pid, INT_TO_FIXED(-turn_max_pwm), INT_TO_FIXED(turn_max_pwm));
 
+    /* --- NUEVO: INICIALIZACIÓN DEL PID DE VELOCIDAD DE GIRO --- */
+    PID_Init(&turn_velocity_pid,
+             FLOAT_TO_FIXED(TURN_VELOCITY_PID_KP_DEFAULT),
+             FLOAT_TO_FIXED(TURN_VELOCITY_PID_KI_DEFAULT),
+             FLOAT_TO_FIXED(TURN_VELOCITY_PID_KD_DEFAULT));
+    // La salida de este PID ES la potencia del motor, así que sus límites son los límites de PWM.
+    PID_Set_Output_Limits(&turn_velocity_pid, INT_TO_FIXED(-turn_max_pwm), INT_TO_FIXED(turn_max_pwm));
+    PID_Set_Setpoint(&turn_velocity_pid, turn_target_dps); // Establecer el setpoint inicial
+
     srand(1); // Inicializa la semilla para rand()
 
     /* Buttons*/
@@ -1621,7 +1692,7 @@ static void Handle_Centering(void)
     {
 
         wall_fade_counter++;
-        if (wall_fade_counter >= WALL_FADE_TICKS)
+        if (wall_fade_counter >= wall_fade_ticks)
         {
             wall_fade_counter = 0;
             Set_Robot_State(STATE_STRAIGHT_DRIVE);
@@ -1730,7 +1801,7 @@ static void Handle_Straight_Drive(void)
         if (!left_wall_detected || !right_wall_detected)
         {
             wall_fade_counter++;
-            if (wall_fade_counter >= WALL_FADE_TICKS)
+            if (wall_fade_counter >= wall_fade_ticks)
             {
                 wall_fade_counter = 0;
                 // Handle_Deciding();
@@ -1767,11 +1838,15 @@ static void Handle_Deciding(void)
     {
         Set_Robot_State(STATE_SMOOTH_TURN_LEFT); // Prioridad a la izquierda
         current_yaw_fixed = 0;
+        PID_Reset(&turn_velocity_pid);
+        PID_Set_Setpoint(&turn_velocity_pid, turn_target_dps); // Valores positivos de gz para giro a la izquierda
     }
     else if (!right_wall_detected)
     {
         Set_Robot_State(STATE_SMOOTH_TURN_RIGHT);
         current_yaw_fixed = 0;
+        PID_Reset(&turn_velocity_pid);
+        PID_Set_Setpoint(&turn_velocity_pid, -turn_target_dps); // Valores negativos de gz para giro a la derecha
     }
     else
     {
@@ -1981,21 +2056,14 @@ static void Handle_Smooth_Turn(void)
     if (robot_state == STATE_SMOOTH_TURN_LEFT)
     {
         dist_diagonal_left_mm = (uint16_t)ADC_To_Distance_mm((uint16_t)Get_Filtered_ADC_Value(SENSOR_DIAGONAL_LEFT_CH));
-        dist_left_lat_mm = (uint16_t)ADC_To_Distance_mm((uint16_t)Get_Filtered_ADC_Value(SENSOR_LEFT_LAT_CH));
-        wall_detected = (dist_left_lat_mm < wall_threshold_mm_side && dist_diagonal_left_mm < wall_threshold_mm_diagonal);
+        wall_detected = (dist_diagonal_left_mm < after_turn_wall_threshold_mm);
         Set_Motor_Speeds(faster_motor_smooth_turn_speed, slower_motor_smooth_turn_speed);
     }
     else if (robot_state == STATE_SMOOTH_TURN_RIGHT)
     {
         dist_diagonal_right_mm = (uint16_t)ADC_To_Distance_mm((uint16_t)Get_Filtered_ADC_Value(SENSOR_DIAGONAL_RIGHT_CH));
-        dist_right_lat_mm = (uint16_t)ADC_To_Distance_mm((uint16_t)Get_Filtered_ADC_Value(SENSOR_RIGHT_LAT_CH));
-        wall_detected = (dist_right_lat_mm < wall_threshold_mm_side && dist_diagonal_right_mm < wall_threshold_mm_diagonal);
+        wall_detected = (dist_diagonal_right_mm < after_turn_wall_threshold_mm);
         Set_Motor_Speeds(slower_motor_smooth_turn_speed, faster_motor_smooth_turn_speed);
-    }
-
-    if (abs(FIXED_TO_INT(current_yaw_fixed)) < 75)
-    {
-        wall_detected = false; // No considerar paredes si el giro es pequeño
     }
 
     if (!wall_detected)
@@ -2005,14 +2073,38 @@ static void Handle_Smooth_Turn(void)
         wall_detected = (dist_front_left_mm < (wall_threshold_mm_front / 2) || dist_front_right_mm < (wall_threshold_mm_front / 2));
     }
 
-    if (abs(FIXED_TO_INT(current_yaw_fixed)) >= (90 - TURN_COMPLETION_DEAD_ZONE) || wall_detected)
+    // abs(FIXED_TO_INT(current_yaw_fixed)) >= (90 - TURN_COMPLETION_DEAD_ZONE)
+    if (wall_detected)
     {
-        Set_Motor_Speeds(0, 0);
-        Set_Robot_State(STATE_CENTERING);
-        PID_Reset(&centering_pid);
-        kick_start_active = true;
-        motion_confirm_counter = 0;
+        wall_fade_counter++;
+        if (wall_fade_counter >= wall_fade_ticks)
+        {
+            Set_Motor_Speeds(0, 0);
+            Set_Robot_State(STATE_CENTERING);
+            PID_Reset(&centering_pid);
+            kick_start_active = true;
+            motion_confirm_counter = 0;
+            return;
+        }
     }
+    else
+    {
+        wall_fade_counter = 0; // Resetear contador si no hay pared detectada
+    }
+
+    int16_t gz;
+    MPU6050_GetCalibratedData(&hmpu, NULL, NULL, NULL, NULL, NULL, &gz);
+
+    int32_t angular_velocity_fixed = FIXED_DIV(INT_TO_FIXED(gz), GYRO_SENSITIVITY);
+    int16_t angular_velocity_dps = (int16_t)FIXED_TO_INT(angular_velocity_fixed);
+
+    int32_t pid_output_fixed = PID_Update(&turn_velocity_pid, angular_velocity_dps, 10);
+    int16_t correction = (int16_t)FIXED_TO_INT(pid_output_fixed);
+
+    int16_t right_speed = slower_motor_smooth_turn_speed + correction;
+    int16_t left_speed = slower_motor_smooth_turn_speed - correction;
+
+    Set_Motor_Speeds(right_speed, left_speed);
 }
 
 static void Modes_State_Machine(void)
