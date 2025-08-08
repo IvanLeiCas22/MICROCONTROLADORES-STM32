@@ -102,7 +102,7 @@ uint16_t braking_max_pwm_offset = BRAKING_MAX_SPEED_DEFAULT; // PWM máximo de f
 uint16_t braking_min_speed = BRAKING_MIN_SPEED_DEFAULT;
 uint16_t braking_dead_zone = BRAKING_DEAD_ZONE_DEFAULT;
 
-bool left_wall_detected = false, right_wall_detected = false, front_wall_detected = false;
+bool left_wall_detected = false, right_wall_detected = false, front_wall_detected = false, left_diagonal_wall_detected = false, right_diagonal_wall_detected = false;
 uint16_t dist_diagonal_left_mm = 0;
 uint16_t dist_diagonal_right_mm = 0;
 uint16_t dist_front_left_mm = 0;
@@ -167,6 +167,7 @@ static void Modes_State_Machine(void);
 //==============================================================================
 void App_Core_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 {
+    static uint8_t MPU_READ_TICKER = MPU_READ_PERIOD_COUNT;
     if (htim->Instance == TIM1)
     {
         time_10ms--;
@@ -176,6 +177,13 @@ void App_Core_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
             time_10ms = TIME_10MS_PERIOD_COUNT;
         }
         HAL_ADC_Start_DMA(&hadc1, (uint32_t *)&buf_adc[adc_buf_write_idx], ADC_CHANNELS);
+
+        MPU_READ_TICKER--;
+        if (!MPU_READ_TICKER)
+        {
+            MPU_READ_TICKER = MPU_READ_PERIOD_COUNT;
+            MPU_READ_REQUEST = true; // Indicar que se debe leer el MPU
+        }
     }
 }
 
@@ -917,7 +925,6 @@ void Do10ms()
     if (time_100ms)
         time_100ms--;
 
-    MPU_READ_REQUEST = true;
     Update_Yaw();
 
     ESP01_Timeout10ms();
@@ -1679,6 +1686,7 @@ static int32_t Get_Filtered_ADC_Value(uint8_t channel)
 
 static void Handle_Navigating(void)
 {
+    // Lectura de sensores
     dist_diagonal_left_mm = (uint16_t)ADC_To_Distance_mm((uint16_t)Get_Filtered_ADC_Value(SENSOR_DIAGONAL_LEFT_CH));
     dist_diagonal_right_mm = (uint16_t)ADC_To_Distance_mm((uint16_t)Get_Filtered_ADC_Value(SENSOR_DIAGONAL_RIGHT_CH));
     dist_front_left_mm = (uint16_t)ADC_To_Distance_mm((uint16_t)Get_Filtered_ADC_Value(SENSOR_FRONT_LEFT_CH));
@@ -1687,29 +1695,43 @@ static void Handle_Navigating(void)
     dist_right_lat_mm = (uint16_t)ADC_To_Distance_mm((uint16_t)Get_Filtered_ADC_Value(SENSOR_RIGHT_LAT_CH));
     uint16_t front_avg_mm = (uint16_t)((dist_front_left_mm + dist_front_right_mm) / 2);
 
-    left_wall_detected = dist_diagonal_left_mm < wall_threshold_mm_diagonal;
-    right_wall_detected = dist_diagonal_right_mm < wall_threshold_mm_diagonal;
-    static uint8_t wall_faded = 0;
-    if (!left_wall_detected || !right_wall_detected)
+    // Detección de paredes
+    left_diagonal_wall_detected = dist_diagonal_left_mm < wall_threshold_mm_diagonal;
+    right_diagonal_wall_detected = dist_diagonal_right_mm < wall_threshold_mm_diagonal;
+    left_wall_detected = dist_left_lat_mm < wall_threshold_mm_side;
+    right_wall_detected = dist_right_lat_mm < wall_threshold_mm_side;
+    front_wall_detected = front_avg_mm < wall_threshold_mm_front;
+
+    if (front_avg_mm < wall_threshold_mm_braking_start)
+    {
+        Set_Motor_Speeds(0, 0);
+        return;
+    }
+
+    static uint8_t wall_diagonal_faded = 0;
+
+    if (!left_diagonal_wall_detected || !right_diagonal_wall_detected)
     {
         wall_fade_counter++;
         if (wall_fade_counter >= wall_fade_ticks)
         {
-            if (!left_wall_detected && !right_wall_detected)
+            if (!left_diagonal_wall_detected && !right_diagonal_wall_detected)
             {
                 wall_fade_counter = 0;
+                wall_diagonal_faded = NO_WALL_FADED;
                 Set_Robot_State(STATE_STRAIGHT_DRIVE);
                 PID_Reset(&centering_pid);
                 PID_Set_Setpoint(&centering_pid, FIXED_TO_INT(current_yaw_fixed));
+                Handle_Straight_Drive();
                 return;
             }
-            else if (!left_wall_detected)
+            else if (!left_diagonal_wall_detected)
             {
-                wall_faded = LEFT_WALL_FADED;
+                wall_diagonal_faded = LEFT_WALL_FADED;
             }
             else
             {
-                wall_faded = RIGHT_WALL_FADED;
+                wall_diagonal_faded = RIGHT_WALL_FADED;
             }
         }
     }
@@ -1718,32 +1740,27 @@ static void Handle_Navigating(void)
         wall_fade_counter = 0; // Resetear contador si hay paredes detectadas
     }
 
-    front_wall_detected = front_avg_mm < wall_threshold_mm_braking_start;
-    if (front_wall_detected)
+    if (wall_diagonal_faded)
     {
-        Set_Motor_Speeds(0, 0);
-        Set_Robot_State(STATE_BRAKING);
-        PID_Reset(&braking_pid);
-        return;
-    }
-
-    front_wall_detected = front_avg_mm < wall_threshold_mm_front;
-    if (wall_faded)
-    {
-        if (wall_faded == LEFT_WALL_FADED)
+        if (wall_diagonal_faded == LEFT_WALL_FADED)
         {
-            if (left_wall_detected)
+            if ((left_diagonal_wall_detected || front_wall_detected) && !left_wall_detected)
             {
+                Handle_Deciding();
+                wall_diagonal_faded = NO_WALL_FADED;
                 wall_fade_counter = 0;
-                Set_Robot_State(STATE_STRAIGHT_DRIVE);
-                PID_Reset(&centering_pid);
-                PID_Set_Setpoint(&centering_pid, FIXED_TO_INT(current_yaw_fixed));
                 return;
             }
         }
         else
         {
-            // Lógica para el desvanecimiento de la pared derecha
+            if ((right_diagonal_wall_detected || front_wall_detected) && !right_wall_detected)
+            {
+                Handle_Deciding();
+                wall_diagonal_faded = NO_WALL_FADED;
+                wall_fade_counter = 0;
+                return;
+            }
         }
     }
 
@@ -1767,39 +1784,29 @@ static void Handle_Navigating(void)
 
     int32_t pid_output_fixed = 0;
 
-    if (dist_left_lat_mm < wall_threshold_mm_side && dist_right_lat_mm < wall_threshold_mm_side)
+    if (left_wall_detected && right_wall_detected)
     {
-        // CASO 1: Ambas paredes.
-        // El "valor medido" es la diferencia. Si es positivo, estamos desviados a la derecha.
         int32_t measured_diff = dist_left_lat_mm - dist_right_lat_mm;
         PID_Set_Setpoint(&centering_pid, 0);
         pid_output_fixed = PID_Update(&centering_pid, measured_diff, 10);
-        // Si measured_diff es positivo (desviado a la derecha), el error (0 - diff) es negativo, la salida PID es negativa.
-        // Necesitamos girar a la IZQUIERDA (correction negativa). La salida ya es correcta.
     }
-    else if (dist_right_lat_mm < wall_threshold_mm_side)
+    else if (right_wall_detected)
     {
-        // CASO 2: Solo pared derecha.
         PID_Set_Setpoint(&centering_pid, wall_target_mm);
         pid_output_fixed = PID_Update(&centering_pid, dist_right_lat_mm, 10);
-        // Si estamos muy cerca (dist < target), el error (target - dist) es positivo, la salida PID es positiva.
-        // Necesitamos girar a la IZQUIERDA (correction negativa). Por tanto, invertimos.
         pid_output_fixed = -pid_output_fixed;
     }
-    else if (dist_left_lat_mm < wall_threshold_mm_side)
+    else if (left_wall_detected)
     {
-        // CASO 3: Solo pared izquierda.
         PID_Set_Setpoint(&centering_pid, wall_target_mm);
         pid_output_fixed = PID_Update(&centering_pid, dist_left_lat_mm, 10);
-        // Si estamos muy cerca (dist < target), el error (target - dist) es positivo, la salida PID es positiva.
-        // Necesitamos girar a la DERECHA (correction positiva). La salida ya es correcta.
     }
     else
     {
         // CASO 4: Sin paredes.
         return;
     }
-    // 4. Aplicar corrección a los motores
+
     int16_t correction = (int16_t)FIXED_TO_INT(pid_output_fixed);
     Set_Motor_Speeds(current_right_base_speed - correction, current_left_base_speed + correction);
 }

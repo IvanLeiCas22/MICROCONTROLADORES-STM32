@@ -160,6 +160,13 @@ typedef enum
     STATE_TURN_AROUND
 } RobotStateTypeDef;
 
+typedef enum
+{
+    LEFT_WALL_FADED = 1,
+    RIGHT_WALL_FADED = 2,
+    NO_WALL_FADED = 0
+} WallFadeTypesTypeDef;
+
 //==============================================================================
 // DEFINICIONES Y MACROS
 //==============================================================================
@@ -206,6 +213,7 @@ extern uint16_t pwm_max_value;
 #define TIME_10MS_PERIOD_COUNT 40
 #define TIME_100MS_PEDIOD_COUNT 10
 #define ALIVE_UDP_PERIOD_COUNT 50
+#define MPU_READ_PERIOD_COUNT 12 // 3ms
 
 /* Communication */
 #define IP_ADDRESS_STRING_LENGTH 16
@@ -315,8 +323,6 @@ extern uint16_t pwm_max_value;
 #define WALL_FOLLOW_TARGET_MM 50                    // Distancia (mm) objetivo para el seguimiento de pared.
 #define WALL_BRAKING_TARGET_MM 20                   // Distancia (mm) objetivo para terminar el frenado.
 #define WALL_FADE_TICKS_DEFAULT 2                   // Ticks para desvanecer la detección de pared
-#define LEFT_WALL_FADED 1
-#define RIGHT_WALL_FADED 2
 
 /* --- Cruise Control --- */
 #define MOTOR_CRUISE_SPEED_DEFAULT 2600      // Velocidad PWM para navegación en rectas
