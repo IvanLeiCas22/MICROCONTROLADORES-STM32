@@ -147,15 +147,17 @@ typedef union
 typedef enum
 {
     STATE_IDLE,
-    STATE_CENTERING,
+    STATE_NAVIGATING,
     STATE_BRAKING,
     STATE_DECIDING,
     STATE_TURNING_LEFT,
     STATE_TURNING_RIGHT,
     STATE_SMOOTH_TURN_LEFT,
     STATE_SMOOTH_TURN_RIGHT,
-    STATE_TURN_AROUND,
-    STATE_STRAIGHT_DRIVE
+    STATE_STRAIGHT_DRIVE,
+    STATE_LEFT_WALL_FADE,
+    STATE_RIGHT_WALL_FADE,
+    STATE_TURN_AROUND
 } RobotStateTypeDef;
 
 //==============================================================================
@@ -193,7 +195,7 @@ extern SystemFlagTypeDef flags0;
 #define ADC_BUFFER_SIZE 48
 #define ADC_CHANNELS 8
 #define ADC_DATA_BYTES (ADC_CHANNELS * 2)
-#define ADC_MOVING_AVERAGE_SAMPLES 40 // Número de muestras a promediar (10ms / 250us)
+#define ADC_MOVING_AVERAGE_SAMPLES 20 // Número de muestras a promediar (10ms / 250us)
 
 /* PWM */
 #define PWM_CHANNELS 4
@@ -306,12 +308,15 @@ extern uint16_t pwm_max_value;
 #define SENSOR_LEFT_LAT_CH 6
 #define SENSOR_FLOOR_REAR_CH 7
 
-#define WALL_PRESENCE_THRESHOLD_MM_SIDE 100     // Distancia (mm) para detectar una pared lateral.
-#define WALL_PRESENCE_THRESHOLD_MM_DIAGONAL 140 // Distancia (mm) para detectar una pared diagonal derecha.
-#define WALL_PRESENCE_THRESHOLD_MM_FRONT 70     // Distancia (mm) para detectar una pared frontal.
-#define WALL_FOLLOW_TARGET_MM 50                // Distancia (mm) objetivo para el seguimiento de pared.
-#define WALL_BRAKING_TARGET_MM 20               // Distancia (mm) objetivo para terminar el frenado.
-#define WALL_FADE_TICKS_DEFAULT 2               // Ticks para desvanecer la detección de pared
+#define WALL_PRESENCE_THRESHOLD_MM_SIDE 100         // Distancia (mm) para detectar una pared lateral.
+#define WALL_PRESENCE_THRESHOLD_MM_DIAGONAL 140     // Distancia (mm) para detectar una pared diagonal derecha.
+#define WALL_PRESENCE_THRESHOLD_MM_FRONT 70         // Distancia (mm) para detectar una pared frontal.
+#define WALL_PRESENCE_THRESHOLD_MM_BRAKING_START 40 // Distancia (mm) para detectar una pared y comenzar el frenado.
+#define WALL_FOLLOW_TARGET_MM 50                    // Distancia (mm) objetivo para el seguimiento de pared.
+#define WALL_BRAKING_TARGET_MM 20                   // Distancia (mm) objetivo para terminar el frenado.
+#define WALL_FADE_TICKS_DEFAULT 2                   // Ticks para desvanecer la detección de pared
+#define LEFT_WALL_FADED 1
+#define RIGHT_WALL_FADED 2
 
 /* --- Cruise Control --- */
 #define MOTOR_CRUISE_SPEED_DEFAULT 2600      // Velocidad PWM para navegación en rectas

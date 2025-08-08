@@ -87,6 +87,7 @@ uint16_t left_motor_base_speed = 4550;          // Velocidad base motor izquierd
 uint16_t faster_motor_smooth_turn_speed = 6000; // Velocidad del motor más rápido en giro suave
 uint16_t slower_motor_smooth_turn_speed = 2500; // Velocidad del motor más lento en giro suave
 uint16_t wall_threshold_mm_front = 70;          // Umbral en mm para detectar pared frontal
+uint16_t wall_threshold_mm_braking_start = 40;  // Umbral en mm para iniciar el frenado
 uint16_t wall_threshold_mm_diagonal = 130;      // Umbral en mm para detectar pared diagonal
 uint16_t wall_threshold_mm_side = 100;          // Umbral en mm para detectar pared lateral
 uint16_t after_turn_wall_threshold_mm = 80;     // Umbral en mm para pared después de un giro
@@ -147,6 +148,7 @@ static void Update_Gyro_Scaler(void);
 static void Set_Motor_Speeds(int16_t right_speed, int16_t left_speed);
 
 static void Handle_Idle(void);
+static void Handle_Navigating(void);
 static void Handle_Centering(void);
 static void Handle_Braking(void);
 static void Handle_Deciding();
@@ -670,7 +672,7 @@ void DecodeCMD(struct UNERBUSHandle *aBus, uint8_t iStartData)
             // Esto replica el comportamiento del botón físico.
             if (menu_mode == MENU_MODE_FIND_CELLS || menu_mode == MENU_MODE_GO_TO_B)
             {
-                Set_Robot_State(STATE_CENTERING); // Aquí se inicia el movimiento
+                Set_Robot_State(STATE_NAVIGATING); // Aquí se inicia el movimiento
                 kick_start_active = true;
                 motion_confirm_counter = 0;
             }
@@ -1215,15 +1217,15 @@ static void ManageButtonEvents(void)
                 PID_Reset(&centering_pid);
                 PID_Reset(&turn_pid);
                 PID_Reset(&braking_pid);
-                Set_Robot_State((menu_mode == MENU_MODE_FIND_CELLS) ? STATE_CENTERING : STATE_IDLE);
-                if (robot_state == STATE_CENTERING)
+                Set_Robot_State((menu_mode == MENU_MODE_FIND_CELLS) ? STATE_NAVIGATING : STATE_IDLE);
+                if (robot_state == STATE_NAVIGATING)
                 {
                     kick_start_active = true;
                     motion_confirm_counter = 0;
                 }
                 if (menu_mode == MENU_MODE_DRIVE_STRAIGHT)
                 {
-                    Set_Robot_State(STATE_STRAIGHT_DRIVE);
+                    Set_Robot_State(STATE_LEFT_WALL_FADE);
                     PID_Set_Setpoint(&centering_pid, FIXED_TO_INT(current_yaw_fixed));
                 }
                 break;
@@ -1337,6 +1339,7 @@ void App_Core_Init(void)
     wall_threshold_mm_front = WALL_PRESENCE_THRESHOLD_MM_FRONT;
     wall_threshold_mm_diagonal = WALL_PRESENCE_THRESHOLD_MM_DIAGONAL;
     wall_threshold_mm_side = WALL_PRESENCE_THRESHOLD_MM_SIDE;
+    wall_threshold_mm_braking_start = WALL_PRESENCE_THRESHOLD_MM_BRAKING_START;
     wall_target_mm = WALL_FOLLOW_TARGET_MM;
     wall_braking_target_mm = WALL_BRAKING_TARGET_MM;
 
@@ -1450,7 +1453,7 @@ static void Update_Yaw(void)
  */
 void Turn_Start(int16_t angle_degrees)
 {
-    if ((robot_state == STATE_CENTERING || robot_state == STATE_DECIDING) ||
+    if ((robot_state == STATE_NAVIGATING || robot_state == STATE_DECIDING) ||
         (robot_state == STATE_IDLE && menu_mode == MENU_MODE_MANUAL_CONTROL))
     {
         PID_Reset(&turn_pid);
@@ -1501,7 +1504,7 @@ static void Manage_Turn(void)
         }
         else
         {
-            Set_Robot_State(STATE_CENTERING);
+            Set_Robot_State(STATE_NAVIGATING);
             PID_Reset(&centering_pid);
             PID_Reset(&braking_pid);
             kick_start_active = true;
@@ -1674,7 +1677,7 @@ static int32_t Get_Filtered_ADC_Value(uint8_t channel)
     return sum / ADC_MOVING_AVERAGE_SAMPLES;
 }
 
-static void Handle_Centering(void)
+static void Handle_Navigating(void)
 {
     dist_diagonal_left_mm = (uint16_t)ADC_To_Distance_mm((uint16_t)Get_Filtered_ADC_Value(SENSOR_DIAGONAL_LEFT_CH));
     dist_diagonal_right_mm = (uint16_t)ADC_To_Distance_mm((uint16_t)Get_Filtered_ADC_Value(SENSOR_DIAGONAL_RIGHT_CH));
@@ -1682,23 +1685,32 @@ static void Handle_Centering(void)
     dist_front_right_mm = (uint16_t)ADC_To_Distance_mm((uint16_t)Get_Filtered_ADC_Value(SENSOR_FRONT_RIGHT_CH));
     dist_left_lat_mm = (uint16_t)ADC_To_Distance_mm((uint16_t)Get_Filtered_ADC_Value(SENSOR_LEFT_LAT_CH));
     dist_right_lat_mm = (uint16_t)ADC_To_Distance_mm((uint16_t)Get_Filtered_ADC_Value(SENSOR_RIGHT_LAT_CH));
+    uint16_t front_avg_mm = (uint16_t)((dist_front_left_mm + dist_front_right_mm) / 2);
 
-    // 2. Comprobar sensores diagonales
     left_wall_detected = dist_diagonal_left_mm < wall_threshold_mm_diagonal;
     right_wall_detected = dist_diagonal_right_mm < wall_threshold_mm_diagonal;
-    front_wall_detected = dist_front_left_mm < wall_threshold_mm_front || dist_front_right_mm < wall_threshold_mm_front;
-
+    static uint8_t wall_faded = 0;
     if (!left_wall_detected || !right_wall_detected)
     {
-
         wall_fade_counter++;
         if (wall_fade_counter >= wall_fade_ticks)
         {
-            wall_fade_counter = 0;
-            Set_Robot_State(STATE_STRAIGHT_DRIVE);
-            PID_Reset(&centering_pid);
-            PID_Set_Setpoint(&centering_pid, FIXED_TO_INT(current_yaw_fixed));
-            return;
+            if (!left_wall_detected && !right_wall_detected)
+            {
+                wall_fade_counter = 0;
+                Set_Robot_State(STATE_STRAIGHT_DRIVE);
+                PID_Reset(&centering_pid);
+                PID_Set_Setpoint(&centering_pid, FIXED_TO_INT(current_yaw_fixed));
+                return;
+            }
+            else if (!left_wall_detected)
+            {
+                wall_faded = LEFT_WALL_FADED;
+            }
+            else
+            {
+                wall_faded = RIGHT_WALL_FADED;
+            }
         }
     }
     else
@@ -1706,12 +1718,33 @@ static void Handle_Centering(void)
         wall_fade_counter = 0; // Resetear contador si hay paredes detectadas
     }
 
+    front_wall_detected = front_avg_mm < wall_threshold_mm_braking_start;
     if (front_wall_detected)
     {
         Set_Motor_Speeds(0, 0);
         Set_Robot_State(STATE_BRAKING);
         PID_Reset(&braking_pid);
         return;
+    }
+
+    front_wall_detected = front_avg_mm < wall_threshold_mm_front;
+    if (wall_faded)
+    {
+        if (wall_faded == LEFT_WALL_FADED)
+        {
+            if (left_wall_detected)
+            {
+                wall_fade_counter = 0;
+                Set_Robot_State(STATE_STRAIGHT_DRIVE);
+                PID_Reset(&centering_pid);
+                PID_Set_Setpoint(&centering_pid, FIXED_TO_INT(current_yaw_fixed));
+                return;
+            }
+        }
+        else
+        {
+            // Lógica para el desvanecimiento de la pared derecha
+        }
     }
 
     // (Lógica de kick-start)
@@ -1781,7 +1814,7 @@ static void Handle_Straight_Drive(void)
     {
         dist_front_left_mm = (uint16_t)ADC_To_Distance_mm((uint16_t)Get_Filtered_ADC_Value(SENSOR_FRONT_LEFT_CH));
         dist_front_right_mm = (uint16_t)ADC_To_Distance_mm((uint16_t)Get_Filtered_ADC_Value(SENSOR_FRONT_RIGHT_CH));
-        front_wall_detected = (dist_front_left_mm < wall_threshold_mm_front || dist_front_right_mm < wall_threshold_mm_front);
+        front_wall_detected = (dist_front_left_mm < wall_threshold_mm_braking_start || dist_front_right_mm < wall_threshold_mm_braking_start);
         if (front_wall_detected)
         {
             Set_Motor_Speeds(0, 0);
@@ -1793,12 +1826,22 @@ static void Handle_Straight_Drive(void)
     else
     {
         // En otros modos, no se detiene por obstáculos frontales.
-        dist_left_lat_mm = (uint16_t)ADC_To_Distance_mm((uint16_t)Get_Filtered_ADC_Value(SENSOR_LEFT_LAT_CH));
-        dist_right_lat_mm = (uint16_t)ADC_To_Distance_mm((uint16_t)Get_Filtered_ADC_Value(SENSOR_RIGHT_LAT_CH));
-        left_wall_detected = (dist_left_lat_mm < wall_threshold_mm_side);
-        right_wall_detected = (dist_right_lat_mm < wall_threshold_mm_side);
-
-        if (!left_wall_detected || !right_wall_detected)
+        dist_front_left_mm = (uint16_t)ADC_To_Distance_mm((uint16_t)Get_Filtered_ADC_Value(SENSOR_FRONT_LEFT_CH));
+        dist_front_right_mm = (uint16_t)ADC_To_Distance_mm((uint16_t)Get_Filtered_ADC_Value(SENSOR_FRONT_RIGHT_CH));
+        front_wall_detected = (dist_front_left_mm < wall_threshold_mm_front || dist_front_right_mm < wall_threshold_mm_front);
+        if (robot_state == STATE_LEFT_WALL_FADE)
+        {
+            dist_diagonal_left_mm = (uint16_t)ADC_To_Distance_mm((uint16_t)Get_Filtered_ADC_Value(SENSOR_DIAGONAL_LEFT_CH));
+            left_wall_detected = (dist_diagonal_left_mm < wall_threshold_mm_diagonal);
+            right_wall_detected = false;
+        }
+        else if (robot_state == STATE_RIGHT_WALL_FADE)
+        {
+            dist_diagonal_right_mm = (uint16_t)ADC_To_Distance_mm((uint16_t)Get_Filtered_ADC_Value(SENSOR_DIAGONAL_RIGHT_CH));
+            right_wall_detected = (dist_diagonal_right_mm < wall_threshold_mm_diagonal);
+            left_wall_detected = false;
+        }
+        if (left_wall_detected || right_wall_detected || front_wall_detected)
         {
             wall_fade_counter++;
             if (wall_fade_counter >= wall_fade_ticks)
@@ -1847,6 +1890,13 @@ static void Handle_Deciding(void)
         current_yaw_fixed = 0;
         PID_Reset(&turn_velocity_pid);
         PID_Set_Setpoint(&turn_velocity_pid, -turn_target_dps); // Valores negativos de gz para giro a la derecha
+    }
+    else if (!front_wall_detected)
+    {
+        Set_Robot_State(STATE_STRAIGHT_DRIVE); // Prioridad al frente
+        current_yaw_fixed = 0;
+        PID_Reset(&turn_velocity_pid);
+        PID_Set_Setpoint(&turn_velocity_pid, turn_target_dps); // Valores positivos de gz para giro al frente
     }
     else
     {
@@ -1957,7 +2007,7 @@ static void Update_Display_Content(void)
         const char *robot_state_str = "Stopped";
         switch (robot_state)
         {
-        case STATE_CENTERING:
+        case STATE_NAVIGATING:
             robot_state_str = "Centering...";
             break;
         case STATE_BRAKING:
@@ -2053,34 +2103,36 @@ static int32_t ADC_To_Distance_mm(uint16_t adc_value)
 static void Handle_Smooth_Turn(void)
 {
     bool wall_detected = false; //
+    int16_t base_right, base_left;
     if (robot_state == STATE_SMOOTH_TURN_LEFT)
     {
         dist_diagonal_left_mm = (uint16_t)ADC_To_Distance_mm((uint16_t)Get_Filtered_ADC_Value(SENSOR_DIAGONAL_LEFT_CH));
         wall_detected = (dist_diagonal_left_mm < after_turn_wall_threshold_mm);
-        Set_Motor_Speeds(faster_motor_smooth_turn_speed, slower_motor_smooth_turn_speed);
+        base_right = faster_motor_smooth_turn_speed; // exterior
+        base_left = slower_motor_smooth_turn_speed;  // interior
     }
     else if (robot_state == STATE_SMOOTH_TURN_RIGHT)
     {
         dist_diagonal_right_mm = (uint16_t)ADC_To_Distance_mm((uint16_t)Get_Filtered_ADC_Value(SENSOR_DIAGONAL_RIGHT_CH));
         wall_detected = (dist_diagonal_right_mm < after_turn_wall_threshold_mm);
-        Set_Motor_Speeds(slower_motor_smooth_turn_speed, faster_motor_smooth_turn_speed);
+        base_right = slower_motor_smooth_turn_speed; // interior
+        base_left = faster_motor_smooth_turn_speed;  // exterior
     }
 
     if (!wall_detected)
     {
         dist_front_left_mm = (uint16_t)ADC_To_Distance_mm((uint16_t)Get_Filtered_ADC_Value(SENSOR_FRONT_LEFT_CH));
         dist_front_right_mm = (uint16_t)ADC_To_Distance_mm((uint16_t)Get_Filtered_ADC_Value(SENSOR_FRONT_RIGHT_CH));
-        wall_detected = (dist_front_left_mm < (wall_threshold_mm_front / 2) || dist_front_right_mm < (wall_threshold_mm_front / 2));
+        wall_detected = (dist_front_left_mm < (wall_threshold_mm_braking_start) || dist_front_right_mm < (wall_threshold_mm_braking_start));
     }
 
-    // abs(FIXED_TO_INT(current_yaw_fixed)) >= (90 - TURN_COMPLETION_DEAD_ZONE)
-    if (wall_detected)
+    if (wall_detected || (abs(FIXED_TO_INT(current_yaw_fixed)) >= (85 - TURN_COMPLETION_DEAD_ZONE)))
     {
         wall_fade_counter++;
         if (wall_fade_counter >= wall_fade_ticks)
         {
             Set_Motor_Speeds(0, 0);
-            Set_Robot_State(STATE_CENTERING);
+            Set_Robot_State(STATE_NAVIGATING);
             PID_Reset(&centering_pid);
             kick_start_active = true;
             motion_confirm_counter = 0;
@@ -2101,8 +2153,8 @@ static void Handle_Smooth_Turn(void)
     int32_t pid_output_fixed = PID_Update(&turn_velocity_pid, angular_velocity_dps, 10);
     int16_t correction = (int16_t)FIXED_TO_INT(pid_output_fixed);
 
-    int16_t right_speed = slower_motor_smooth_turn_speed + correction;
-    int16_t left_speed = slower_motor_smooth_turn_speed - correction;
+    int16_t right_speed = base_right + correction;
+    int16_t left_speed = base_left - correction;
 
     Set_Motor_Speeds(right_speed, left_speed);
 }
@@ -2118,8 +2170,8 @@ static void Modes_State_Machine(void)
             // Ejecutar la lógica de resolución de laberintos
             switch (robot_state)
             {
-            case STATE_CENTERING:
-                Handle_Centering();
+            case STATE_NAVIGATING:
+                Handle_Navigating();
                 break;
             case STATE_BRAKING:
                 Handle_Braking();
@@ -2127,7 +2179,8 @@ static void Modes_State_Machine(void)
             case STATE_DECIDING:
                 Handle_Deciding();
                 break;
-            case STATE_STRAIGHT_DRIVE:
+            case STATE_LEFT_WALL_FADE:
+            case STATE_RIGHT_WALL_FADE:
                 Handle_Straight_Drive();
                 break;
             case STATE_TURNING_LEFT:
@@ -2137,6 +2190,7 @@ static void Modes_State_Machine(void)
                 break;
             case STATE_SMOOTH_TURN_LEFT:
             case STATE_SMOOTH_TURN_RIGHT:
+            case STATE_STRAIGHT_DRIVE:
                 Handle_Smooth_Turn();
                 break;
             default:
@@ -2167,7 +2221,7 @@ static void Modes_State_Machine(void)
             case STATE_BRAKING:
                 Handle_Braking();
                 break;
-            case STATE_STRAIGHT_DRIVE:
+            case STATE_LEFT_WALL_FADE:
                 Handle_Straight_Drive();
                 break;
             default:
