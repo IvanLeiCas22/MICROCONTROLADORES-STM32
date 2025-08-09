@@ -116,7 +116,7 @@ static int32_t current_yaw_fixed = 0; // Yaw angle in Q16.16 fixed-point (degree
 static int32_t gyro_z_scaler;         // Factor de escala dinámico para el giroscopio
 
 static volatile RobotStateTypeDef robot_state = STATE_IDLE;
-uint16_t motor_cruise_speed;
+uint16_t motor_kick_start_speed;
 uint16_t accel_motion_threshold;
 uint8_t accel_motion_confirm_ticks;
 static bool kick_start_active = false;
@@ -149,7 +149,6 @@ static void Set_Motor_Speeds(int16_t right_speed, int16_t left_speed);
 
 static void Handle_Idle(void);
 static void Handle_Navigating(void);
-static void Handle_Centering(void);
 static void Handle_Braking(void);
 static void Handle_Deciding();
 static void Manage_Turn(void);
@@ -724,7 +723,7 @@ void DecodeCMD(struct UNERBUSHandle *aBus, uint8_t iStartData)
         length = UNERBUS_CMD_ID_SIZE + UNERBUS_ROBOT_STATUS_SIZE;
         break;
     case CMD_SET_CRUISE_PARAMS:
-        motor_cruise_speed = UNERBUS_GetUInt16(aBus);
+        motor_kick_start_speed = UNERBUS_GetUInt16(aBus);
         accel_motion_threshold = UNERBUS_GetUInt16(aBus);
         // Se recibe como u16 para alinear el paquete, pero se usa como u8.
         accel_motion_confirm_ticks = (uint8_t)UNERBUS_GetUInt16(aBus);
@@ -733,8 +732,8 @@ void DecodeCMD(struct UNERBUSHandle *aBus, uint8_t iStartData)
         break;
     case CMD_GET_CRUISE_PARAMS:
         uint8_t cruise_buffer[UNERBUS_CRUISE_PARAMS_SIZE];
-        cruise_buffer[0] = (uint8_t)(motor_cruise_speed & 0xFF);
-        cruise_buffer[1] = (uint8_t)((motor_cruise_speed >> 8) & 0xFF);
+        cruise_buffer[0] = (uint8_t)(motor_kick_start_speed & 0xFF);
+        cruise_buffer[1] = (uint8_t)((motor_kick_start_speed >> 8) & 0xFF);
         cruise_buffer[2] = (uint8_t)(accel_motion_threshold & 0xFF);
         cruise_buffer[3] = (uint8_t)((accel_motion_threshold >> 8) & 0xFF);
         cruise_buffer[4] = (uint8_t)(accel_motion_confirm_ticks);
@@ -935,14 +934,6 @@ void Do10ms()
 void Do100ms()
 {
     time_100ms = TIME_100MS_PEDIOD_COUNT;
-
-    if (menu_mode == MENU_MODE_MANUAL_CONTROL)
-    {
-        char aux[16];
-        snprintf(aux, sizeof(aux), "Yaw %li", FIXED_TO_INT(current_yaw_fixed));
-        SSD1306_DrawText(&hssd, 0, 50, aux, SSD1306_TEXT_ALIGN_LEFT);
-        Update_Display_Content();
-    }
 
     // --- Lógica de Heartbeat Dinámico ---
     if (temporary_heartbeat_ticks > 0)
@@ -1338,7 +1329,7 @@ void App_Core_Init(void)
     UNERBUS_Init(&unerbus_pc_handle);
 
     /* --- INICIALIZACIÓN DE PARÁMETROS DE CRUCERO --- */
-    motor_cruise_speed = MOTOR_CRUISE_SPEED_DEFAULT;
+    motor_kick_start_speed = MOTOR_KICK_START_SPEED_DEFAULT;
     accel_motion_threshold = ACCEL_MOTION_THRESHOLD_DEFAULT;
     accel_motion_confirm_ticks = ACCEL_MOTION_CONFIRM_TICKS_DEFAULT;
 
@@ -1705,6 +1696,8 @@ static void Handle_Navigating(void)
     if (front_avg_mm < wall_threshold_mm_braking_start)
     {
         Set_Motor_Speeds(0, 0);
+        PID_Reset(&braking_pid);
+        Set_Robot_State(STATE_BRAKING);
         return;
     }
 
@@ -1722,7 +1715,6 @@ static void Handle_Navigating(void)
                 Set_Robot_State(STATE_STRAIGHT_DRIVE);
                 PID_Reset(&centering_pid);
                 PID_Set_Setpoint(&centering_pid, FIXED_TO_INT(current_yaw_fixed));
-                Handle_Straight_Drive();
                 return;
             }
             else if (!left_diagonal_wall_detected)
@@ -1779,24 +1771,24 @@ static void Handle_Navigating(void)
             motion_confirm_counter = 0;
         }
     }
-    uint16_t current_left_base_speed = kick_start_active ? (left_motor_base_speed + motor_cruise_speed) : left_motor_base_speed;
-    uint16_t current_right_base_speed = kick_start_active ? (right_motor_base_speed + motor_cruise_speed) : right_motor_base_speed;
+    uint16_t current_left_base_speed = kick_start_active ? (left_motor_base_speed + motor_kick_start_speed) : left_motor_base_speed;
+    uint16_t current_right_base_speed = kick_start_active ? (right_motor_base_speed + motor_kick_start_speed) : right_motor_base_speed;
 
     int32_t pid_output_fixed = 0;
 
-    if (left_wall_detected && right_wall_detected)
+    if (left_diagonal_wall_detected && right_diagonal_wall_detected)
     {
         int32_t measured_diff = dist_left_lat_mm - dist_right_lat_mm;
         PID_Set_Setpoint(&centering_pid, 0);
         pid_output_fixed = PID_Update(&centering_pid, measured_diff, 10);
     }
-    else if (right_wall_detected)
+    else if (right_diagonal_wall_detected)
     {
         PID_Set_Setpoint(&centering_pid, wall_target_mm);
         pid_output_fixed = PID_Update(&centering_pid, dist_right_lat_mm, 10);
         pid_output_fixed = -pid_output_fixed;
     }
-    else if (left_wall_detected)
+    else if (left_diagonal_wall_detected)
     {
         PID_Set_Setpoint(&centering_pid, wall_target_mm);
         pid_output_fixed = PID_Update(&centering_pid, dist_left_lat_mm, 10);
@@ -1832,35 +1824,20 @@ static void Handle_Straight_Drive(void)
     }
     else
     {
-        // En otros modos, no se detiene por obstáculos frontales.
         dist_front_left_mm = (uint16_t)ADC_To_Distance_mm((uint16_t)Get_Filtered_ADC_Value(SENSOR_FRONT_LEFT_CH));
         dist_front_right_mm = (uint16_t)ADC_To_Distance_mm((uint16_t)Get_Filtered_ADC_Value(SENSOR_FRONT_RIGHT_CH));
-        front_wall_detected = (dist_front_left_mm < wall_threshold_mm_front || dist_front_right_mm < wall_threshold_mm_front);
-        if (robot_state == STATE_LEFT_WALL_FADE)
+        dist_diagonal_left_mm = (uint16_t)ADC_To_Distance_mm((uint16_t)Get_Filtered_ADC_Value(SENSOR_DIAGONAL_LEFT_CH));
+        dist_diagonal_right_mm = (uint16_t)ADC_To_Distance_mm((uint16_t)Get_Filtered_ADC_Value(SENSOR_DIAGONAL_RIGHT_CH));
+        uint16_t front_avg_mm = (uint16_t)((dist_front_left_mm + dist_front_right_mm) / 2);
+
+        front_wall_detected = (front_avg_mm < wall_threshold_mm_front);
+        left_diagonal_wall_detected = (dist_diagonal_left_mm < wall_threshold_mm_diagonal);
+        right_diagonal_wall_detected = (dist_diagonal_right_mm < wall_threshold_mm_diagonal);
+
+        if (left_diagonal_wall_detected || right_diagonal_wall_detected || front_wall_detected)
         {
-            dist_diagonal_left_mm = (uint16_t)ADC_To_Distance_mm((uint16_t)Get_Filtered_ADC_Value(SENSOR_DIAGONAL_LEFT_CH));
-            left_wall_detected = (dist_diagonal_left_mm < wall_threshold_mm_diagonal);
-            right_wall_detected = false;
-        }
-        else if (robot_state == STATE_RIGHT_WALL_FADE)
-        {
-            dist_diagonal_right_mm = (uint16_t)ADC_To_Distance_mm((uint16_t)Get_Filtered_ADC_Value(SENSOR_DIAGONAL_RIGHT_CH));
-            right_wall_detected = (dist_diagonal_right_mm < wall_threshold_mm_diagonal);
-            left_wall_detected = false;
-        }
-        if (left_wall_detected || right_wall_detected || front_wall_detected)
-        {
-            wall_fade_counter++;
-            if (wall_fade_counter >= wall_fade_ticks)
-            {
-                wall_fade_counter = 0;
-                // Handle_Deciding();
-                Set_Robot_State(STATE_DECIDING);
-            }
-        }
-        else
-        {
-            wall_fade_counter = 0; // Resetear contador si ambas paredes están presentes
+            Handle_Deciding();
+            return;
         }
     }
 
@@ -1882,7 +1859,7 @@ static void Handle_Deciding(void)
 
     left_wall_detected = (dist_left_lat_mm < wall_threshold_mm_side);
     right_wall_detected = (dist_right_lat_mm < wall_threshold_mm_side);
-    front_wall_detected = (dist_front_left_mm < wall_threshold_mm_front || dist_front_right_mm < wall_threshold_mm_front);
+    front_wall_detected = ((dist_front_left_mm + dist_front_right_mm) / 2) < wall_threshold_mm_front;
 
     if (!left_wall_detected)
     {
@@ -1900,10 +1877,11 @@ static void Handle_Deciding(void)
     }
     else if (!front_wall_detected)
     {
-        Set_Robot_State(STATE_STRAIGHT_DRIVE); // Prioridad al frente
+        Set_Robot_State(STATE_NAVIGATING);
         current_yaw_fixed = 0;
-        PID_Reset(&turn_velocity_pid);
-        PID_Set_Setpoint(&turn_velocity_pid, turn_target_dps); // Valores positivos de gz para giro al frente
+        PID_Reset(&centering_pid);
+        kick_start_active = true;
+        motion_confirm_counter = 0;
     }
     else
     {
@@ -1958,7 +1936,7 @@ static void Set_Robot_State(RobotStateTypeDef new_state)
     if (robot_state != new_state)
     {
         robot_state = new_state;
-        SSD_UPDATE_REQUEST = true; // Solicitar actualización del display solo si el estado cambia
+        // SSD_UPDATE_REQUEST = true;
     }
 }
 
@@ -1991,49 +1969,49 @@ static void Update_Display_Content(void)
         SSD1306_DrawText(&hssd, 0, 40, text_line4, SSD1306_TEXT_ALIGN_LEFT);
         SSD1306_DrawText(&hssd, 0, 50, text_line5, SSD1306_TEXT_ALIGN_LEFT);
     }
-    else // APP_STATE_RUNNING
-    {
-        const char *current_mode_str = "Unknown";
-        switch (menu_mode)
+    /*     else // APP_STATE_RUNNING
         {
-        case MENU_MODE_IDLE:
-            current_mode_str = "Idle";
-            break;
-        case MENU_MODE_FIND_CELLS:
-            current_mode_str = "Finding Cells";
-            break;
-        case MENU_MODE_GO_TO_B:
-            current_mode_str = "Going A->B";
-            break;
-        case MENU_MODE_MANUAL_CONTROL:
-            current_mode_str = "Manual Control";
-            break;
-        } //
-        snprintf(text_line1, sizeof(text_line1), "Mode: %s", current_mode_str);
+            const char *current_mode_str = "Unknown";
+            switch (menu_mode)
+            {
+            case MENU_MODE_IDLE:
+                current_mode_str = "Idle";
+                break;
+            case MENU_MODE_FIND_CELLS:
+                current_mode_str = "Finding Cells";
+                break;
+            case MENU_MODE_GO_TO_B:
+                current_mode_str = "Going A->B";
+                break;
+            case MENU_MODE_MANUAL_CONTROL:
+                current_mode_str = "Manual Control";
+                break;
+            } //
+            snprintf(text_line1, sizeof(text_line1), "Mode: %s", current_mode_str);
 
-        const char *robot_state_str = "Stopped";
-        switch (robot_state)
-        {
-        case STATE_NAVIGATING:
-            robot_state_str = "Centering...";
-            break;
-        case STATE_BRAKING:
-            robot_state_str = "Braking...";
-            break;
-        case STATE_DECIDING:
-            robot_state_str = "Deciding...";
-            break;
-        case STATE_TURNING_LEFT:
-        case STATE_TURNING_RIGHT:
-        case STATE_TURN_AROUND:
-            robot_state_str = "Turning...";
-            break;
-        }
-        snprintf(text_line2, sizeof(text_line2), "State: %s", robot_state_str);
+            const char *robot_state_str = "Stopped";
+            switch (robot_state)
+            {
+            case STATE_NAVIGATING:
+                robot_state_str = "Centering...";
+                break;
+            case STATE_BRAKING:
+                robot_state_str = "Braking...";
+                break;
+            case STATE_DECIDING:
+                robot_state_str = "Deciding...";
+                break;
+            case STATE_TURNING_LEFT:
+            case STATE_TURNING_RIGHT:
+            case STATE_TURN_AROUND:
+                robot_state_str = "Turning...";
+                break;
+            }
+            snprintf(text_line2, sizeof(text_line2), "State: %s", robot_state_str);
 
-        SSD1306_DrawText(&hssd, 0, 0, text_line1, SSD1306_TEXT_ALIGN_LEFT);
-        SSD1306_DrawText(&hssd, 0, 10, text_line2, SSD1306_TEXT_ALIGN_LEFT);
-    }
+            SSD1306_DrawText(&hssd, 0, 0, text_line1, SSD1306_TEXT_ALIGN_LEFT);
+            SSD1306_DrawText(&hssd, 0, 10, text_line2, SSD1306_TEXT_ALIGN_LEFT);
+        } */
 }
 
 /**
@@ -2110,7 +2088,7 @@ static int32_t ADC_To_Distance_mm(uint16_t adc_value)
 static void Handle_Smooth_Turn(void)
 {
     bool wall_detected = false; //
-    int16_t base_right, base_left;
+    int16_t base_right = 0, base_left = 0;
     if (robot_state == STATE_SMOOTH_TURN_LEFT)
     {
         dist_diagonal_left_mm = (uint16_t)ADC_To_Distance_mm((uint16_t)Get_Filtered_ADC_Value(SENSOR_DIAGONAL_LEFT_CH));
@@ -2133,22 +2111,14 @@ static void Handle_Smooth_Turn(void)
         wall_detected = (dist_front_left_mm < (wall_threshold_mm_braking_start) || dist_front_right_mm < (wall_threshold_mm_braking_start));
     }
 
-    if (wall_detected || (abs(FIXED_TO_INT(current_yaw_fixed)) >= (85 - TURN_COMPLETION_DEAD_ZONE)))
+    if (wall_detected || (abs(FIXED_TO_INT(current_yaw_fixed)) >= (90 - TURN_COMPLETION_DEAD_ZONE)))
     {
-        wall_fade_counter++;
-        if (wall_fade_counter >= wall_fade_ticks)
-        {
-            Set_Motor_Speeds(0, 0);
-            Set_Robot_State(STATE_NAVIGATING);
-            PID_Reset(&centering_pid);
-            kick_start_active = true;
-            motion_confirm_counter = 0;
-            return;
-        }
-    }
-    else
-    {
-        wall_fade_counter = 0; // Resetear contador si no hay pared detectada
+        Set_Motor_Speeds(right_motor_base_speed, left_motor_base_speed);
+        Set_Robot_State(STATE_NAVIGATING);
+        PID_Reset(&centering_pid);
+        kick_start_active = true;
+        motion_confirm_counter = 0;
+        return;
     }
 
     int16_t gz;
@@ -2188,6 +2158,7 @@ static void Modes_State_Machine(void)
                 break;
             case STATE_LEFT_WALL_FADE:
             case STATE_RIGHT_WALL_FADE:
+            case STATE_STRAIGHT_DRIVE:
                 Handle_Straight_Drive();
                 break;
             case STATE_TURNING_LEFT:
@@ -2197,7 +2168,6 @@ static void Modes_State_Machine(void)
                 break;
             case STATE_SMOOTH_TURN_LEFT:
             case STATE_SMOOTH_TURN_RIGHT:
-            case STATE_STRAIGHT_DRIVE:
                 Handle_Smooth_Turn();
                 break;
             default:
