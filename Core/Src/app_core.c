@@ -63,7 +63,11 @@ uint32_t heartbeat_counter, heartbeat_mask;
 uint8_t time_10ms, time_100ms, timeout_alive_udp;
 
 uint16_t buf_adc[ADC_BUFFER_SIZE][ADC_CHANNELS];
-volatile uint8_t adc_buf_write_idx, adc_buf_read_idx;
+volatile uint8_t adc_buf_write_idx = 0;
+static uint32_t adc_running_sum[ADC_CHANNELS] = {0};
+static volatile uint16_t adc_filtered_avg[ADC_CHANNELS] = {0};
+static uint8_t adc_samples_accumulated = 0;
+static volatile uint8_t adc_processed_idx = 0;
 
 static MPU6050_HandleTypeDef hmpu;
 static SSD1306_HandleTypeDef hssd;
@@ -154,6 +158,7 @@ static void Handle_Deciding();
 static void Manage_Turn(void);
 static void Update_Yaw(void);
 void Turn_Start(int16_t angle_degrees);
+static void ADC_Filter_Task(void);
 static int32_t Get_Filtered_ADC_Value(uint8_t channel);
 static void Set_Robot_State(RobotStateTypeDef new_state);
 static void Update_Display_Content(void);
@@ -188,8 +193,7 @@ void App_Core_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 
 void App_Core_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
 {
-    adc_buf_write_idx++;
-    adc_buf_write_idx %= ADC_BUFFER_SIZE;
+    adc_buf_write_idx = (uint8_t)((adc_buf_write_idx + 1) & ADC_BUF_MASK);
 }
 
 void App_Core_UART_RxCpltCallback(UART_HandleTypeDef *huart)
@@ -1277,10 +1281,6 @@ void App_Core_Init(void)
     time_100ms = TIME_100MS_PEDIOD_COUNT;
     timeout_alive_udp = ALIVE_UDP_PERIOD_COUNT;
 
-    /* ADC */
-    adc_buf_write_idx = 0;
-    adc_buf_read_idx = 0;
-
     /* ESP01 */
     esp01_handle.DoCHPD = ESP01_SetChipEnable;
     esp01_handle.WriteByteToBufRX = ESP01_WriteByteToRxBuffer;
@@ -1412,6 +1412,8 @@ void App_Core_Loop(void)
 
     if (!time_100ms)
         Do100ms();
+
+    ADC_Filter_Task();
 
     if (ON10MS)
     {
@@ -1645,34 +1647,60 @@ static void Handle_Idle(void)
 }
 
 /**
- * @brief Calcula el valor promedio de las últimas N muestras de un canal ADC.
- * @param channel El canal del ADC del cual se quiere obtener el valor filtrado.
- * @return El valor promedio (filtrado) de 32 bits.
+ * @brief Procesa las muestras pendientes del ring buffer y actualiza el promedio móvil por canal.
+ *        Ejecutar frecuentemente en el lazo principal.
  */
-static int32_t Get_Filtered_ADC_Value(uint8_t channel)
+static void ADC_Filter_Task(void)
 {
-    uint32_t sum = 0;
-    // El índice de escritura apunta a la siguiente posición vacía,
-    // por lo que empezamos desde la muestra anterior a la actual.
-    uint8_t read_idx = (adc_buf_write_idx == 0) ? (ADC_BUFFER_SIZE - 1) : (adc_buf_write_idx - 1);
-
-    // Iterar hacia atrás N veces para sumar las últimas N muestras
-    for (int i = 0; i < ADC_MOVING_AVERAGE_SAMPLES; i++)
+    // Procesar todas las muestras pendientes entre adc_processed_idx y adc_buf_write_idx
+    while (adc_processed_idx != adc_buf_write_idx)
     {
-        sum += buf_adc[read_idx][channel];
+        uint8_t idx_new = adc_processed_idx;
 
-        // Manejar el búfer circular: si el índice es 0, salta al final
-        if (read_idx == 0)
+        uint8_t window_full = (adc_samples_accumulated >= ADC_MOVING_AVERAGE_SAMPLES);
+        uint8_t idx_old = 0;
+        if (window_full)
         {
-            read_idx = ADC_BUFFER_SIZE - 1;
+            idx_old = (uint8_t)((idx_new - ADC_MOVING_AVERAGE_SAMPLES) & ADC_BUF_MASK);
+        }
+
+        if (!window_full)
+        {
+            uint8_t new_count = (uint8_t)(adc_samples_accumulated + 1);
+            for (uint8_t ch = 0; ch < ADC_CHANNELS; ch++)
+            {
+                uint16_t newv = buf_adc[idx_new][ch];
+                adc_running_sum[ch] += newv;
+                adc_filtered_avg[ch] = (uint16_t)(adc_running_sum[ch] / new_count);
+            }
+            adc_samples_accumulated = new_count;
         }
         else
         {
-            read_idx--;
-        }
-    }
+            for (uint8_t ch = 0; ch < ADC_CHANNELS; ch++)
+            {
+                uint16_t newv = buf_adc[idx_new][ch];
+                uint16_t oldv = buf_adc[idx_old][ch];
 
-    return sum / ADC_MOVING_AVERAGE_SAMPLES;
+                adc_running_sum[ch] -= oldv;
+                adc_running_sum[ch] += newv;
+
+                adc_filtered_avg[ch] = (uint16_t)(adc_running_sum[ch] >> ADC_FILTER_SHIFT);
+            }
+        }
+
+        adc_processed_idx = (uint8_t)((adc_processed_idx + 1) & ADC_BUF_MASK);
+    }
+}
+
+/**
+ * @brief Devuelve el promedio móvil precalculado del canal.
+ */
+static int32_t Get_Filtered_ADC_Value(uint8_t channel)
+{
+    if (channel >= ADC_CHANNELS)
+        return 0;
+    return (int32_t)adc_filtered_avg[channel];
 }
 
 static void Handle_Navigating(void)

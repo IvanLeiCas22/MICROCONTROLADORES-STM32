@@ -199,10 +199,12 @@ extern SystemFlagTypeDef flags0;
 #define MPU_DMA_BUF_GYRO_Z_L 13
 
 /* ADC */
-#define ADC_BUFFER_SIZE 48
+#define ADC_BUFFER_SIZE 32
 #define ADC_CHANNELS 8
 #define ADC_DATA_BYTES (ADC_CHANNELS * 2)
-#define ADC_MOVING_AVERAGE_SAMPLES 20 // Número de muestras a promediar (10ms / 250us)
+#define ADC_MOVING_AVERAGE_SAMPLES 16 // Número de muestras a promediar (10ms / 250us)
+#define ADC_FILTER_SHIFT 4            // Corresponde a log2(16)
+#define ADC_BUF_MASK (ADC_BUFFER_SIZE - 1)
 
 /* PWM */
 #define PWM_CHANNELS 4
