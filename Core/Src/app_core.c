@@ -42,11 +42,27 @@ typedef struct
 static const SensorLutEntry sensor_lut[] = {
     {30, 150}, {65, 140}, {106, 130}, {135, 120}, {169, 110}, {208, 100}, {260, 90}, {337, 80}, {441, 70}, {511, 65}, {590, 60}, {711, 55}, {827, 50}, {1020, 45}, {1305, 40}, {1613, 35}, {2130, 30}, {2870, 25}, {3760, 20}};
 
+enum
+{
+    ADC_LUT_SIZE = (int)(sizeof(sensor_lut) / sizeof(sensor_lut[0]))
+};
+enum
+{
+    ADC_SEG_COUNT = ADC_LUT_SIZE - 1
+};
+typedef struct
+{
+    uint16_t x0;       // Valor ADC de inicio del segmento
+    uint16_t x1;       // Valor ADC de fin del segmento
+    uint16_t y0;       // Distancia en mm correspondiente a x0
+    int32_t slope_q16; // Pendiente (y1 - y0) / (x1 - x0) en formato Q16.16
+} ADC_LutSeg_t;
+
 //==============================================================================
 // VARIABLES GLOBALES DEL MÓDULO
 //==============================================================================
 
-static const uint8_t sensor_lut_size = sizeof(sensor_lut) / sizeof(sensor_lut[0]);
+static ADC_LutSeg_t adc_lut_segs[ADC_SEG_COUNT];
 
 SystemFlagTypeDef flags0;
 uint16_t pwm_max_value = 10000; // Valor máximo del PWM
@@ -159,6 +175,7 @@ static void Manage_Turn(void);
 static void Update_Yaw(void);
 void Turn_Start(int16_t angle_degrees);
 static void ADC_Filter_Task(void);
+static void ADC_LUT_Precompute(void);
 static int32_t Get_Filtered_ADC_Value(uint8_t channel);
 static void Set_Robot_State(RobotStateTypeDef new_state);
 static void Update_Display_Content(void);
@@ -1385,6 +1402,7 @@ void App_Core_Init(void)
     Update_Gyro_Scaler();
     SSD1306_UpdateScreen_DMA(&hssd);
     HAL_Delay(DEVICE_INIT_DELAY_MS);
+    ADC_LUT_Precompute();
 
     /* UART */
     HAL_UART_Receive_IT(&huart1, &data_rx_esp01, 1);
@@ -1657,34 +1675,40 @@ static void ADC_Filter_Task(void)
     while (adc_processed_idx != adc_buf_write_idx)
     {
         uint8_t idx_new = adc_processed_idx;
-
-        uint8_t window_full = (adc_samples_accumulated >= ADC_MOVING_AVERAGE_SAMPLES);
-        uint8_t idx_old = 0;
-        if (window_full)
-        {
-            idx_old = (uint8_t)((idx_new - ADC_MOVING_AVERAGE_SAMPLES) & ADC_BUF_MASK);
-        }
+        bool window_full = (adc_samples_accumulated >= ADC_MOVING_AVERAGE_SAMPLES);
 
         if (!window_full)
         {
-            uint8_t new_count = (uint8_t)(adc_samples_accumulated + 1);
+            // La ventana aún no está llena, solo agregamos y promediamos sobre el total actual
+            adc_samples_accumulated++;
             for (uint8_t ch = 0; ch < ADC_CHANNELS; ch++)
             {
-                uint16_t newv = buf_adc[idx_new][ch];
-                adc_running_sum[ch] += newv;
-                adc_filtered_avg[ch] = (uint16_t)(adc_running_sum[ch] / new_count);
+                adc_running_sum[ch] += buf_adc[idx_new][ch];
+                adc_filtered_avg[ch] = (uint16_t)(adc_running_sum[ch] / adc_samples_accumulated);
             }
-            adc_samples_accumulated = new_count;
         }
-        else
+        else // La ventana está llena, usamos el método eficiente de suma/resta
         {
+            uint8_t idx_old = (uint8_t)((idx_new - ADC_MOVING_AVERAGE_SAMPLES) & ADC_BUF_MASK);
             for (uint8_t ch = 0; ch < ADC_CHANNELS; ch++)
             {
-                uint16_t newv = buf_adc[idx_new][ch];
-                uint16_t oldv = buf_adc[idx_old][ch];
+                uint16_t new_val = buf_adc[idx_new][ch];
+                uint16_t old_val = buf_adc[idx_old][ch];
 
-                adc_running_sum[ch] -= oldv;
-                adc_running_sum[ch] += newv;
+                // Se previene el underflow en la resta. Si el valor a restar es anómalamente
+                // más grande que la suma acumulada (debido a un pico de ruido), la resta
+                // de enteros sin signo causaría un 'wrap-around' a un número muy grande.
+                // Para evitarlo, se resetea la suma. El filtro se recuperará en las siguientes muestras.
+                if (old_val > adc_running_sum[ch])
+                {
+                    adc_running_sum[ch] = 0;
+                }
+                else
+                {
+                    adc_running_sum[ch] -= old_val;
+                }
+
+                adc_running_sum[ch] += new_val;
 
                 adc_filtered_avg[ch] = (uint16_t)(adc_running_sum[ch] >> ADC_FILTER_SHIFT);
             }
@@ -2044,70 +2068,92 @@ static void Update_Display_Content(void)
 }
 
 /**
- * @brief Convierte un valor ADC a distancia en milímetros usando una LUT con
- *        interpolación/extrapolación lineal. El resultado final se limita
- *        al rango de 20mm a 120mm.
- * @param adc_value El valor ADC filtrado del sensor.
- * @return La distancia calculada y limitada en milímetros.
+ * @brief Precalcula las pendientes de los segmentos de la LUT de ADC.
+ * @note  Debe llamarse una sola vez durante la inicialización.
+ *        Rellena el array global `adc_lut_segs`.
+ * @retval None
+ */
+static void ADC_LUT_Precompute(void)
+{
+    for (uint8_t i = 0; i < ADC_SEG_COUNT; ++i)
+    {
+        const uint16_t x0 = sensor_lut[i].adc;
+        const uint16_t x1 = sensor_lut[i + 1].adc;
+        const int32_t y0 = (int32_t)sensor_lut[i].dist_mm;
+        const int32_t y1 = (int32_t)sensor_lut[i + 1].dist_mm;
+
+        adc_lut_segs[i].x0 = x0;
+        adc_lut_segs[i].x1 = x1;
+        adc_lut_segs[i].y0 = (uint16_t)y0;
+
+        const int32_t dx = (int32_t)x1 - (int32_t)x0;
+        const int32_t dy = y1 - y0;
+
+        // Calcula la pendiente en formato Q16.16, manejando la división por cero.
+        if (dx != 0)
+        {
+            adc_lut_segs[i].slope_q16 = ((dy << FIXED_POINT_SHIFT) / dx);
+        }
+        else
+        {
+            adc_lut_segs[i].slope_q16 = 0;
+        }
+    }
+}
+
+/**
+ * @brief Convierte un valor de ADC a distancia en milímetros usando una LUT con pendientes precalculadas.
+ * @param  adc_value: El valor de 12 bits del ADC a convertir.
+ * @retval La distancia estimada en milímetros (int32_t).
+ * @note   Utiliza búsqueda binaria y aritmética de punto fijo. No usa 'float'.
  */
 static int32_t ADC_To_Distance_mm(uint16_t adc_value)
 {
-    const SensorLutEntry *p1 = NULL, *p2 = NULL;
-
-    // Caso 1: El valor ADC es menor que el primer punto de la tabla (extrapolar)
+    // 1. Manejo de casos extremos (saturación)
     if (adc_value <= sensor_lut[0].adc)
     {
-        p1 = &sensor_lut[0];
-        p2 = &sensor_lut[1];
+        return (int32_t)sensor_lut[0].dist_mm;
     }
-    // Caso 2: El valor ADC es mayor que el último punto de la tabla (extrapolar)
-    else if (adc_value >= sensor_lut[sensor_lut_size - 1].adc)
+    if (adc_value >= sensor_lut[ADC_LUT_SIZE - 1].adc)
     {
-        p1 = &sensor_lut[sensor_lut_size - 2];
-        p2 = &sensor_lut[sensor_lut_size - 1];
+        return (int32_t)sensor_lut[ADC_LUT_SIZE - 1].dist_mm;
     }
-    // Caso 3: El valor ADC está dentro de la tabla (interpolar)
-    else
+
+    // 2. Búsqueda binaria para encontrar el segmento correcto [lo, lo+1]
+    uint8_t lo = 0;
+    uint8_t hi = (uint8_t)(ADC_LUT_SIZE - 1);
+    while ((uint8_t)(hi - lo) > 1U)
     {
-        for (uint8_t i = 0; i < sensor_lut_size - 1; i++)
+        uint8_t mid = (uint8_t)((lo + hi) >> 1);
+        if (adc_value < sensor_lut[mid].adc)
         {
-            if (adc_value >= sensor_lut[i].adc && adc_value <= sensor_lut[i + 1].adc)
-            {
-                p1 = &sensor_lut[i];
-                p2 = &sensor_lut[i + 1];
-                break;
-            }
+            hi = mid;
+        }
+        else
+        {
+            lo = mid;
         }
     }
 
-    // Si por alguna razón no se encontraron los puntos, devuelve un valor seguro.
-    if (p1 == NULL || p2 == NULL)
-    {
-        return WALL_FOLLOW_TARGET_MM;
-    }
+    // 3. Interpolación lineal usando el segmento precalculado 'lo'
+    const ADC_LutSeg_t *s = &adc_lut_segs[lo];
 
-    // Interpolación/extrapolación lineal con aritmética de enteros:
-    // y = y1 + (x - x1) * (y2 - y1) / (x2 - x1)
-    int32_t adc_diff = p2->adc - p1->adc;
-    if (adc_diff == 0)
-    { // Evitar división por cero
-        return p1->dist_mm;
-    }
+    // y = y0 + slope * (x - x0)
+    int32_t dx = (int32_t)adc_value - (int32_t)s->x0;
 
-    int32_t dist_diff = p2->dist_mm - p1->dist_mm;
-    int32_t calculated_dist = (int32_t)p1->dist_mm + ((int32_t)(adc_value - p1->adc) * dist_diff) / adc_diff;
+    // Multiplicación en 64 bits para evitar overflow (Q16.16 * Q16.0 -> Q32.16)
+    int64_t mul = (int64_t)s->slope_q16 * (int64_t)dx;
 
-    // Limitar (clamp) el resultado final al rango de operación seguro
-    if (calculated_dist < 20)
-    {
-        return 20;
-    }
-    if (calculated_dist > 150)
-    {
-        return 150;
-    }
+    // Redondeo al entero más cercano y conversión de vuelta a entero
+    int32_t incr = (int32_t)((mul + (1LL << (FIXED_POINT_SHIFT - 1))) >> FIXED_POINT_SHIFT);
 
-    return calculated_dist;
+    int32_t y = (int32_t)s->y0 + incr;
+
+    // 4. Seguridad final
+    if (y < 0)
+        return 0;
+
+    return y;
 }
 
 /**
