@@ -1227,7 +1227,8 @@ static void ManageButtonEvents(void)
                 }
                 if (menu_mode == MENU_MODE_DRIVE_STRAIGHT)
                 {
-                    Set_Robot_State(STATE_LEFT_WALL_FADE);
+                    Set_Robot_State(STATE_STRAIGHT_DRIVE);
+                    PID_Reset(&centering_pid);
                     PID_Set_Setpoint(&centering_pid, FIXED_TO_INT(current_yaw_fixed));
                 }
                 break;
@@ -1554,7 +1555,7 @@ static void Manage_Turn(void)
         right_speed = -(int16_t)FIXED_TO_INT(base_right_speed_fixed);
     }
 
-    // 4. Aplicar la velocidad mínima para vencer la inercia (lógica sin cambios)
+    // 4. Aplicar la velocidad mínima para vencer la inercia
     if (right_speed > 0 && right_speed < turn_min_speed)
         right_speed = turn_min_speed;
     else if (right_speed < 0 && right_speed > -turn_min_speed)
@@ -1847,8 +1848,8 @@ static void Handle_Straight_Drive(void)
             Set_Motor_Speeds(0, 0);
             app_state = APP_STATE_MENU;  // Volver al menú
             Set_Robot_State(STATE_IDLE); // Volver al estado de espera
+            return;
         }
-        return;
     }
     else
     {
@@ -2226,7 +2227,7 @@ static void Modes_State_Machine(void)
             case STATE_BRAKING:
                 Handle_Braking();
                 break;
-            case STATE_LEFT_WALL_FADE:
+            case STATE_STRAIGHT_DRIVE:
                 Handle_Straight_Drive();
                 break;
             default:
