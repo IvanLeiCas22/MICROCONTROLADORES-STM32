@@ -284,7 +284,7 @@ extern uint16_t pwm_max_value;
 /* Wifi Settings */
 #define WIFI_SSID "InternetPlus_8e2fbb"
 #define WIFI_PASSWORD "Akhantos2340"
-#define WIFI_UDP_REMOTE_IP "192.168.1.3"
+#define WIFI_UDP_REMOTE_IP "192.168.1.120"
 #define WIFI_UDP_REMOTE_PORT 30010
 #define WIFI_UDP_LOCAL_PORT 30000
 

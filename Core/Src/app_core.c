@@ -1475,11 +1475,8 @@ void Turn_Start(int16_t angle_degrees)
     if ((robot_state == STATE_NAVIGATING || robot_state == STATE_DECIDING) ||
         (robot_state == STATE_IDLE && menu_mode == MENU_MODE_MANUAL_CONTROL))
     {
+        // Reseteamos el PID que usaremos para el control de velocidad y el ángulo acumulado.
         PID_Reset(&turn_pid);
-
-        // Establecemos el ángulo objetivo en el controlador PID.
-        PID_Set_Setpoint(&turn_pid, angle_degrees);
-
         current_yaw_fixed = 0; // Reseteamos la medición de ángulo para un giro relativo.
 
         // Asignar el estado de giro correcto
@@ -1491,7 +1488,7 @@ void Turn_Start(int16_t angle_degrees)
         {
             Set_Robot_State(STATE_TURNING_LEFT);
         }
-        else // 180 o cualquier otro ángulo
+        else if (abs(angle_degrees) >= 170) // Acepta 180, -180, etc.
         {
             Set_Robot_State(STATE_TURN_AROUND);
         }
@@ -1502,7 +1499,7 @@ void Turn_Start(int16_t angle_degrees)
  * @brief Gestiona el estado de giro del robot usando un controlador PID.
  *        Utiliza una potencia de giro independiente y compensación mecánica.
  */
-static void Manage_Turn(void)
+/* static void Manage_Turn(void)
 {
     if (robot_state != STATE_TURNING_LEFT && robot_state != STATE_TURNING_RIGHT && robot_state != STATE_TURN_AROUND)
     {
@@ -1585,6 +1582,102 @@ static void Manage_Turn(void)
         left_speed = -turn_min_speed;
 
     // 5. Aplicar las velocidades calculadas a los motores.
+    Set_Motor_Speeds(right_speed, left_speed);
+} */
+
+/**
+ * @brief Gestiona el estado de giro del robot usando un controlador PID de velocidad angular.
+ *        Este método utiliza 'turn_pid' para alcanzar y mantener una velocidad angular objetivo
+ *        durante los giros pivote.
+ */
+static void Manage_Turn(void)
+{
+    if (robot_state != STATE_TURNING_LEFT && robot_state != STATE_TURNING_RIGHT && robot_state != STATE_TURN_AROUND)
+    {
+        return;
+    }
+
+    int32_t current_yaw_degrees = FIXED_TO_INT(current_yaw_fixed);
+    int16_t target_yaw_degrees = 0;
+    int16_t target_dps = 0;
+
+    // 1. Determinar el ángulo objetivo (para la condición de parada) y la velocidad angular
+    //    objetivo (para el setpoint del PID) basándose en el estado de giro.
+    switch (robot_state)
+    {
+    case STATE_TURNING_LEFT:
+        target_yaw_degrees = 90;
+        target_dps = (int16_t)turn_min_speed; // Un 'gz' positivo es giro a la izquierda.
+        break;
+    case STATE_TURNING_RIGHT:
+        target_yaw_degrees = 90;
+        target_dps = -((int16_t)turn_min_speed); // Un 'gz' negativo es giro a la derecha.
+        break;
+    case STATE_TURN_AROUND:
+        target_yaw_degrees = 180;
+        target_dps = (int16_t)turn_min_speed; // Girar a la izquierda por defecto para 180.
+        break;
+    default: // Estado inesperado
+        Set_Motor_Speeds(0, 0);
+        return;
+    }
+
+    target_dps = ((int32_t)target_dps * (int32_t)((((abs(target_yaw_degrees) - abs(current_yaw_degrees)) * 100) / target_yaw_degrees) + 50)) / 100;
+
+    // 2. Comprobar si el giro ha terminado (condición de parada basada en el ángulo total girado).
+    if (abs(current_yaw_degrees) >= (abs(target_yaw_degrees) - TURN_COMPLETION_DEAD_ZONE))
+    {
+        Set_Motor_Speeds(0, 0);
+        if (menu_mode == MENU_MODE_MANUAL_CONTROL)
+        {
+            Set_Robot_State(STATE_IDLE);
+        }
+        else
+        {
+            // Después de un giro, volvemos a navegar.
+            Set_Robot_State(STATE_NAVIGATING);
+            PID_Reset(&centering_pid);
+            PID_Reset(&braking_pid);
+            kick_start_active = true;
+            motion_confirm_counter = 0;
+        }
+        return;
+    }
+
+    // --- Lógica del PID de velocidad angular ---
+
+    // 3. Obtener la velocidad angular actual del giroscopio.
+    int16_t gz;
+    MPU6050_GetCalibratedData(&hmpu, NULL, NULL, NULL, NULL, NULL, &gz);
+
+    // Convertir el valor raw del giroscopio (gz) a grados por segundo (dps).
+    int32_t angular_velocity_fixed = FIXED_DIV(INT_TO_FIXED(gz), GYRO_SENSITIVITY);
+    int16_t angular_velocity_dps = (int16_t)FIXED_TO_INT(angular_velocity_fixed);
+
+    // 4. Establecer el setpoint del PID de giro a la velocidad angular deseada.
+    PID_Set_Setpoint(&turn_pid, target_dps);
+
+    // 5. Calcular la salida del PID. La entrada es la velocidad angular actual.
+    //    La salida es la "fuerza" de giro (un valor de PWM).
+    int32_t pid_output_fixed = PID_Update(&turn_pid, angular_velocity_dps, 10);
+    int16_t correction_pwm = (int16_t)FIXED_TO_INT(pid_output_fixed);
+
+    // 6. Aplicar la corrección para un giro pivote (motores en contrafase).
+    //    La 'correction_pwm' es la fuerza de giro. La aplicamos simétricamente.
+    int16_t right_speed = 0;
+    int16_t left_speed = 0;
+    if (robot_state == STATE_TURNING_RIGHT)
+    {
+        right_speed = -right_motor_base_speed + correction_pwm;
+        left_speed = right_motor_base_speed - correction_pwm;
+    }
+    else
+    {
+        right_speed = (int16_t)right_motor_base_speed + correction_pwm;
+        left_speed = -((int16_t)right_motor_base_speed) - correction_pwm;
+    }
+
+    // 7. Aplicar las velocidades calculadas a los motores.
     Set_Motor_Speeds(right_speed, left_speed);
 }
 
@@ -2168,15 +2261,15 @@ static void Handle_Smooth_Turn(void)
     {
         dist_diagonal_left_mm = (uint16_t)ADC_To_Distance_mm((uint16_t)Get_Filtered_ADC_Value(SENSOR_DIAGONAL_LEFT_CH));
         wall_detected = (dist_diagonal_left_mm < after_turn_wall_threshold_mm);
-        base_right = faster_motor_smooth_turn_speed; // exterior
-        base_left = slower_motor_smooth_turn_speed;  // interior
+        base_right = (int16_t)faster_motor_smooth_turn_speed; // exterior
+        base_left = (int16_t)slower_motor_smooth_turn_speed;  // interior
     }
     else if (robot_state == STATE_SMOOTH_TURN_RIGHT)
     {
         dist_diagonal_right_mm = (uint16_t)ADC_To_Distance_mm((uint16_t)Get_Filtered_ADC_Value(SENSOR_DIAGONAL_RIGHT_CH));
         wall_detected = (dist_diagonal_right_mm < after_turn_wall_threshold_mm);
-        base_right = slower_motor_smooth_turn_speed; // interior
-        base_left = faster_motor_smooth_turn_speed;  // exterior
+        base_right = (int16_t)slower_motor_smooth_turn_speed; // interior
+        base_left = (int16_t)faster_motor_smooth_turn_speed;  // exterior
     }
 
     if (!wall_detected)
