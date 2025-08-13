@@ -1488,9 +1488,13 @@ void Turn_Start(int16_t angle_degrees)
         {
             Set_Robot_State(STATE_TURNING_LEFT);
         }
-        else if (abs(angle_degrees) >= 170) // Acepta 180, -180, etc.
+        else if (angle_degrees == 180)
         {
-            Set_Robot_State(STATE_TURN_AROUND);
+            Set_Robot_State(STATE_TURN_AROUND_RIGHT);
+        }
+        else if (angle_degrees == -180)
+        {
+            Set_Robot_State(STATE_TURN_AROUND_LEFT);
         }
     }
 }
@@ -1592,11 +1596,6 @@ void Turn_Start(int16_t angle_degrees)
  */
 static void Manage_Turn(void)
 {
-    if (robot_state != STATE_TURNING_LEFT && robot_state != STATE_TURNING_RIGHT && robot_state != STATE_TURN_AROUND)
-    {
-        return;
-    }
-
     int32_t current_yaw_degrees = FIXED_TO_INT(current_yaw_fixed);
     int16_t target_yaw_degrees = 0;
     int16_t target_dps = 0;
@@ -1606,23 +1605,27 @@ static void Manage_Turn(void)
     switch (robot_state)
     {
     case STATE_TURNING_LEFT:
-        target_yaw_degrees = 90;
+        target_yaw_degrees = -90;
         target_dps = (int16_t)turn_min_speed; // Un 'gz' positivo es giro a la izquierda.
         break;
     case STATE_TURNING_RIGHT:
         target_yaw_degrees = 90;
         target_dps = -((int16_t)turn_min_speed); // Un 'gz' negativo es giro a la derecha.
         break;
-    case STATE_TURN_AROUND:
+    case STATE_TURN_AROUND_LEFT:
+        target_yaw_degrees = -180;
+        target_dps = (int16_t)turn_min_speed;
+        break;
+    case STATE_TURN_AROUND_RIGHT:
         target_yaw_degrees = 180;
-        target_dps = (int16_t)turn_min_speed; // Girar a la izquierda por defecto para 180.
+        target_dps = -((int16_t)turn_min_speed);
         break;
     default: // Estado inesperado
         Set_Motor_Speeds(0, 0);
         return;
     }
 
-    target_dps = ((int32_t)target_dps * (int32_t)((((abs(target_yaw_degrees) - abs(current_yaw_degrees)) * 100) / target_yaw_degrees) + 50)) / 100;
+    target_dps = ((int32_t)target_dps * (int32_t)((((abs(target_yaw_degrees) - abs(current_yaw_degrees)) * (int16_t)100) / abs(target_yaw_degrees)) + (int16_t)40)) / 100;
 
     // 2. Comprobar si el giro ha terminado (condición de parada basada en el ángulo total girado).
     if (abs(current_yaw_degrees) >= (abs(target_yaw_degrees) - TURN_COMPLETION_DEAD_ZONE))
@@ -1662,23 +1665,8 @@ static void Manage_Turn(void)
     int32_t pid_output_fixed = PID_Update(&turn_pid, angular_velocity_dps, 10);
     int16_t correction_pwm = (int16_t)FIXED_TO_INT(pid_output_fixed);
 
-    // 6. Aplicar la corrección para un giro pivote (motores en contrafase).
-    //    La 'correction_pwm' es la fuerza de giro. La aplicamos simétricamente.
-    int16_t right_speed = 0;
-    int16_t left_speed = 0;
-    if (robot_state == STATE_TURNING_RIGHT)
-    {
-        right_speed = -right_motor_base_speed + correction_pwm;
-        left_speed = right_motor_base_speed - correction_pwm;
-    }
-    else
-    {
-        right_speed = (int16_t)right_motor_base_speed + correction_pwm;
-        left_speed = -((int16_t)right_motor_base_speed) - correction_pwm;
-    }
-
     // 7. Aplicar las velocidades calculadas a los motores.
-    Set_Motor_Speeds(right_speed, left_speed);
+    Set_Motor_Speeds(correction_pwm, -correction_pwm);
 }
 
 /**
@@ -2331,7 +2319,8 @@ static void Modes_State_Machine(void)
                 break;
             case STATE_TURNING_LEFT:
             case STATE_TURNING_RIGHT:
-            case STATE_TURN_AROUND:
+            case STATE_TURN_AROUND_LEFT:
+            case STATE_TURN_AROUND_RIGHT:
                 Manage_Turn();
                 break;
             case STATE_SMOOTH_TURN_LEFT:
@@ -2350,7 +2339,8 @@ static void Modes_State_Machine(void)
             {
             case STATE_TURNING_LEFT:
             case STATE_TURNING_RIGHT:
-            case STATE_TURN_AROUND:
+            case STATE_TURN_AROUND_LEFT:
+            case STATE_TURN_AROUND_RIGHT:
                 Manage_Turn();
                 break;
             case STATE_IDLE:

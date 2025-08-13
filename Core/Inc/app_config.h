@@ -157,7 +157,8 @@ typedef enum
     STATE_STRAIGHT_DRIVE,
     STATE_LEFT_WALL_FADE,
     STATE_RIGHT_WALL_FADE,
-    STATE_TURN_AROUND
+    STATE_TURN_AROUND_RIGHT,
+    STATE_TURN_AROUND_LEFT
 } RobotStateTypeDef;
 
 typedef enum
@@ -301,7 +302,7 @@ extern uint16_t pwm_max_value;
 #define TURN_PID_KD_DEFAULT 150.0f  // Ganancia Derivativa inicial (NOTA: estos valores probablemente necesiten reajuste)
 #define TURN_COMPLETION_DEAD_ZONE 1 // Zona muerta en grados para considerar el giro completo
 #define TURN_MAX_SPEED_DEFAULT 6500 // Velocidad máxima de giro en PWM
-#define TURN_MIN_SPEED_DEFAULT 2600 // Velocidad mínima de giro para vencer la inercia
+#define TURN_MIN_SPEED_DEFAULT 360  // Velocidad mínima de giro para vencer la inercia
 
 #define TURN_VELOCITY_PID_KP_DEFAULT 20.0f // Kp para el control de velocidad angular
 #define TURN_VELOCITY_PID_KI_DEFAULT 5.0f  // Ki para el control de velocidad angular
