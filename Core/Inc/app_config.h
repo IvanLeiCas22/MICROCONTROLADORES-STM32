@@ -99,8 +99,8 @@ typedef enum
     CMD_GET_PWM_PERIOD = 0x51,
     CMD_SET_MPU_CONFIG = 0xA7,
     CMD_GET_MPU_CONFIG = 0xA8,
-    CMD_SET_TURN_MIN_SPEED = 0x4C,  // Para configurar la velocidad mínima de giro
-    CMD_GET_TURN_MIN_SPEED = 0x4D,  // Para leer la velocidad mínima de giro
+    CMD_SET_PIVOT_TURN_DPS = 0x4C,  // Para configurar la velocidad de giro en pivote
+    CMD_GET_PIVOT_TURN_DPS = 0x4D,  // Para leer la velocidad de giro en pivote
     CMD_SET_WALL_THRESHOLDS = 0x60, // Configurar el umbral de pared
     CMD_GET_WALL_THRESHOLDS = 0x61, // Leer el umbral de pared
     CMD_SET_WALL_TARGET_ADC = 0x62, // Configurar el valor ADC objetivo para seguimiento de pared
@@ -235,7 +235,7 @@ extern uint16_t pwm_max_value;
 #define UNERBUS_PWM_PERIOD_SIZE (sizeof(uint16_t))
 #define UNERBUS_MPU_CONFIG_SIZE (sizeof(uint8_t) * 3) // Accel, Gyro, DLPF
 #define UNERBUS_WALL_THRESHOLDS_SIZE (sizeof(uint16_t) * 4)
-#define UNERBUS_WALL_TARGET_ADC_SIZE (sizeof(uint16_t))
+#define UNERBUS_WALL_TARGET_ADC_SIZE (sizeof(uint16_t) * 2)
 #define UNERBUS_APP_STATE_SIZE (sizeof(uint8_t))
 #define UNERBUS_MENU_MODE_SIZE (sizeof(uint8_t))
 #define UNERBUS_ROBOT_STATUS_SIZE (sizeof(uint8_t) * 2)
@@ -297,12 +297,12 @@ extern uint16_t pwm_max_value;
 #define DEVICE_INIT_DELAY_MS 1000
 
 /* --- Turn PID Controller --- */
-#define TURN_PID_KP_DEFAULT 80.0f   // Ganancia Proporcional inicial
-#define TURN_PID_KI_DEFAULT 0.0f    // Ganancia Integral (iniciamos en 0)
-#define TURN_PID_KD_DEFAULT 150.0f  // Ganancia Derivativa inicial (NOTA: estos valores probablemente necesiten reajuste)
-#define TURN_COMPLETION_DEAD_ZONE 1 // Zona muerta en grados para considerar el giro completo
-#define TURN_MAX_SPEED_DEFAULT 6500 // Velocidad máxima de giro en PWM
-#define TURN_MIN_SPEED_DEFAULT 360  // Velocidad mínima de giro para vencer la inercia
+#define TURN_PID_KP_DEFAULT 80.0f         // Ganancia Proporcional inicial
+#define TURN_PID_KI_DEFAULT 0.0f          // Ganancia Integral (iniciamos en 0)
+#define TURN_PID_KD_DEFAULT 150.0f        // Ganancia Derivativa inicial (NOTA: estos valores probablemente necesiten reajuste)
+#define TURN_COMPLETION_DEAD_ZONE 1       // Zona muerta en grados para considerar el giro completo
+#define TURN_MAX_SPEED_DEFAULT 6500       // Velocidad máxima de giro en PWM
+#define PIVOT_TURN_TARGET_DPS_DEFAULT 360 // Velocidad mínima de giro para vencer la inercia
 
 #define TURN_VELOCITY_PID_KP_DEFAULT 20.0f // Kp para el control de velocidad angular
 #define TURN_VELOCITY_PID_KI_DEFAULT 5.0f  // Ki para el control de velocidad angular

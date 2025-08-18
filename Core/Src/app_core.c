@@ -107,6 +107,7 @@ uint16_t left_motor_base_speed = 4550;          // Velocidad base motor izquierd
 uint16_t faster_motor_smooth_turn_speed = 6000; // Velocidad del motor más rápido en giro suave
 uint16_t slower_motor_smooth_turn_speed = 2500; // Velocidad del motor más lento en giro suave
 uint16_t wall_threshold_mm_front = 70;          // Umbral en mm para detectar pared frontal
+uint16_t tape_detection_threshold_adc = 1500;   // Umbral en ADC para detectar cinta
 uint16_t wall_threshold_mm_braking_start = 40;  // Umbral en mm para iniciar el frenado
 uint16_t wall_threshold_mm_diagonal = 130;      // Umbral en mm para detectar pared diagonal
 uint16_t wall_threshold_mm_side = 100;          // Umbral en mm para detectar pared lateral
@@ -116,19 +117,23 @@ uint16_t wall_braking_target_mm = 30;           // Distancia de parada objetivo
 uint16_t braking_accel_stop_threshold = 2000;   // Umbral de aceleración para confirmar detención
 uint16_t max_pwm_correction = 4000;             // Corrección máxima del PID
 uint16_t turn_max_pwm = TURN_MAX_SPEED_DEFAULT;
-uint16_t turn_min_speed = TURN_MIN_SPEED_DEFAULT;
+uint16_t pivot_turn_target_dps = PIVOT_TURN_TARGET_DPS_DEFAULT;
 uint16_t turn_target_dps = TURN_TARGET_DPS_DEFAULT;
 uint16_t braking_max_pwm_offset = BRAKING_MAX_SPEED_DEFAULT; // PWM máximo de frenado
 uint16_t braking_min_speed = BRAKING_MIN_SPEED_DEFAULT;
 uint16_t braking_dead_zone = BRAKING_DEAD_ZONE_DEFAULT;
 
-bool left_wall_detected = false, right_wall_detected = false, front_wall_detected = false, left_diagonal_wall_detected = false, right_diagonal_wall_detected = false;
+bool left_wall_detected = false, right_wall_detected = false, front_wall_detected = false,
+     left_diagonal_wall_detected = false, right_diagonal_wall_detected = false, rear_tape_detected = false,
+     front_tape_detected = false;
 uint16_t dist_diagonal_left_mm = 0;
 uint16_t dist_diagonal_right_mm = 0;
 uint16_t dist_front_left_mm = 0;
 uint16_t dist_front_right_mm = 0;
 uint16_t dist_left_lat_mm = 0;
 uint16_t dist_right_lat_mm = 0;
+uint16_t adc_rear_floor = 0;
+uint16_t adc_front_floor = 0;
 uint8_t wall_fade_counter = 0;
 uint8_t wall_fade_ticks = WALL_FADE_TICKS_DEFAULT;
 
@@ -347,10 +352,10 @@ void DecodeCMD(struct UNERBUSHandle *aBus, uint8_t iStartData)
         UNERBUS_Write(aBus, adc_buffer, ADC_DATA_BYTES);
         length = UNERBUS_CMD_ID_SIZE + ADC_DATA_BYTES; // 1 (CMD) + 16 (datos)
         break;
-    case CMD_CALIBRATE_MPU:               // Calibrar el MPU6050
-        MPU6050_Calibrate(&hmpu, 200);    // Calibrar con 200 muestras (ajustable)
-        UNERBUS_WriteByte(aBus, CMD_ACK); // Confirmar calibración
-        length = UNERBUS_CMD_ID_SIZE + UNERBUS_ACK_SIZE;
+    case CMD_CALIBRATE_MPU:            // Calibrar el MPU6050
+        MPU6050_Calibrate(&hmpu, 200); // Calibrar con 200 muestras (ajustable)
+                                       /*         UNERBUS_WriteByte(aBus, CMD_ACK); // Confirmar calibración
+                                               length = UNERBUS_CMD_ID_SIZE + UNERBUS_ACK_SIZE; */
         break;
     case CMD_SET_UART_BYPASS_CONTROL: // UART_BYPASS_CONTROL - Activar/desactivar bypass
         UART_BYPASS = !UART_BYPASS;
@@ -384,7 +389,6 @@ void DecodeCMD(struct UNERBUSHandle *aBus, uint8_t iStartData)
     break;
     case CMD_SET_MOTOR_PWM: // Control de PWM de motores
         // Recibir 4 valores uint16_t (8 bytes) para los 4 canales PWM
-        uint8_t pwm_response[UNERBUS_PWM_RESPONSE_STATUS_SIZE + PWM_DATA_BYTES]; // Buffer para respuesta (1 byte status + 8 bytes valores actuales)
 
         // Extraer y validar valores PWM
         for (uint8_t i = 0; i < PWM_CHANNELS; i++)
@@ -400,17 +404,6 @@ void DecodeCMD(struct UNERBUSHandle *aBus, uint8_t iStartData)
         __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_2, motor_pwm_values[MOTOR_FRONT_RIGHT_IDX]);
         __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_3, motor_pwm_values[MOTOR_REAR_LEFT_IDX]);
         __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_4, motor_pwm_values[MOTOR_FRONT_LEFT_IDX]);
-
-        // Preparar respuesta con estado de éxito y valores actuales
-        pwm_response[0] = CMD_ACK; // Status: OK
-        for (uint8_t i = 0; i < PWM_CHANNELS; i++)
-        {
-            pwm_response[1 + i * 2] = (uint8_t)(motor_pwm_values[i] & 0xFF);        // Byte bajo
-            pwm_response[2 + i * 2] = (uint8_t)((motor_pwm_values[i] >> 8) & 0xFF); // Byte alto
-        }
-
-        UNERBUS_Write(aBus, pwm_response, UNERBUS_PWM_RESPONSE_STATUS_SIZE + PWM_DATA_BYTES);
-        length = UNERBUS_CMD_ID_SIZE + UNERBUS_PWM_RESPONSE_STATUS_SIZE + PWM_DATA_BYTES; // 1 (CMD) + 9 (status + datos)
         break;
     case CMD_GET_MOTOR_PWM:                         // Obtener valores PWM actuales
         uint8_t pwm_current_buffer[PWM_DATA_BYTES]; // Buffer para valores actuales
@@ -445,8 +438,6 @@ void DecodeCMD(struct UNERBUSHandle *aBus, uint8_t iStartData)
             // Actualizar el registro de auto-recarga del temporizador
             __HAL_TIM_SET_AUTORELOAD(&htim4, pwm_max_value - 1);
         }
-        UNERBUS_WriteByte(aBus, CMD_ACK);
-        length = UNERBUS_CMD_ID_SIZE + UNERBUS_ACK_SIZE;
         break;
     case CMD_GET_PWM_PERIOD:
         uint8_t period_buffer[UNERBUS_PWM_PERIOD_SIZE];
@@ -479,16 +470,6 @@ void DecodeCMD(struct UNERBUSHandle *aBus, uint8_t iStartData)
             // Actualizar el escalador del giroscopio con la nueva configuración
             Update_Gyro_Scaler();
         }
-
-        // --- Respuesta con la configuración actual (Sugerencia implementada) ---
-        // Se envía la configuración que está actualmente en el handle, ya sea la nueva o la anterior si la validación falló.
-        // Esto sirve como confirmación explícita para la HMI.
-        uint8_t mpu_config_buffer[UNERBUS_MPU_CONFIG_SIZE];
-        mpu_config_buffer[0] = hmpu.accel_range;
-        mpu_config_buffer[1] = hmpu.gyro_range;
-        mpu_config_buffer[2] = hmpu.dlpf_config;
-        UNERBUS_Write(aBus, mpu_config_buffer, UNERBUS_MPU_CONFIG_SIZE);
-        length = UNERBUS_CMD_ID_SIZE + UNERBUS_MPU_CONFIG_SIZE;
     }
     break;
     case CMD_GET_MPU_CONFIG:
@@ -510,10 +491,6 @@ void DecodeCMD(struct UNERBUSHandle *aBus, uint8_t iStartData)
         centering_pid.kp = (int32_t)(((int64_t)kp_int << FIXED_POINT_SHIFT) / 100);
         centering_pid.ki = (int32_t)(((int64_t)ki_int << FIXED_POINT_SHIFT) / 100);
         centering_pid.kd = (int32_t)(((int64_t)kd_int << FIXED_POINT_SHIFT) / 100);
-
-        // Enviar confirmación (ACK)
-        UNERBUS_WriteByte(aBus, CMD_ACK);
-        length = UNERBUS_CMD_ID_SIZE + UNERBUS_ACK_SIZE;
         break;
     case CMD_GET_PID_GAINS: // Leer Kp, Ki, Kd
         uint8_t response_buffer[UNERBUS_PID_GAINS_SIZE];
@@ -539,10 +516,6 @@ void DecodeCMD(struct UNERBUSHandle *aBus, uint8_t iStartData)
 
         // Actualizar la configuración del PID con los nuevos valores
         PID_Set_Output_Limits(&centering_pid, INT_TO_FIXED(-max_pwm_correction), INT_TO_FIXED(max_pwm_correction));
-
-        // Enviar confirmación (ACK)
-        UNERBUS_WriteByte(aBus, CMD_ACK);
-        length = UNERBUS_CMD_ID_SIZE + UNERBUS_ACK_SIZE;
         break;
     case CMD_GET_MAX_PWM_CORRECTION: // Leer la corrección máxima del PWM
         uint8_t response_buffer_2[UNERBUS_CONTROL_PARAMS_SIZE];
@@ -557,10 +530,6 @@ void DecodeCMD(struct UNERBUSHandle *aBus, uint8_t iStartData)
         // Se esperan 2 valores uint16_t: Right Motor Base Speed, Left Motor Base Speed
         right_motor_base_speed = UNERBUS_GetUInt16(aBus);
         left_motor_base_speed = UNERBUS_GetUInt16(aBus);
-
-        // Enviar confirmación (ACK)
-        UNERBUS_WriteByte(aBus, CMD_ACK);
-        length = UNERBUS_CMD_ID_SIZE + UNERBUS_ACK_SIZE;
         break;
     case CMD_GET_MOTOR_BASE_SPEEDS: // Leer velocidades base independientes
         uint8_t motor_speeds_buffer[UNERBUS_MOTOR_BASE_SPEEDS_SIZE];
@@ -588,8 +557,6 @@ void DecodeCMD(struct UNERBUSHandle *aBus, uint8_t iStartData)
         // Recibe un ángulo de 16 bits con signo
         int16_t angle = (int16_t)UNERBUS_GetUInt16(aBus);
         Turn_Start(angle);
-        UNERBUS_WriteByte(aBus, CMD_ACK);
-        length = UNERBUS_CMD_ID_SIZE + UNERBUS_ACK_SIZE;
         break;
     case CMD_SET_TURN_PID_GAINS: // Configurar Kp, Ki, Kd del PID de giro
         // Se esperan 3 valores uint16_t: Kp*100, Ki*100, Kd*100
@@ -601,10 +568,6 @@ void DecodeCMD(struct UNERBUSHandle *aBus, uint8_t iStartData)
         turn_pid.kp = (int32_t)(((int64_t)turn_kp_int << FIXED_POINT_SHIFT) / 100);
         turn_pid.ki = (int32_t)(((int64_t)turn_ki_int << FIXED_POINT_SHIFT) / 100);
         turn_pid.kd = (int32_t)(((int64_t)turn_kd_int << FIXED_POINT_SHIFT) / 100);
-
-        // Enviar confirmación (ACK)
-        UNERBUS_WriteByte(aBus, CMD_ACK);
-        length = UNERBUS_CMD_ID_SIZE + UNERBUS_ACK_SIZE;
         break;
     case CMD_GET_TURN_PID_GAINS: // Leer Kp, Ki, Kd del PID de giro
         uint8_t turn_pid_buffer[UNERBUS_TURN_PID_GAINS_SIZE];
@@ -629,8 +592,6 @@ void DecodeCMD(struct UNERBUSHandle *aBus, uint8_t iStartData)
         if (turn_max_pwm > pwm_max_value)
             turn_max_pwm = pwm_max_value; // Limitar al máximo global
         PID_Set_Output_Limits(&turn_pid, INT_TO_FIXED(-turn_max_pwm), INT_TO_FIXED(turn_max_pwm));
-        UNERBUS_WriteByte(aBus, CMD_ACK);
-        length = UNERBUS_CMD_ID_SIZE + UNERBUS_ACK_SIZE;
         break;
     case CMD_GET_TURN_MAX_SPEED:
         uint8_t speed_buffer[UNERBUS_TURN_MAX_SPEED_SIZE];
@@ -639,17 +600,15 @@ void DecodeCMD(struct UNERBUSHandle *aBus, uint8_t iStartData)
         UNERBUS_Write(aBus, speed_buffer, UNERBUS_TURN_MAX_SPEED_SIZE);
         length = UNERBUS_CMD_ID_SIZE + UNERBUS_TURN_MAX_SPEED_SIZE;
         break;
-    case CMD_SET_TURN_MIN_SPEED:
-        turn_min_speed = UNERBUS_GetUInt16(aBus);
-        if (turn_min_speed > turn_max_pwm)
-            turn_min_speed = turn_max_pwm; // No puede ser mayor que la máxima
-        UNERBUS_WriteByte(aBus, CMD_ACK);
-        length = UNERBUS_CMD_ID_SIZE + UNERBUS_ACK_SIZE;
+    case CMD_SET_PIVOT_TURN_DPS:
+        pivot_turn_target_dps = UNERBUS_GetUInt16(aBus);
+        if (pivot_turn_target_dps > turn_max_pwm)
+            pivot_turn_target_dps = turn_max_pwm; // No puede ser mayor que la máxima
         break;
-    case CMD_GET_TURN_MIN_SPEED:
+    case CMD_GET_PIVOT_TURN_DPS:
         uint8_t min_speed_buffer[UNERBUS_TURN_MIN_SPEED_SIZE];
-        min_speed_buffer[0] = (uint8_t)(turn_min_speed & 0xFF);
-        min_speed_buffer[1] = (uint8_t)((turn_min_speed >> 8) & 0xFF);
+        min_speed_buffer[0] = (uint8_t)(pivot_turn_target_dps & 0xFF);
+        min_speed_buffer[1] = (uint8_t)((pivot_turn_target_dps >> 8) & 0xFF);
         UNERBUS_Write(aBus, min_speed_buffer, UNERBUS_TURN_MIN_SPEED_SIZE);
         length = UNERBUS_CMD_ID_SIZE + UNERBUS_TURN_MIN_SPEED_SIZE;
         break;
@@ -658,8 +617,6 @@ void DecodeCMD(struct UNERBUSHandle *aBus, uint8_t iStartData)
         wall_threshold_mm_side = UNERBUS_GetUInt16(aBus);
         wall_threshold_mm_diagonal = UNERBUS_GetUInt16(aBus);
         after_turn_wall_threshold_mm = UNERBUS_GetUInt16(aBus);
-        UNERBUS_WriteByte(aBus, CMD_ACK);
-        length = UNERBUS_CMD_ID_SIZE + UNERBUS_ACK_SIZE;
         break;
     case CMD_GET_WALL_THRESHOLDS:
         uint8_t thresholds_buffer[UNERBUS_WALL_THRESHOLDS_SIZE];
@@ -676,13 +633,14 @@ void DecodeCMD(struct UNERBUSHandle *aBus, uint8_t iStartData)
         break;
     case CMD_SET_WALL_TARGET_ADC:
         wall_target_mm = UNERBUS_GetUInt16(aBus);
-        UNERBUS_WriteByte(aBus, CMD_ACK);
-        length = UNERBUS_CMD_ID_SIZE + UNERBUS_ACK_SIZE;
+        tape_detection_threshold_adc = UNERBUS_GetUInt16(aBus);
         break;
     case CMD_GET_WALL_TARGET_ADC:
         uint8_t target_buffer[UNERBUS_WALL_TARGET_ADC_SIZE];
         target_buffer[0] = (uint8_t)(wall_target_mm & 0xFF);
         target_buffer[1] = (uint8_t)((wall_target_mm >> 8) & 0xFF);
+        target_buffer[2] = (uint8_t)(tape_detection_threshold_adc & 0xFF);
+        target_buffer[3] = (uint8_t)((tape_detection_threshold_adc >> 8) & 0xFF);
         UNERBUS_Write(aBus, target_buffer, UNERBUS_WALL_TARGET_ADC_SIZE);
         length = UNERBUS_CMD_ID_SIZE + UNERBUS_WALL_TARGET_ADC_SIZE;
         break;
@@ -718,8 +676,6 @@ void DecodeCMD(struct UNERBUSHandle *aBus, uint8_t iStartData)
         }
         Update_Display_Content();
         SSD_UPDATE_REQUEST = true;
-        UNERBUS_WriteByte(aBus, CMD_ACK);
-        length = UNERBUS_CMD_ID_SIZE + UNERBUS_ACK_SIZE;
         break;
     case CMD_GET_APP_STATE:
         UNERBUS_WriteByte(aBus, (uint8_t)app_state);
@@ -729,8 +685,6 @@ void DecodeCMD(struct UNERBUSHandle *aBus, uint8_t iStartData)
         menu_mode = (MenuModeTypeDef)UNERBUS_GetUInt8(aBus);
         Update_Display_Content();
         SSD_UPDATE_REQUEST = true;
-        UNERBUS_WriteByte(aBus, CMD_ACK);
-        length = UNERBUS_CMD_ID_SIZE + UNERBUS_ACK_SIZE;
         break;
     case CMD_GET_MENU_MODE:
         UNERBUS_WriteByte(aBus, (uint8_t)menu_mode);
@@ -748,8 +702,6 @@ void DecodeCMD(struct UNERBUSHandle *aBus, uint8_t iStartData)
         accel_motion_threshold = UNERBUS_GetUInt16(aBus);
         // Se recibe como u16 para alinear el paquete, pero se usa como u8.
         accel_motion_confirm_ticks = (uint8_t)UNERBUS_GetUInt16(aBus);
-        UNERBUS_WriteByte(aBus, CMD_ACK);
-        length = UNERBUS_CMD_ID_SIZE + UNERBUS_ACK_SIZE;
         break;
     case CMD_GET_CRUISE_PARAMS:
         uint8_t cruise_buffer[UNERBUS_CRUISE_PARAMS_SIZE];
@@ -770,8 +722,6 @@ void DecodeCMD(struct UNERBUSHandle *aBus, uint8_t iStartData)
         braking_pid.kp = (int32_t)(((int64_t)kp_int << FIXED_POINT_SHIFT) / 100);
         braking_pid.ki = (int32_t)(((int64_t)ki_int << FIXED_POINT_SHIFT) / 100);
         braking_pid.kd = (int32_t)(((int64_t)kd_int << FIXED_POINT_SHIFT) / 100);
-        UNERBUS_WriteByte(aBus, CMD_ACK);
-        length = UNERBUS_CMD_ID_SIZE + UNERBUS_ACK_SIZE;
         break;
     case CMD_GET_BRAKING_PID_GAINS:
         uint8_t braking_pid_buffer[UNERBUS_BRAKING_PID_GAINS_SIZE];
@@ -792,8 +742,6 @@ void DecodeCMD(struct UNERBUSHandle *aBus, uint8_t iStartData)
         wall_braking_target_mm = UNERBUS_GetUInt16(aBus);
         braking_accel_stop_threshold = UNERBUS_GetUInt16(aBus);
         PID_Set_Setpoint(&braking_pid, wall_braking_target_mm);
-        UNERBUS_WriteByte(aBus, CMD_ACK);
-        length = UNERBUS_CMD_ID_SIZE + UNERBUS_ACK_SIZE;
         break;
     case CMD_GET_BRAKING_PARAMS:
         uint8_t braking_params_buffer[UNERBUS_BRAKING_PARAMS_SIZE];
@@ -807,8 +755,6 @@ void DecodeCMD(struct UNERBUSHandle *aBus, uint8_t iStartData)
     case CMD_SET_BRAKING_MAX_SPEED:
         braking_max_pwm_offset = UNERBUS_GetUInt16(aBus);
         PID_Set_Output_Limits(&braking_pid, INT_TO_FIXED(-braking_max_pwm_offset), INT_TO_FIXED(braking_max_pwm_offset));
-        UNERBUS_WriteByte(aBus, CMD_ACK);
-        length = UNERBUS_CMD_ID_SIZE + UNERBUS_ACK_SIZE;
         break;
     case CMD_GET_BRAKING_MAX_SPEED:
         uint8_t braking_speed_buffer[UNERBUS_BRAKING_MAX_SPEED_SIZE];
@@ -819,8 +765,6 @@ void DecodeCMD(struct UNERBUSHandle *aBus, uint8_t iStartData)
         break;
     case CMD_SET_BRAKING_MIN_SPEED:
         braking_min_speed = UNERBUS_GetUInt16(aBus);
-        UNERBUS_WriteByte(aBus, CMD_ACK);
-        length = UNERBUS_CMD_ID_SIZE + UNERBUS_ACK_SIZE;
         break;
     case CMD_GET_BRAKING_MIN_SPEED:
         uint8_t braking_min_speed_buffer[UNERBUS_BRAKING_MIN_SPEED_SIZE];
@@ -831,8 +775,6 @@ void DecodeCMD(struct UNERBUSHandle *aBus, uint8_t iStartData)
         break;
     case CMD_SET_BRAKING_DEAD_ZONE:
         braking_dead_zone = UNERBUS_GetUInt16(aBus);
-        UNERBUS_WriteByte(aBus, CMD_ACK);
-        length = UNERBUS_CMD_ID_SIZE + UNERBUS_ACK_SIZE;
         break;
     case CMD_GET_BRAKING_DEAD_ZONE:
         uint8_t braking_dead_zone_buffer[UNERBUS_BRAKING_DEAD_ZONE_SIZE];
@@ -871,9 +813,6 @@ void DecodeCMD(struct UNERBUSHandle *aBus, uint8_t iStartData)
 
         if (slower_motor_smooth_turn_speed > (pwm_max_value - 1))
             slower_motor_smooth_turn_speed = (pwm_max_value - 1); // Limitar al máximo global
-
-        UNERBUS_WriteByte(aBus, CMD_ACK);
-        length = UNERBUS_CMD_ID_SIZE + UNERBUS_ACK_SIZE;
         break;
     case CMD_SET_TURN_VELOCITY_PID_GAINS:
         vel_kp_int = UNERBUS_GetUInt16(aBus);
@@ -882,8 +821,6 @@ void DecodeCMD(struct UNERBUSHandle *aBus, uint8_t iStartData)
         turn_velocity_pid.kp = (int32_t)(((int64_t)vel_kp_int << FIXED_POINT_SHIFT) / 100);
         turn_velocity_pid.ki = (int32_t)(((int64_t)vel_ki_int << FIXED_POINT_SHIFT) / 100);
         turn_velocity_pid.kd = (int32_t)(((int64_t)vel_kd_int << FIXED_POINT_SHIFT) / 100);
-        UNERBUS_WriteByte(aBus, CMD_ACK);
-        length = UNERBUS_CMD_ID_SIZE + UNERBUS_ACK_SIZE;
         break;
     case CMD_GET_TURN_VELOCITY_PID_GAINS:
         uint8_t vel_pid_buffer[UNERBUS_TURN_VELOCITY_PID_GAINS_SIZE];
@@ -901,8 +838,6 @@ void DecodeCMD(struct UNERBUSHandle *aBus, uint8_t iStartData)
         break;
     case CMD_SET_TURN_TARGET_DPS:
         turn_target_dps = UNERBUS_GetUInt16(aBus);
-        UNERBUS_WriteByte(aBus, CMD_ACK);
-        length = UNERBUS_CMD_ID_SIZE + UNERBUS_ACK_SIZE;
         break;
     case CMD_GET_TURN_TARGET_DPS:
         uint8_t dps_buffer[UNERBUS_TURN_TARGET_DPS_SIZE];
@@ -920,8 +855,6 @@ void DecodeCMD(struct UNERBUSHandle *aBus, uint8_t iStartData)
         break;
     case CMD_SET_DELAY_TICKS:
         wall_fade_ticks = UNERBUS_GetUInt8(aBus);
-        UNERBUS_WriteByte(aBus, CMD_ACK);
-        length = UNERBUS_CMD_ID_SIZE + UNERBUS_ACK_SIZE;
         break;
     default:
         // Comando desconocido, enviar ACK de error
@@ -1575,15 +1508,15 @@ void Turn_Start(int16_t angle_degrees)
     }
 
     // 4. Aplicar la velocidad mínima para vencer la inercia
-    if (right_speed > 0 && right_speed < turn_min_speed)
-        right_speed = turn_min_speed;
-    else if (right_speed < 0 && right_speed > -turn_min_speed)
-        right_speed = -turn_min_speed;
+    if (right_speed > 0 && right_speed < pivot_turn_target_dps)
+        right_speed = pivot_turn_target_dps;
+    else if (right_speed < 0 && right_speed > -pivot_turn_target_dps)
+        right_speed = -pivot_turn_target_dps;
 
-    if (left_speed > 0 && left_speed < turn_min_speed)
-        left_speed = turn_min_speed;
-    else if (left_speed < 0 && left_speed > -turn_min_speed)
-        left_speed = -turn_min_speed;
+    if (left_speed > 0 && left_speed < pivot_turn_target_dps)
+        left_speed = pivot_turn_target_dps;
+    else if (left_speed < 0 && left_speed > -pivot_turn_target_dps)
+        left_speed = -pivot_turn_target_dps;
 
     // 5. Aplicar las velocidades calculadas a los motores.
     Set_Motor_Speeds(right_speed, left_speed);
@@ -1606,19 +1539,19 @@ static void Manage_Turn(void)
     {
     case STATE_TURNING_LEFT:
         target_yaw_degrees = -90;
-        target_dps = (int16_t)turn_min_speed; // Un 'gz' positivo es giro a la izquierda.
+        target_dps = (int16_t)pivot_turn_target_dps; // Un 'gz' positivo es giro a la izquierda.
         break;
     case STATE_TURNING_RIGHT:
         target_yaw_degrees = 90;
-        target_dps = -((int16_t)turn_min_speed); // Un 'gz' negativo es giro a la derecha.
+        target_dps = -((int16_t)pivot_turn_target_dps); // Un 'gz' negativo es giro a la derecha.
         break;
     case STATE_TURN_AROUND_LEFT:
         target_yaw_degrees = -180;
-        target_dps = (int16_t)turn_min_speed;
+        target_dps = (int16_t)pivot_turn_target_dps;
         break;
     case STATE_TURN_AROUND_RIGHT:
         target_yaw_degrees = 180;
-        target_dps = -((int16_t)turn_min_speed);
+        target_dps = -((int16_t)pivot_turn_target_dps);
         break;
     default: // Estado inesperado
         Set_Motor_Speeds(0, 0);
@@ -1736,7 +1669,7 @@ static void Update_Gyro_Scaler(void)
         break;
     default:
         // Caso por defecto seguro
-        gyro_z_scaler = 5;
+        gyro_z_scaler = 10;
         break;
     }
 }
@@ -1818,6 +1751,8 @@ static void Handle_Navigating(void)
     dist_front_right_mm = (uint16_t)ADC_To_Distance_mm((uint16_t)Get_Filtered_ADC_Value(SENSOR_FRONT_RIGHT_CH));
     dist_left_lat_mm = (uint16_t)ADC_To_Distance_mm((uint16_t)Get_Filtered_ADC_Value(SENSOR_LEFT_LAT_CH));
     dist_right_lat_mm = (uint16_t)ADC_To_Distance_mm((uint16_t)Get_Filtered_ADC_Value(SENSOR_RIGHT_LAT_CH));
+    adc_rear_floor = (uint16_t)Get_Filtered_ADC_Value(SENSOR_FLOOR_REAR_CH);
+    // adc_front_floor = (uint16_t)Get_Filtered_ADC_Value(SENSOR_FLOOR_FRONT_CH);
     uint16_t front_avg_mm = (uint16_t)((dist_front_left_mm + dist_front_right_mm) / 2);
 
     // Detección de paredes
@@ -1868,25 +1803,15 @@ static void Handle_Navigating(void)
 
     if (wall_diagonal_faded)
     {
-        if (wall_diagonal_faded == LEFT_WALL_FADED)
+        rear_tape_detected = rear_tape_detected || adc_rear_floor < tape_detection_threshold_adc; // Evitar que se borre el estado si proviene de otro lado en el código
+
+        if (rear_tape_detected)
         {
-            if ((left_diagonal_wall_detected || front_wall_detected) && !left_wall_detected)
-            {
-                Handle_Deciding();
-                wall_diagonal_faded = NO_WALL_FADED;
-                wall_fade_counter = 0;
-                return;
-            }
-        }
-        else
-        {
-            if ((right_diagonal_wall_detected || front_wall_detected) && !right_wall_detected)
-            {
-                Handle_Deciding();
-                wall_diagonal_faded = NO_WALL_FADED;
-                wall_fade_counter = 0;
-                return;
-            }
+            rear_tape_detected = false;
+            wall_diagonal_faded = NO_WALL_FADED;
+            wall_fade_counter = 0;
+            Handle_Deciding();
+            return;
         }
     }
 
@@ -1958,18 +1883,12 @@ static void Handle_Straight_Drive(void)
     }
     else
     {
-        dist_front_left_mm = (uint16_t)ADC_To_Distance_mm((uint16_t)Get_Filtered_ADC_Value(SENSOR_FRONT_LEFT_CH));
-        dist_front_right_mm = (uint16_t)ADC_To_Distance_mm((uint16_t)Get_Filtered_ADC_Value(SENSOR_FRONT_RIGHT_CH));
-        dist_diagonal_left_mm = (uint16_t)ADC_To_Distance_mm((uint16_t)Get_Filtered_ADC_Value(SENSOR_DIAGONAL_LEFT_CH));
-        dist_diagonal_right_mm = (uint16_t)ADC_To_Distance_mm((uint16_t)Get_Filtered_ADC_Value(SENSOR_DIAGONAL_RIGHT_CH));
-        uint16_t front_avg_mm = (uint16_t)((dist_front_left_mm + dist_front_right_mm) / 2);
+        adc_rear_floor = (uint16_t)Get_Filtered_ADC_Value(SENSOR_FLOOR_REAR_CH);
+        rear_tape_detected = adc_rear_floor < tape_detection_threshold_adc;
 
-        front_wall_detected = (front_avg_mm < wall_threshold_mm_front);
-        left_diagonal_wall_detected = (dist_diagonal_left_mm < wall_threshold_mm_diagonal);
-        right_diagonal_wall_detected = (dist_diagonal_right_mm < wall_threshold_mm_diagonal);
-
-        if (left_diagonal_wall_detected || right_diagonal_wall_detected || front_wall_detected)
+        if (rear_tape_detected)
         {
+            rear_tape_detected = false;
             Handle_Deciding();
             return;
         }
@@ -2243,8 +2162,12 @@ static int32_t ADC_To_Distance_mm(uint16_t adc_value)
  */
 static void Handle_Smooth_Turn(void)
 {
-    bool wall_detected = false; //
+    bool wall_detected = false;
     int16_t base_right = 0, base_left = 0;
+
+    adc_rear_floor = (uint16_t)Get_Filtered_ADC_Value(SENSOR_FLOOR_REAR_CH);
+    rear_tape_detected = rear_tape_detected || (abs(FIXED_TO_INT(current_yaw_fixed)) > 60 && adc_rear_floor < tape_detection_threshold_adc);
+
     if (robot_state == STATE_SMOOTH_TURN_LEFT)
     {
         dist_diagonal_left_mm = (uint16_t)ADC_To_Distance_mm((uint16_t)Get_Filtered_ADC_Value(SENSOR_DIAGONAL_LEFT_CH));
