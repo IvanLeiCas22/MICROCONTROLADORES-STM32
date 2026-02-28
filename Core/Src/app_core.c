@@ -185,7 +185,7 @@ static int32_t Get_Filtered_ADC_Value(uint8_t channel);
 static void Set_Robot_State(RobotStateTypeDef new_state);
 static void Update_Display_Content(void);
 static int32_t ADC_To_Distance_mm(uint16_t adc_value);
-static void Handle_Straight_Drive(void);
+static void Handle_Straight_Drive(bool have_to_decide);
 static void Modes_State_Machine(void);
 
 //==============================================================================
@@ -1781,7 +1781,7 @@ static void Handle_Navigating(void)
             {
                 wall_fade_counter = 0;
                 wall_diagonal_faded = NO_WALL_FADED;
-                Set_Robot_State(STATE_STRAIGHT_DRIVE);
+                Set_Robot_State(STATE_STRAIGHT_DRIVE_DESIDING);
                 PID_Reset(&centering_pid);
                 PID_Set_Setpoint(&centering_pid, FIXED_TO_INT(current_yaw_fixed));
                 return;
@@ -1830,8 +1830,13 @@ static void Handle_Navigating(void)
             motion_confirm_counter = 0;
         }
     }
+
     uint16_t current_left_base_speed = kick_start_active ? (left_motor_base_speed + motor_kick_start_speed) : left_motor_base_speed;
     uint16_t current_right_base_speed = kick_start_active ? (right_motor_base_speed + motor_kick_start_speed) : right_motor_base_speed;
+
+    // Disminución de la velocidad al dejar de detectar pared en diagonal
+    current_left_base_speed = wall_diagonal_faded ? ((uint32_t)current_left_base_speed * 80)/100 : current_left_base_speed;
+    current_right_base_speed = wall_diagonal_faded ? ((uint32_t)current_right_base_speed * 80)/100 : current_right_base_speed;
 
     int32_t pid_output_fixed = 0;
 
@@ -1866,7 +1871,7 @@ static void Handle_Navigating(void)
  * @brief Maneja el estado de avance recto usando el PID de yaw.
  *        Se detiene si detecta un obstáculo frontal.
  */
-static void Handle_Straight_Drive(void)
+static void Handle_Straight_Drive(bool have_to_decide)
 {
     if (menu_mode == MENU_MODE_DRIVE_STRAIGHT)
     {
@@ -1889,7 +1894,17 @@ static void Handle_Straight_Drive(void)
         if (rear_tape_detected)
         {
             rear_tape_detected = false;
-            Handle_Deciding();
+            if (have_to_decide)
+            {
+            	Handle_Deciding();
+            }
+            else
+            {
+            	Set_Robot_State(STATE_NAVIGATING);
+				PID_Reset(&centering_pid);
+				kick_start_active = true;
+				motion_confirm_counter = 0;
+            }
             return;
         }
     }
@@ -1905,6 +1920,11 @@ static void Handle_Straight_Drive(void)
 
 static void Handle_Deciding(void)
 {
+	uint8_t posibleOptions = 0;
+	uint8_t validOptions[4] = {0,0,0,0};
+	uint8_t validOptionsCounter = 0;
+	enum Direcciones { ATRAS, ADELANTE, DERECHA, IZQUIERDA };
+
     dist_left_lat_mm = (uint16_t)ADC_To_Distance_mm((uint16_t)Get_Filtered_ADC_Value(SENSOR_LEFT_LAT_CH));
     dist_right_lat_mm = (uint16_t)ADC_To_Distance_mm((uint16_t)Get_Filtered_ADC_Value(SENSOR_RIGHT_LAT_CH));
     dist_front_left_mm = (uint16_t)ADC_To_Distance_mm((uint16_t)Get_Filtered_ADC_Value(SENSOR_FRONT_LEFT_CH));
@@ -1914,31 +1934,55 @@ static void Handle_Deciding(void)
     right_wall_detected = (dist_right_lat_mm < wall_threshold_mm_side);
     front_wall_detected = ((dist_front_left_mm + dist_front_right_mm) / 2) < wall_threshold_mm_front;
 
-    if (!left_wall_detected)
+    // Analizar las opciones (asumiendo que 1 siempre es "atrás" y está libre)
+    // Bit 0: Atrás (Siempre 1)
+    // Bit 1: Adelante
+    // Bit 2: Derecha
+    // Bit 3: Izquierda
+    posibleOptions = ((!left_wall_detected)  << 3) |
+                     ((!right_wall_detected) << 2) |
+                     ((!front_wall_detected) << 1) |
+                     (1 << 0); // El camino de atrás siempre suele estar libre
+
+    // Si solo está disponible el camino hacia atrás
+    if (posibleOptions == 1)
+    {
+    	Turn_Start(180); // Callejón sin salida
+    	return;
+    }
+
+    for (uint8_t i = 1; i < 4; i++)
+    {
+        // Verificamos si el bit 'i' está encendido
+        if (posibleOptions & (1 << i))
+        {
+            validOptions[validOptionsCounter] = i;
+            validOptionsCounter++;
+        }
+    }
+
+    // Elegimos una opción al azar:
+    uint8_t choice = validOptions[rand() % validOptionsCounter];
+
+    if (choice == IZQUIERDA)
     {
         Set_Robot_State(STATE_SMOOTH_TURN_LEFT); // Prioridad a la izquierda
         current_yaw_fixed = 0;
         PID_Reset(&turn_velocity_pid);
         PID_Set_Setpoint(&turn_velocity_pid, turn_target_dps); // Valores positivos de gz para giro a la izquierda
     }
-    else if (!right_wall_detected)
+    else if (choice == DERECHA)
     {
         Set_Robot_State(STATE_SMOOTH_TURN_RIGHT);
         current_yaw_fixed = 0;
         PID_Reset(&turn_velocity_pid);
         PID_Set_Setpoint(&turn_velocity_pid, -turn_target_dps); // Valores negativos de gz para giro a la derecha
     }
-    else if (!front_wall_detected)
+    else if (choice == ADELANTE)
     {
-        Set_Robot_State(STATE_NAVIGATING);
-        current_yaw_fixed = 0;
-        PID_Reset(&centering_pid);
-        kick_start_active = true;
-        motion_confirm_counter = 0;
-    }
-    else
-    {
-        Turn_Start(180); // Callejón sin salida
+    	Set_Robot_State(STATE_STRAIGHT_DRIVE);
+		PID_Reset(&centering_pid);
+		PID_Set_Setpoint(&centering_pid, FIXED_TO_INT(current_yaw_fixed));
     }
 }
 
@@ -2238,7 +2282,9 @@ static void Modes_State_Machine(void)
             case STATE_LEFT_WALL_FADE:
             case STATE_RIGHT_WALL_FADE:
             case STATE_STRAIGHT_DRIVE:
-                Handle_Straight_Drive();
+                Handle_Straight_Drive(false);
+            case STATE_STRAIGHT_DRIVE_DESIDING:
+            	Handle_Straight_Drive(true);
                 break;
             case STATE_TURNING_LEFT:
             case STATE_TURNING_RIGHT:
@@ -2280,7 +2326,7 @@ static void Modes_State_Machine(void)
                 Handle_Braking();
                 break;
             case STATE_STRAIGHT_DRIVE:
-                Handle_Straight_Drive();
+                Handle_Straight_Drive(false);
                 break;
             default:
                 // No hacer nada, permite que los comandos externos

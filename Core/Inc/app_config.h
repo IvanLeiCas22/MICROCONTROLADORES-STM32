@@ -155,6 +155,7 @@ typedef enum
     STATE_SMOOTH_TURN_LEFT,
     STATE_SMOOTH_TURN_RIGHT,
     STATE_STRAIGHT_DRIVE,
+	STATE_STRAIGHT_DRIVE_DESIDING,
     STATE_LEFT_WALL_FADE,
     STATE_RIGHT_WALL_FADE,
     STATE_TURN_AROUND_RIGHT,
@@ -283,9 +284,9 @@ extern uint16_t pwm_max_value;
 #define HEARTBEAT_RUNNING_MANUAL_CONTROL 0xF0F0F0F0 // <--- AÑADIR ESTA LÍNEA (Blink constante y rápido)
 
 /* Wifi Settings */
-#define WIFI_SSID "InternetPlus_8e2fbb"
-#define WIFI_PASSWORD "Akhantos2340"
-#define WIFI_UDP_REMOTE_IP "192.168.1.120"
+#define WIFI_SSID "FCAL"
+#define WIFI_PASSWORD "fcalconcordia.06-2019"
+#define WIFI_UDP_REMOTE_IP "172.23.225.120"
 #define WIFI_UDP_REMOTE_PORT 30010
 #define WIFI_UDP_LOCAL_PORT 30000
 
