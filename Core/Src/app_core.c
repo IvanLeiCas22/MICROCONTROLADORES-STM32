@@ -1799,6 +1799,7 @@ static void Handle_Navigating(void)
     else
     {
         wall_fade_counter = 0; // Resetear contador si hay paredes detectadas
+        wall_diagonal_faded = 0; // Resetear estado de pared desvanecida
     }
 
     if (wall_diagonal_faded)
@@ -1848,18 +1849,28 @@ static void Handle_Navigating(void)
     }
     else if (right_diagonal_wall_detected)
     {
-        PID_Set_Setpoint(&centering_pid, wall_target_mm);
+/*         PID_Set_Setpoint(&centering_pid, wall_target_mm);
         pid_output_fixed = PID_Update(&centering_pid, dist_right_lat_mm, 10);
-        pid_output_fixed = -pid_output_fixed;
+        pid_output_fixed = -pid_output_fixed; */
+
+        int32_t measured_diff = (wall_target_mm - dist_right_lat_mm)*2; // Se multiplica por 2 para dar más peso a la corrección al perder la pared diagonal, ya que solo queda una referencia.
+        PID_Set_Setpoint(&centering_pid, 0);
+        pid_output_fixed = PID_Update(&centering_pid, measured_diff, 10);
     }
     else if (left_diagonal_wall_detected)
     {
-        PID_Set_Setpoint(&centering_pid, wall_target_mm);
-        pid_output_fixed = PID_Update(&centering_pid, dist_left_lat_mm, 10);
+/*         PID_Set_Setpoint(&centering_pid, wall_target_mm);
+        pid_output_fixed = PID_Update(&centering_pid, dist_left_lat_mm, 10); */
+
+        int32_t measured_diff = (dist_left_lat_mm - wall_target_mm)*2; // Se multiplica por 2 para dar más peso a la corrección al perder la pared diagonal, ya que solo queda una referencia.
+        PID_Set_Setpoint(&centering_pid, 0);
+        pid_output_fixed = PID_Update(&centering_pid, measured_diff, 10);
     }
     else
     {
         // CASO 4: Sin paredes.
+        PID_Set_Setpoint(&centering_pid, 0);
+        pid_output_fixed = PID_Update(&centering_pid, 0, 10);
         return;
     }
 
@@ -1980,9 +1991,19 @@ static void Handle_Deciding(void)
     }
     else if (choice == ADELANTE)
     {
-    	Set_Robot_State(STATE_STRAIGHT_DRIVE);
-		PID_Reset(&centering_pid);
-		PID_Set_Setpoint(&centering_pid, FIXED_TO_INT(current_yaw_fixed));
+        if (left_wall_detected || right_wall_detected)
+        {
+            Set_Robot_State(STATE_NAVIGATING);
+            PID_Reset(&centering_pid);
+/*             kick_start_active = true;
+            motion_confirm_counter = 0; */
+        }
+        else
+        {
+            Set_Robot_State(STATE_STRAIGHT_DRIVE);
+            PID_Reset(&centering_pid);
+            PID_Set_Setpoint(&centering_pid, FIXED_TO_INT(current_yaw_fixed));
+        }	
     }
 }
 
@@ -2227,12 +2248,12 @@ static void Handle_Smooth_Turn(void)
         base_left = (int16_t)faster_motor_smooth_turn_speed;  // exterior
     }
 
-    if (!wall_detected)
+/*     if (!wall_detected)
     {
         dist_front_left_mm = (uint16_t)ADC_To_Distance_mm((uint16_t)Get_Filtered_ADC_Value(SENSOR_FRONT_LEFT_CH));
         dist_front_right_mm = (uint16_t)ADC_To_Distance_mm((uint16_t)Get_Filtered_ADC_Value(SENSOR_FRONT_RIGHT_CH));
         wall_detected = (dist_front_left_mm < (wall_threshold_mm_braking_start) || dist_front_right_mm < (wall_threshold_mm_braking_start));
-    }
+    } */
 
     if (wall_detected || (abs(FIXED_TO_INT(current_yaw_fixed)) >= (90 - TURN_COMPLETION_DEAD_ZONE)))
     {
@@ -2283,6 +2304,7 @@ static void Modes_State_Machine(void)
             case STATE_RIGHT_WALL_FADE:
             case STATE_STRAIGHT_DRIVE:
                 Handle_Straight_Drive(false);
+                break;
             case STATE_STRAIGHT_DRIVE_DESIDING:
             	Handle_Straight_Drive(true);
                 break;
