@@ -1841,13 +1841,13 @@ static void Handle_Navigating(void)
 
     int32_t pid_output_fixed = 0;
 
-    if (left_diagonal_wall_detected && right_diagonal_wall_detected)
+    if (left_diagonal_wall_detected && right_diagonal_wall_detected && left_wall_detected && right_wall_detected)
     {
         int32_t measured_diff = dist_left_lat_mm - dist_right_lat_mm;
         PID_Set_Setpoint(&centering_pid, 0);
         pid_output_fixed = PID_Update(&centering_pid, measured_diff, 10);
     }
-    else if (right_diagonal_wall_detected)
+    else if (right_diagonal_wall_detected && right_wall_detected)
     {
 /*         PID_Set_Setpoint(&centering_pid, wall_target_mm);
         pid_output_fixed = PID_Update(&centering_pid, dist_right_lat_mm, 10);
@@ -1857,7 +1857,7 @@ static void Handle_Navigating(void)
         PID_Set_Setpoint(&centering_pid, 0);
         pid_output_fixed = PID_Update(&centering_pid, measured_diff, 10);
     }
-    else if (left_diagonal_wall_detected)
+    else if (left_diagonal_wall_detected && left_wall_detected)
     {
 /*         PID_Set_Setpoint(&centering_pid, wall_target_mm);
         pid_output_fixed = PID_Update(&centering_pid, dist_left_lat_mm, 10); */
