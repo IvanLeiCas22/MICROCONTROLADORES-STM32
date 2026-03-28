@@ -169,6 +169,20 @@ typedef enum
     NO_WALL_FADED = 0
 } WallFadeTypesTypeDef;
 
+//--- Laberinto ---
+typedef enum {
+    HEADING_NORTH = 0,
+    HEADING_EAST  = 1,
+    HEADING_SOUTH = 2,
+    HEADING_WEST  = 3
+} HeadingTypeDef;
+
+typedef enum {
+    TURN_RIGHT = 1,
+    TURN_LEFT  = -1,
+    TURN_AROUND = 2
+} TurnTypeDef;
+
 //==============================================================================
 // DEFINICIONES Y MACROS
 //==============================================================================
@@ -344,5 +358,17 @@ extern uint16_t pwm_max_value;
 
 /* --- Go straight --- */
 #define FRONT_OBSTACLE_STOP_DISTANCE_MM 50
+
+/* --- Laberinto --- */
+// Definición de bits para cada celda
+#define WALL_NORTH  0x01 // 0000 0001
+#define WALL_SOUTH  0x02 // 0000 0010
+#define WALL_EAST   0x04 // 0000 0100
+#define WALL_WEST   0x08 // 0000 1000
+#define CELL_VISITED 0x10 // 0001 0000
+#define CELL_SPECIAL 0x20 // 0010 0000
+// Tamaño del arreglo lógico (15x15) para laberinto físico de 8x8
+#define MAZE_WIDTH  15
+#define MAZE_HEIGHT 15
 
 #endif /* INC_APP_CONFIG_H_ */

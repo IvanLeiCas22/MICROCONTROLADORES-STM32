@@ -4,6 +4,7 @@
 
 #include <stdlib.h>
 #include <stdio.h> // Para snprintf
+#include <string.h> // Para memset
 
 #include "usbd_cdc_if.h"
 #include "ESP01.h"
@@ -57,6 +58,23 @@ typedef struct
     uint16_t y0;       // Distancia en mm correspondiente a x0
     int32_t slope_q16; // Pendiente (y1 - y0) / (x1 - x0) en formato Q16.16
 } ADC_LutSeg_t;
+
+// Coordenadas actuales del robot
+typedef struct {
+    uint8_t x;
+    uint8_t y;
+    HeadingTypeDef heading; // Dirección a la que mira: NORTH, SOUTH, EAST, WEST
+} RobotPosition_t;
+
+// Fila = Heading (N, E, S, W)
+// Columna = Sensor (Frente, Derecha, Izquierda)
+const uint8_t wall_lut[4][3] = {
+    // FTE           DER           IZQ
+    {WALL_NORTH, WALL_EAST,  WALL_WEST }, // HEADING_NORTH (0)
+    {WALL_EAST,  WALL_SOUTH, WALL_NORTH}, // HEADING_EAST  (1)
+    {WALL_SOUTH, WALL_WEST,  WALL_EAST }, // HEADING_SOUTH (2)
+    {WALL_WEST,  WALL_NORTH, WALL_SOUTH}  // HEADING_WEST  (3)
+};
 
 //==============================================================================
 // VARIABLES GLOBALES DEL MÓDULO
@@ -147,6 +165,11 @@ uint8_t accel_motion_confirm_ticks;
 static bool kick_start_active = false;
 static uint8_t motion_confirm_counter = 0;
 
+/* --- Laberinto --- */
+// El mapa completo. Todo el laberinto entra en 225 Bytes de RAM
+uint8_t maze_map[MAZE_WIDTH][MAZE_HEIGHT];
+RobotPosition_t current_pos;
+
 //==============================================================================
 // PROTOTIPOS DE FUNCIONES PRIVADAS
 //==============================================================================
@@ -173,6 +196,11 @@ static void Update_Gyro_Scaler(void);
 static void Set_Motor_Speeds(int16_t right_speed, int16_t left_speed);
 
 static void Handle_Idle(void);
+static void Reset_Robot_Position(void);
+static void Reset_Maze_State(void);
+static void Current_Cell_Mapping(void);
+static void Update_Robot_Heading(int8_t turn_direction);
+static void Draw_MiniMap_On_OLED(void);
 static void Handle_Navigating(void);
 static void Handle_Braking(void);
 static void Handle_Deciding();
@@ -661,6 +689,12 @@ void DecodeCMD(struct UNERBUSHandle *aBus, uint8_t iStartData)
                 Set_Robot_State(STATE_NAVIGATING); // Aquí se inicia el movimiento
                 kick_start_active = true;
                 motion_confirm_counter = 0;
+                
+                if (menu_mode == MENU_MODE_FIND_CELLS) {
+                    Reset_Maze_State();
+                } else if (menu_mode == MENU_MODE_GO_TO_B) {
+                    Reset_Robot_Position();
+                }
             }
             else
             {
@@ -1174,6 +1208,14 @@ static void ManageButtonEvents(void)
                 {
                     kick_start_active = true;
                     motion_confirm_counter = 0;
+                    
+                    if (menu_mode == MENU_MODE_FIND_CELLS) {
+                        Reset_Maze_State();
+                    } else if (menu_mode == MENU_MODE_GO_TO_B) {
+                        Reset_Robot_Position();
+                    }
+                    
+                    rear_tape_detected = true; // Para forzar actualización de la casilla
                 }
                 if (menu_mode == MENU_MODE_DRIVE_STRAIGHT)
                 {
@@ -1522,6 +1564,13 @@ void Turn_Start(int16_t angle_degrees)
     Set_Motor_Speeds(right_speed, left_speed);
 } */
 
+// Actualiza la orientación luego de un giro. 
+// turn_direction: 1 (Giro Derecha), -1 (Giro Izquierda), 2 (Media Vuelta)
+static void Update_Robot_Heading(int8_t turn_direction) {
+    // Sumamos 4 antes de aplicar módulo 4 para evitar problemas matemáticos con números negativos en C
+    current_pos.heading = (HeadingTypeDef)((current_pos.heading + turn_direction + 4) % 4);
+}
+
 /**
  * @brief Gestiona el estado de giro del robot usando un controlador PID de velocidad angular.
  *        Este método utiliza 'turn_pid' para alcanzar y mantener una velocidad angular objetivo
@@ -1576,6 +1625,7 @@ static void Manage_Turn(void)
             PID_Reset(&braking_pid);
             kick_start_active = true;
             motion_confirm_counter = 0;
+            Update_Robot_Heading(TURN_AROUND); // Solo TURN_AROUND considerado ya que no se usa giro pivot para otro tipo de giro
         }
         return;
     }
@@ -1742,6 +1792,107 @@ static int32_t Get_Filtered_ADC_Value(uint8_t channel)
     return (int32_t)adc_filtered_avg[channel];
 }
 
+// Actualiza la posición (x, y) asumiendo que el robot avanzó 1 celda hacia el frente
+static void Update_Robot_Position(void) {
+    switch (current_pos.heading) {
+        case HEADING_NORTH:
+            if (current_pos.y < MAZE_HEIGHT - 1) current_pos.y++;
+            break;
+        case HEADING_EAST:
+            if (current_pos.x < MAZE_WIDTH - 1) current_pos.x++;
+            break;
+        case HEADING_SOUTH:
+            if (current_pos.y > 0) current_pos.y--;
+            break;
+        case HEADING_WEST:
+            if (current_pos.x > 0) current_pos.x--;
+            break;
+    }
+}
+
+static void Current_Cell_Mapping(void) {
+    uint8_t cell_data = CELL_VISITED;
+    
+    // Indexamos directamente el array en O(1)
+    if(front_wall_detected) cell_data |= wall_lut[current_pos.heading][0];
+    if(right_wall_detected) cell_data |= wall_lut[current_pos.heading][1];
+    if(left_wall_detected)  cell_data |= wall_lut[current_pos.heading][2];
+    
+    // Volcamos al mapa la celda actual
+    maze_map[current_pos.x][current_pos.y] |= cell_data;
+    
+    // --- LÓGICA AUXILIAR PARA CELDAS VECINAS ---
+    // IMPORTANTE: Asume que "Norte" es Y creciente (y+1) y "Este" es X creciente (x+1).
+    // Las condicionales evitan desbordar el arreglo de memoria (ej. x < MAZE_WIDTH-1).
+    
+    if ((cell_data & WALL_NORTH) && (current_pos.y < MAZE_HEIGHT - 1)) {
+        maze_map[current_pos.x][current_pos.y + 1] |= WALL_SOUTH;
+    }
+    if ((cell_data & WALL_SOUTH) && (current_pos.y > 0)) {
+        maze_map[current_pos.x][current_pos.y - 1] |= WALL_NORTH;
+    }
+    if ((cell_data & WALL_EAST) && (current_pos.x < MAZE_WIDTH - 1)) {
+        maze_map[current_pos.x + 1][current_pos.y] |= WALL_WEST;
+    }
+    if ((cell_data & WALL_WEST) && (current_pos.x > 0)) {
+        maze_map[current_pos.x - 1][current_pos.y] |= WALL_EAST;
+    }
+}
+
+static void Reset_Robot_Position(void) {
+    current_pos.x = 7;
+    current_pos.y = 7;
+    current_pos.heading = HEADING_NORTH;
+}
+
+static void Reset_Maze_State(void) {
+    memset(maze_map, 0, sizeof(maze_map));
+    Reset_Robot_Position();
+}
+
+void Draw_MiniMap_On_OLED(void) {
+    // 1. Limpiamos el buffer de memoria de la pantalla
+    SSD1306_Clear(&hssd);
+    
+    // 2. Definimos DÓNDE arranca el mapa (X=64 es la mitad de la pantalla, Y=2 es para no tocar el borde superior)
+    int offset_x = 64; 
+    int offset_y = 2;
+    // 3. Recorremos TODA la matriz lógica comprobando las celdas
+    for (int x = 0; x < MAZE_WIDTH; x++) {
+        for (int y = 0; y < MAZE_HEIGHT; y++) {
+            
+            uint8_t cell = maze_map[x][y];
+            
+            // Solo dibujamos la celda si el robot ya la visitó
+            if (cell & CELL_VISITED) {
+                
+                // Calculamos en qué píxel (px, py) cae la esquina superior izquierda de esta celda (4x4 píxeles)
+                int px = offset_x + (x * 4);
+                // Invertimos la Y, porque en matemática Y crece hacia arriba, pero en las pantallas Y crece hacia abajo
+                int py = offset_y + ((MAZE_HEIGHT - 1 - y) * 4); 
+                // Pintamos un pequeño puntito interno para saber que fue el piso pisado
+                SSD1306_DrawPixel(&hssd, px + 1, py + 1, true);
+                SSD1306_DrawPixel(&hssd, px + 2, py + 2, true);
+                // Dibujar las paredes usando líneas alrededor de ese bloque de 4x4
+                if (cell & WALL_NORTH) SSD1306_DrawLine(&hssd, px, py, px + 3, py, true); // Techo
+                if (cell & WALL_SOUTH) SSD1306_DrawLine(&hssd, px, py + 3, px + 3, py + 3, true); // Piso
+                if (cell & WALL_WEST)  SSD1306_DrawLine(&hssd, px, py, px, py + 3, true); // Pared Izq
+                if (cell & WALL_EAST)  SSD1306_DrawLine(&hssd, px + 3, py, px + 3, py + 3, true); // Pared Der
+            }
+        }
+    }
+    
+    // 4. Dibujamos DÓNDE está nuestro robot ahora mismo (será un cuadradito súper blanco de 4x4)
+    int robot_px = offset_x + (current_pos.x * 4);
+    int robot_py = offset_y + ((MAZE_HEIGHT - 1 - current_pos.y) * 4);
+    SSD1306_DrawRect(&hssd, robot_px, robot_py, 4, 4, true);
+    // 5. Aprovechamos la otra mitad de la pantalla para textos útiles (opcional)
+    SSD1306_DrawText(&hssd, 0, 0, "LABERINTO", SSD1306_TEXT_ALIGN_LEFT);
+    
+    // Por último, requerimos la actualización de la pantalla
+    SSD_UPDATE_REQUEST = true;
+}
+
 static void Handle_Navigating(void)
 {
     // Lectura de sensores
@@ -1752,6 +1903,7 @@ static void Handle_Navigating(void)
     dist_left_lat_mm = (uint16_t)ADC_To_Distance_mm((uint16_t)Get_Filtered_ADC_Value(SENSOR_LEFT_LAT_CH));
     dist_right_lat_mm = (uint16_t)ADC_To_Distance_mm((uint16_t)Get_Filtered_ADC_Value(SENSOR_RIGHT_LAT_CH));
     adc_rear_floor = (uint16_t)Get_Filtered_ADC_Value(SENSOR_FLOOR_REAR_CH);
+    rear_tape_detected = rear_tape_detected || adc_rear_floor < tape_detection_threshold_adc; // Evitar que se borre el estado si proviene de otro lado en el código
     // adc_front_floor = (uint16_t)Get_Filtered_ADC_Value(SENSOR_FLOOR_FRONT_CH);
     uint16_t front_avg_mm = (uint16_t)((dist_front_left_mm + dist_front_right_mm) / 2);
 
@@ -1802,17 +1954,28 @@ static void Handle_Navigating(void)
         wall_diagonal_faded = 0; // Resetear estado de pared desvanecida
     }
 
-    if (wall_diagonal_faded)
+    if (rear_tape_detected)
     {
-        rear_tape_detected = rear_tape_detected || adc_rear_floor < tape_detection_threshold_adc; // Evitar que se borre el estado si proviene de otro lado en el código
-
-        if (rear_tape_detected)
+        // 1. Llegué a una nueva celda, me muevo lógicamente
+        Update_Robot_Position();
+        // 2. Ahora que ya pisé mi nueva (x,y), la mapeo buscando paredes
+        Current_Cell_Mapping();
+        Draw_MiniMap_On_OLED();
+        
+        // 3. Evaluamos si veníamos esperando esta línea para tomar una decisión
+        if (wall_diagonal_faded)
         {
             rear_tape_detected = false;
             wall_diagonal_faded = NO_WALL_FADED;
             wall_fade_counter = 0;
             Handle_Deciding();
             return;
+        }
+        else 
+        {
+            // Si íbamos por un pasillo recto y no hay decisiones que tomar, 
+            // IGUALMENTE debemos apagar la bandera para no sumar +10 posiciones en 100ms.
+            rear_tape_detected = false; 
         }
     }
 
@@ -1936,14 +2099,14 @@ static void Handle_Deciding(void)
 	uint8_t validOptionsCounter = 0;
 	enum Direcciones { ATRAS, ADELANTE, DERECHA, IZQUIERDA };
 
-    dist_left_lat_mm = (uint16_t)ADC_To_Distance_mm((uint16_t)Get_Filtered_ADC_Value(SENSOR_LEFT_LAT_CH));
+    /* dist_left_lat_mm = (uint16_t)ADC_To_Distance_mm((uint16_t)Get_Filtered_ADC_Value(SENSOR_LEFT_LAT_CH));
     dist_right_lat_mm = (uint16_t)ADC_To_Distance_mm((uint16_t)Get_Filtered_ADC_Value(SENSOR_RIGHT_LAT_CH));
     dist_front_left_mm = (uint16_t)ADC_To_Distance_mm((uint16_t)Get_Filtered_ADC_Value(SENSOR_FRONT_LEFT_CH));
     dist_front_right_mm = (uint16_t)ADC_To_Distance_mm((uint16_t)Get_Filtered_ADC_Value(SENSOR_FRONT_RIGHT_CH));
 
     left_wall_detected = (dist_left_lat_mm < wall_threshold_mm_side);
     right_wall_detected = (dist_right_lat_mm < wall_threshold_mm_side);
-    front_wall_detected = ((dist_front_left_mm + dist_front_right_mm) / 2) < wall_threshold_mm_front;
+    front_wall_detected = ((dist_front_left_mm + dist_front_right_mm) / 2) < wall_threshold_mm_front; */
 
     // Analizar las opciones (asumiendo que 1 siempre es "atrás" y está libre)
     // Bit 0: Atrás (Siempre 1)
@@ -2262,6 +2425,10 @@ static void Handle_Smooth_Turn(void)
         PID_Reset(&centering_pid);
         kick_start_active = true;
         motion_confirm_counter = 0;
+        if (robot_state == STATE_SMOOTH_TURN_LEFT)
+            Update_Robot_Heading(TURN_LEFT);
+        else if (robot_state == STATE_SMOOTH_TURN_RIGHT)
+            Update_Robot_Heading(TURN_RIGHT);
         return;
     }
 
