@@ -143,7 +143,7 @@ uint16_t braking_dead_zone = BRAKING_DEAD_ZONE_DEFAULT;
 
 bool left_wall_detected = false, right_wall_detected = false, front_wall_detected = false,
      left_diagonal_wall_detected = false, right_diagonal_wall_detected = false, rear_tape_detected = false,
-     front_tape_detected = false;
+     front_tape_detected = false, was_rear_tape_detected = false;
 uint16_t dist_diagonal_left_mm = 0;
 uint16_t dist_diagonal_right_mm = 0;
 uint16_t dist_front_left_mm = 0;
@@ -1903,7 +1903,11 @@ static void Handle_Navigating(void)
     dist_left_lat_mm = (uint16_t)ADC_To_Distance_mm((uint16_t)Get_Filtered_ADC_Value(SENSOR_LEFT_LAT_CH));
     dist_right_lat_mm = (uint16_t)ADC_To_Distance_mm((uint16_t)Get_Filtered_ADC_Value(SENSOR_RIGHT_LAT_CH));
     adc_rear_floor = (uint16_t)Get_Filtered_ADC_Value(SENSOR_FLOOR_REAR_CH);
-    rear_tape_detected = rear_tape_detected || adc_rear_floor < tape_detection_threshold_adc; // Evitar que se borre el estado si proviene de otro lado en el código
+    bool current_rear_tape = (adc_rear_floor < tape_detection_threshold_adc);
+    if (current_rear_tape && !was_rear_tape_detected) {
+        rear_tape_detected = true;
+    }
+    was_rear_tape_detected = current_rear_tape;
     // adc_front_floor = (uint16_t)Get_Filtered_ADC_Value(SENSOR_FLOOR_FRONT_CH);
     uint16_t front_avg_mm = (uint16_t)((dist_front_left_mm + dist_front_right_mm) / 2);
 
@@ -2063,7 +2067,11 @@ static void Handle_Straight_Drive(bool have_to_decide)
     else
     {
         adc_rear_floor = (uint16_t)Get_Filtered_ADC_Value(SENSOR_FLOOR_REAR_CH);
-        rear_tape_detected = adc_rear_floor < tape_detection_threshold_adc;
+        bool current_rear_tape = (adc_rear_floor < tape_detection_threshold_adc);
+        if (current_rear_tape && !was_rear_tape_detected) {
+            rear_tape_detected = true;
+        }
+        was_rear_tape_detected = current_rear_tape;
 
         if (rear_tape_detected)
         {
@@ -2394,7 +2402,11 @@ static void Handle_Smooth_Turn(void)
     int16_t base_right = 0, base_left = 0;
 
     adc_rear_floor = (uint16_t)Get_Filtered_ADC_Value(SENSOR_FLOOR_REAR_CH);
-    rear_tape_detected = rear_tape_detected || (abs(FIXED_TO_INT(current_yaw_fixed)) > 60 && adc_rear_floor < tape_detection_threshold_adc);
+    bool current_rear_tape = (adc_rear_floor < tape_detection_threshold_adc);
+    if ((abs(FIXED_TO_INT(current_yaw_fixed)) > 60) && current_rear_tape && !was_rear_tape_detected) {
+        rear_tape_detected = true;
+    }
+    was_rear_tape_detected = current_rear_tape;
 
     if (robot_state == STATE_SMOOTH_TURN_LEFT)
     {
