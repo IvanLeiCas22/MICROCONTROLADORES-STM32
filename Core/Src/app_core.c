@@ -215,6 +215,7 @@ static void Update_Display_Content(void);
 static int32_t ADC_To_Distance_mm(uint16_t adc_value);
 static void Handle_Straight_Drive(bool have_to_decide);
 static void Modes_State_Machine(void);
+static void Send_Maze_Cell_Update(uint8_t x, uint8_t y, uint8_t cell_data, uint8_t heading);
 
 //==============================================================================
 // IMPLEMENTACIÓN DE WRAPPERS DE CALLBACKS HAL
@@ -1821,6 +1822,9 @@ static void Current_Cell_Mapping(void) {
     // Volcamos al mapa la celda actual
     maze_map[current_pos.x][current_pos.y] |= cell_data;
     
+    // Notificamos a la HMI a través de Unerbus
+    Send_Maze_Cell_Update(current_pos.x, current_pos.y, maze_map[current_pos.x][current_pos.y], current_pos.heading);
+    
     // --- LÓGICA AUXILIAR PARA CELDAS VECINAS ---
     // IMPORTANTE: Asume que "Norte" es Y creciente (y+1) y "Este" es X creciente (x+1).
     // Las condicionales evitan desbordar el arreglo de memoria (ej. x < MAZE_WIDTH-1).
@@ -1837,6 +1841,17 @@ static void Current_Cell_Mapping(void) {
     if ((cell_data & WALL_WEST) && (current_pos.x > 0)) {
         maze_map[current_pos.x - 1][current_pos.y] |= WALL_EAST;
     }
+}
+
+static void Send_Maze_Cell_Update(uint8_t x, uint8_t y, uint8_t cell_data, uint8_t heading) {
+    uint8_t buffer[UNERBUS_UPDATE_MAZE_CELL_SIZE];
+    buffer[0] = x;
+    buffer[1] = y;
+    buffer[2] = cell_data;
+    buffer[3] = heading;
+    
+    UNERBUS_Write(&unerbus_esp01_handle, buffer, UNERBUS_UPDATE_MAZE_CELL_SIZE);
+    UNERBUS_Send(&unerbus_esp01_handle, CMD_UPDATE_MAZE_CELL, UNERBUS_CMD_ID_SIZE + UNERBUS_UPDATE_MAZE_CELL_SIZE);
 }
 
 static void Reset_Robot_Position(void) {
