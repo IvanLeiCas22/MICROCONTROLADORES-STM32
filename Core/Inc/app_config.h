@@ -131,7 +131,9 @@ typedef enum
     CMD_GET_TURN_TARGET_DPS = 0x85,         // Leer la velocidad angular objetivo
     CMD_GET_DELAY_TICKS = 0X90,             // Leer el número de ticks de retardo
     CMD_SET_DELAY_TICKS = 0X91,             // Configurar el número de ticks de retardo
+    CMD_UPDATE_MAZE_CELL = 0x92,            // (STM32 -> Qt) Enviar actualización de info de celda
     CMD_OTHERS
+
 } CommandIdTypeDef;
 
 typedef union
@@ -264,7 +266,8 @@ extern uint16_t pwm_max_value;
 #define UNERBUS_SMOOTH_TURN_CONFIG_SIZE (sizeof(uint16_t) * 2)
 #define UNERBUS_TURN_VELOCITY_PID_GAINS_SIZE (sizeof(uint16_t) * 3)
 #define UNERBUS_TURN_TARGET_DPS_SIZE (sizeof(uint16_t))
-#define UNERBUS_DELAY_TICKS_SIZE (sizeof(uint8_t)) // Número de ticks de retardo como uint8_t
+#define UNERBUS_DELAY_TICKS_SIZE (sizeof(uint8_t))          // Número de ticks de retardo como uint8_t
+#define UNERBUS_MAZE_CELL_UPDATE_SIZE (sizeof(uint8_t) * 4) // x, y, walls, heading
 
 /* USB CDC Buffer Sizes */
 #define USB_CDC_RX_BUFFER_SIZE 128
