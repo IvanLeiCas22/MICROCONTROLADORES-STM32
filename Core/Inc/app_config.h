@@ -133,6 +133,7 @@ typedef enum
     CMD_SET_DELAY_TICKS = 0X91,             // Configurar el número de ticks de retardo
     CMD_UPDATE_MAZE_CELL = 0x92,            // (STM32 -> Qt) Enviar actualización de info de celda
     CMD_OTHERS
+
 } CommandIdTypeDef;
 
 typedef union
@@ -171,16 +172,18 @@ typedef enum
 } WallFadeTypesTypeDef;
 
 //--- Laberinto ---
-typedef enum {
+typedef enum
+{
     HEADING_NORTH = 0,
-    HEADING_EAST  = 1,
+    HEADING_EAST = 1,
     HEADING_SOUTH = 2,
-    HEADING_WEST  = 3
+    HEADING_WEST = 3
 } HeadingTypeDef;
 
-typedef enum {
+typedef enum
+{
     TURN_RIGHT = 1,
-    TURN_LEFT  = -1,
+    TURN_LEFT = -1,
     TURN_AROUND = 2
 } TurnTypeDef;
 
@@ -265,8 +268,8 @@ extern uint16_t pwm_max_value;
 #define UNERBUS_SMOOTH_TURN_CONFIG_SIZE (sizeof(uint16_t) * 2)
 #define UNERBUS_TURN_VELOCITY_PID_GAINS_SIZE (sizeof(uint16_t) * 3)
 #define UNERBUS_TURN_TARGET_DPS_SIZE (sizeof(uint16_t))
-#define UNERBUS_DELAY_TICKS_SIZE (sizeof(uint8_t)) // Número de ticks de retardo como uint8_t
-#define UNERBUS_UPDATE_MAZE_CELL_SIZE (sizeof(uint8_t) * 4) // X, Y, Walls, Heading
+#define UNERBUS_DELAY_TICKS_SIZE (sizeof(uint8_t))          // Número de ticks de retardo como uint8_t
+#define UNERBUS_MAZE_CELL_UPDATE_SIZE (sizeof(uint8_t) * 4) // x, y, walls, heading
 
 /* USB CDC Buffer Sizes */
 #define USB_CDC_RX_BUFFER_SIZE 128
@@ -363,14 +366,14 @@ extern uint16_t pwm_max_value;
 
 /* --- Laberinto --- */
 // Definición de bits para cada celda
-#define WALL_NORTH  0x01 // 0000 0001
-#define WALL_SOUTH  0x02 // 0000 0010
-#define WALL_EAST   0x04 // 0000 0100
-#define WALL_WEST   0x08 // 0000 1000
+#define WALL_NORTH 0x01   // 0000 0001
+#define WALL_SOUTH 0x02   // 0000 0010
+#define WALL_EAST 0x04    // 0000 0100
+#define WALL_WEST 0x08    // 0000 1000
 #define CELL_VISITED 0x10 // 0001 0000
 #define CELL_SPECIAL 0x20 // 0010 0000
 // Tamaño del arreglo lógico (15x15) para laberinto físico de 8x8
-#define MAZE_WIDTH  15
+#define MAZE_WIDTH 15
 #define MAZE_HEIGHT 15
 
 #endif /* INC_APP_CONFIG_H_ */
