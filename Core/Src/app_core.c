@@ -1904,14 +1904,26 @@ static void Handle_Navigating(void)
     dist_front_right_mm = (uint16_t)ADC_To_Distance_mm((uint16_t)Get_Filtered_ADC_Value(SENSOR_FRONT_RIGHT_CH));
     dist_left_lat_mm = (uint16_t)ADC_To_Distance_mm((uint16_t)Get_Filtered_ADC_Value(SENSOR_LEFT_LAT_CH));
     dist_right_lat_mm = (uint16_t)ADC_To_Distance_mm((uint16_t)Get_Filtered_ADC_Value(SENSOR_RIGHT_LAT_CH));
+
+    static uint8_t tape_debounce_counter = 0;
     adc_rear_floor = (uint16_t)Get_Filtered_ADC_Value(SENSOR_FLOOR_REAR_CH);
-    bool current_rear_tape = (adc_rear_floor < tape_detection_threshold_adc);
-    if (current_rear_tape && !was_rear_tape_detected)
+    if (adc_rear_floor < tape_detection_threshold_adc) // ¿Vemos negro?
     {
-        rear_tape_detected = true;
+        if (!was_rear_tape_detected) // Si aún no hemos confirmado y "consumido" esta línea
+        {
+            tape_debounce_counter++;
+            if (tape_debounce_counter >= wall_fade_ticks) 
+            {
+                rear_tape_detected = true;     // Disparamos la bandera (Avanza la celda)
+                was_rear_tape_detected = true; // Bloqueamos para no volver a disparar en la misma cinta
+            }
+        }
     }
-    was_rear_tape_detected = current_rear_tape;
-    // adc_front_floor = (uint16_t)Get_Filtered_ADC_Value(SENSOR_FLOOR_FRONT_CH);
+    else // Vemos blanco (piso normal)
+    {
+        tape_debounce_counter = 0;      // Reseteamos el contador de ruido
+        was_rear_tape_detected = false; // "Armamos" el gatillo para la próxima cinta
+    }
     uint16_t front_avg_mm = (uint16_t)((dist_front_left_mm + dist_front_right_mm) / 2);
 
     // Detección de paredes
@@ -1919,7 +1931,8 @@ static void Handle_Navigating(void)
     right_diagonal_wall_detected = dist_diagonal_right_mm < wall_threshold_mm_diagonal;
     left_wall_detected = dist_left_lat_mm < wall_threshold_mm_side;
     right_wall_detected = dist_right_lat_mm < wall_threshold_mm_side;
-    front_wall_detected = front_avg_mm < wall_threshold_mm_front;
+    front_wall_detected = (dist_front_left_mm < wall_threshold_mm_front) && 
+                      (dist_front_right_mm < wall_threshold_mm_front);
 
     if (front_avg_mm < wall_threshold_mm_braking_start)
     {
@@ -2123,12 +2136,12 @@ static void Handle_Deciding(void)
     dist_front_right_mm = (uint16_t)ADC_To_Distance_mm((uint16_t)Get_Filtered_ADC_Value(SENSOR_FRONT_RIGHT_CH));
     dist_left_lat_mm = (uint16_t)ADC_To_Distance_mm((uint16_t)Get_Filtered_ADC_Value(SENSOR_LEFT_LAT_CH));
     dist_right_lat_mm = (uint16_t)ADC_To_Distance_mm((uint16_t)Get_Filtered_ADC_Value(SENSOR_RIGHT_LAT_CH));
-    uint16_t front_avg_mm = (uint16_t)((dist_front_left_mm + dist_front_right_mm) / 2);
 
     // Detección de paredes
     left_wall_detected = dist_left_lat_mm < wall_threshold_mm_side;
     right_wall_detected = dist_right_lat_mm < wall_threshold_mm_side;
-    front_wall_detected = front_avg_mm < wall_threshold_mm_front;
+    front_wall_detected = (dist_front_left_mm < wall_threshold_mm_front) && 
+                      (dist_front_right_mm < wall_threshold_mm_front);
 
     // Analizar las opciones (asumiendo que 1 siempre es "atrás" y está libre)
     // Bit 0: Atrás (Siempre 1)
@@ -2417,7 +2430,7 @@ static void Handle_Smooth_Turn(void)
 
     adc_rear_floor = (uint16_t)Get_Filtered_ADC_Value(SENSOR_FLOOR_REAR_CH);
     bool current_rear_tape = (adc_rear_floor < tape_detection_threshold_adc);
-    if ((abs(FIXED_TO_INT(current_yaw_fixed)) > 60) && current_rear_tape && !was_rear_tape_detected)
+    if ((abs(FIXED_TO_INT(current_yaw_fixed)) > 45) && current_rear_tape && !was_rear_tape_detected)
     {
         rear_tape_detected = true;
     }
@@ -2438,14 +2451,7 @@ static void Handle_Smooth_Turn(void)
         base_left = (int16_t)faster_motor_smooth_turn_speed;  // exterior
     }
 
-    /*     if (!wall_detected)
-        {
-            dist_front_left_mm = (uint16_t)ADC_To_Distance_mm((uint16_t)Get_Filtered_ADC_Value(SENSOR_FRONT_LEFT_CH));
-            dist_front_right_mm = (uint16_t)ADC_To_Distance_mm((uint16_t)Get_Filtered_ADC_Value(SENSOR_FRONT_RIGHT_CH));
-            wall_detected = (dist_front_left_mm < (wall_threshold_mm_braking_start) || dist_front_right_mm < (wall_threshold_mm_braking_start));
-        } */
-
-    if (wall_detected || (abs(FIXED_TO_INT(current_yaw_fixed)) >= (90 - TURN_COMPLETION_DEAD_ZONE)))
+    if (wall_detected || (abs(FIXED_TO_INT(current_yaw_fixed)) >= (90 - TURN_COMPLETION_DEAD_ZONE)) || rear_tape_detected)
     {
         RobotStateTypeDef completed_turn_state = robot_state;
 
@@ -2459,10 +2465,6 @@ static void Handle_Smooth_Turn(void)
             Update_Robot_Heading(TURN_LEFT);
         else if (completed_turn_state == STATE_SMOOTH_TURN_RIGHT)
             Update_Robot_Heading(TURN_RIGHT);
-
-        // Publicamos heading/pose al finalizar el giro para sincronizar Qt
-        // aunque no haya cruce inmediato de cinta.
-        Send_Maze_Cell_Update();
 
         return;
     }
