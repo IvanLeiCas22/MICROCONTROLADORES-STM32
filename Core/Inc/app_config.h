@@ -132,6 +132,7 @@ typedef enum
     CMD_GET_DELAY_TICKS = 0X90,             // Leer el número de ticks de retardo
     CMD_SET_DELAY_TICKS = 0X91,             // Configurar el número de ticks de retardo
     CMD_UPDATE_MAZE_CELL = 0x92,            // (STM32 -> Qt) Enviar actualización de info de celda
+    CMD_SYNC_MAZE_COLUMN = 0x93,            // Sincronizar 1 columna entera del laberinto
     CMD_OTHERS
 
 } CommandIdTypeDef;

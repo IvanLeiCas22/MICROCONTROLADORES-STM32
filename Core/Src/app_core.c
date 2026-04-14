@@ -894,6 +894,31 @@ void DecodeCMD(struct UNERBUSHandle *aBus, uint8_t iStartData)
     case CMD_SET_DELAY_TICKS:
         wall_fade_ticks = UNERBUS_GetUInt8(aBus);
         break;
+    case CMD_SYNC_MAZE_COLUMN:
+        uint8_t requested_col = UNERBUS_GetUInt8(aBus);
+        
+        // Verificamos que la columna pedida esté dentro del rango (0 a 14)
+        if (requested_col < MAZE_WIDTH)
+        {
+            // Tamaño: 1 byte (col) + 15 bytes (datos) + 3 bytes (x, y, heading) = 19 bytes
+            uint8_t col_buffer[MAZE_HEIGHT + 4]; 
+            uint8_t p_idx = 0;
+            
+            col_buffer[p_idx++] = requested_col; // Columna que estamos enviando
+            
+            for(uint8_t i = 0; i < MAZE_HEIGHT; i++)
+            {
+                col_buffer[p_idx++] = maze_map[requested_col][i];
+            }
+            
+            col_buffer[p_idx++] = current_pos.x;
+            col_buffer[p_idx++] = current_pos.y;
+            col_buffer[p_idx++] = (uint8_t)current_pos.heading;
+
+            UNERBUS_Write(aBus, col_buffer, p_idx);
+            length = UNERBUS_CMD_ID_SIZE + p_idx;
+        }
+        break;
     default:
         // Comando desconocido, enviar ACK de error
         /*         UNERBUS_WriteByte(aBus, CMD_NACK);
@@ -2053,8 +2078,7 @@ static void Handle_Navigating(void)
     else
     {
         // CASO 4: Sin paredes.
-        PID_Set_Setpoint(&centering_pid, 0);
-        pid_output_fixed = PID_Update(&centering_pid, 0, 10);
+        Set_Motor_Speeds(0, 0); 
         return;
     }
 
@@ -2093,9 +2117,15 @@ static void Handle_Straight_Drive(bool have_to_decide)
 
         if (rear_tape_detected)
         {
-            rear_tape_detected = false;
             if (have_to_decide)
             {
+                rear_tape_detected = false;
+                was_rear_tape_detected = true; // Bloqueamos para no volver a disparar en la misma cinta
+
+                Update_Robot_Position();
+                Current_Cell_Mapping();
+                Send_Maze_Cell_Update();
+                
                 Handle_Deciding();
             }
             else
@@ -2430,11 +2460,18 @@ static void Handle_Smooth_Turn(void)
 
     adc_rear_floor = (uint16_t)Get_Filtered_ADC_Value(SENSOR_FLOOR_REAR_CH);
     bool current_rear_tape = (adc_rear_floor < tape_detection_threshold_adc);
-    if ((abs(FIXED_TO_INT(current_yaw_fixed)) > 45) && current_rear_tape && !was_rear_tape_detected)
+
+    // Si vemos blanco, el robot ha salido completamente de cualquier cinta previa
+    if (!current_rear_tape) 
+    {
+        was_rear_tape_detected = false;
+    }
+    // Si vemos negro, no lo habíamos procesado, y ya giramos un umbral seguro (> 45)
+    else if (!was_rear_tape_detected && (abs(FIXED_TO_INT(current_yaw_fixed)) > 45)) 
     {
         rear_tape_detected = true;
+        was_rear_tape_detected = true; // Lo bloqueamos para que no se dispare repetidas veces
     }
-    was_rear_tape_detected = current_rear_tape;
 
     if (robot_state == STATE_SMOOTH_TURN_LEFT)
     {
@@ -2455,16 +2492,37 @@ static void Handle_Smooth_Turn(void)
     {
         RobotStateTypeDef completed_turn_state = robot_state;
 
+        if (completed_turn_state == STATE_SMOOTH_TURN_LEFT)
+            Update_Robot_Heading(TURN_LEFT);
+        else if (completed_turn_state == STATE_SMOOTH_TURN_RIGHT)
+            Update_Robot_Heading(TURN_RIGHT);
+
+        if (rear_tape_detected)
+        {
+            // Releer sensores para mapear la nueva celda con datos frescos
+            dist_front_left_mm  = (uint16_t)ADC_To_Distance_mm((uint16_t)Get_Filtered_ADC_Value(SENSOR_FRONT_LEFT_CH));
+            dist_front_right_mm = (uint16_t)ADC_To_Distance_mm((uint16_t)Get_Filtered_ADC_Value(SENSOR_FRONT_RIGHT_CH));
+            dist_left_lat_mm    = (uint16_t)ADC_To_Distance_mm((uint16_t)Get_Filtered_ADC_Value(SENSOR_LEFT_LAT_CH));
+            dist_right_lat_mm   = (uint16_t)ADC_To_Distance_mm((uint16_t)Get_Filtered_ADC_Value(SENSOR_RIGHT_LAT_CH));
+
+            left_wall_detected  = (dist_left_lat_mm < wall_threshold_mm_side);
+            right_wall_detected = (dist_right_lat_mm < wall_threshold_mm_side);
+            front_wall_detected = (dist_front_left_mm < wall_threshold_mm_front) &&
+                                (dist_front_right_mm < wall_threshold_mm_front);
+
+            Update_Robot_Position();
+            Current_Cell_Mapping();
+            Send_Maze_Cell_Update();
+
+            rear_tape_detected = false;
+            was_rear_tape_detected = true;
+        }
+
         Set_Motor_Speeds(right_motor_base_speed, left_motor_base_speed);
         Set_Robot_State(STATE_NAVIGATING);
         PID_Reset(&centering_pid);
         kick_start_active = true;
         motion_confirm_counter = 0;
-
-        if (completed_turn_state == STATE_SMOOTH_TURN_LEFT)
-            Update_Robot_Heading(TURN_LEFT);
-        else if (completed_turn_state == STATE_SMOOTH_TURN_RIGHT)
-            Update_Robot_Heading(TURN_RIGHT);
 
         return;
     }
