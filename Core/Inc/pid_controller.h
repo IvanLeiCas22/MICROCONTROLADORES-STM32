@@ -1,6 +1,7 @@
 #ifndef PID_CONTROLLER_H
 #define PID_CONTROLLER_H
 
+#include <stdbool.h>
 #include <stdint.h>
 
 // --- Aritmética de Punto Fijo (Formato Q16.16) ---
@@ -37,6 +38,20 @@ typedef struct
 
 } PID_Controller_t;
 
+/**
+ * @brief Configuración reusable de un controlador PID.
+ *        Las ganancias y los límites se almacenan en el mismo formato interno
+ *        usado por el controlador (Q16.16 para ganancias y límites).
+ */
+typedef struct
+{
+    int32_t kp;
+    int32_t ki;
+    int32_t kd;
+    int32_t out_min;
+    int32_t out_max;
+} PID_Config_t;
+
 // --- Prototipos de Funciones Públicas ---
 
 /**
@@ -47,6 +62,14 @@ typedef struct
  * @param kd Ganancia derivativa (en punto fijo).
  */
 void PID_Init(PID_Controller_t *pid, int32_t kp, int32_t ki, int32_t kd);
+
+/**
+ * @brief Aplica una configuración completa al controlador PID.
+ * @param pid Puntero a la estructura del controlador.
+ * @param cfg Configuración a aplicar.
+ * @param reset_state Si es true, reinicia integral y error previo.
+ */
+void PID_ApplyConfig(PID_Controller_t *pid, const PID_Config_t *cfg, bool reset_state);
 
 /**
  * @brief Establece el valor de consigna (setpoint) del PID.

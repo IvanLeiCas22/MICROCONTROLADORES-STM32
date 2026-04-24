@@ -1,10 +1,11 @@
 /* STM32/Test2024-master/Core/Src/app_core.c */
 #include "app_core.h"
 #include "app_config.h"
+#include "app_maze.h"
+#include "app_sensors.h"
 
 #include <stdlib.h>
 #include <stdio.h>  // Para snprintf
-#include <string.h> // Para memset
 
 #include "usbd_cdc_if.h"
 #include "ESP01.h"
@@ -30,58 +31,8 @@ extern DMA_HandleTypeDef hdma_i2c2_rx;
 extern DMA_HandleTypeDef hdma_i2c2_tx;
 
 //==============================================================================
-// Typedefs y Estructuras
-//==============================================================================
-
-// Tabla de consulta (LUT) para linealización de sensores IR
-typedef struct
-{
-    uint16_t adc;
-    uint16_t dist_mm;
-} SensorLutEntry;
-
-static const SensorLutEntry sensor_lut[] = {
-    {30, 150}, {65, 140}, {106, 130}, {135, 120}, {169, 110}, {208, 100}, {260, 90}, {337, 80}, {441, 70}, {511, 65}, {590, 60}, {711, 55}, {827, 50}, {1020, 45}, {1305, 40}, {1613, 35}, {2130, 30}, {2870, 25}, {3760, 20}};
-
-enum
-{
-    ADC_LUT_SIZE = (int)(sizeof(sensor_lut) / sizeof(sensor_lut[0]))
-};
-enum
-{
-    ADC_SEG_COUNT = ADC_LUT_SIZE - 1
-};
-typedef struct
-{
-    uint16_t x0;       // Valor ADC de inicio del segmento
-    uint16_t x1;       // Valor ADC de fin del segmento
-    uint16_t y0;       // Distancia en mm correspondiente a x0
-    int32_t slope_q16; // Pendiente (y1 - y0) / (x1 - x0) en formato Q16.16
-} ADC_LutSeg_t;
-
-// Coordenadas actuales del robot
-typedef struct
-{
-    uint8_t x;
-    uint8_t y;
-    HeadingTypeDef heading; // Dirección a la que mira: NORTH, SOUTH, EAST, WEST
-} RobotPosition_t;
-
-// Fila = Heading (N, E, S, W)
-// Columna = Sensor (Frente, Derecha, Izquierda)
-const uint8_t wall_lut[4][3] = {
-    // FTE           DER           IZQ
-    {WALL_NORTH, WALL_EAST, WALL_WEST},  // HEADING_NORTH (0)
-    {WALL_EAST, WALL_SOUTH, WALL_NORTH}, // HEADING_EAST  (1)
-    {WALL_SOUTH, WALL_WEST, WALL_EAST},  // HEADING_SOUTH (2)
-    {WALL_WEST, WALL_NORTH, WALL_SOUTH}  // HEADING_WEST  (3)
-};
-
-//==============================================================================
 // VARIABLES GLOBALES DEL MÓDULO
 //==============================================================================
-
-static ADC_LutSeg_t adc_lut_segs[ADC_SEG_COUNT];
 
 SystemFlagTypeDef flags0;
 uint16_t pwm_max_value = 10000; // Valor máximo del PWM
@@ -96,13 +47,6 @@ uint8_t buf_rx_esp01[WIFI_RX_BUFFER_SIZE], buf_tx_esp01[WIFI_TX_BUFFER_SIZE], da
 
 uint32_t heartbeat_counter, heartbeat_mask;
 uint8_t time_10ms, time_100ms, timeout_alive_udp;
-
-uint16_t buf_adc[ADC_BUFFER_SIZE][ADC_CHANNELS];
-volatile uint8_t adc_buf_write_idx = 0;
-static uint32_t adc_running_sum[ADC_CHANNELS] = {0};
-static volatile uint16_t adc_filtered_avg[ADC_CHANNELS] = {0};
-static uint8_t adc_samples_accumulated = 0;
-static volatile uint8_t adc_processed_idx = 0;
 
 static MPU6050_HandleTypeDef hmpu;
 static SSD1306_HandleTypeDef hssd;
@@ -121,6 +65,22 @@ PID_Controller_t centering_pid;
 PID_Controller_t turn_pid;
 PID_Controller_t turn_velocity_pid;
 PID_Controller_t braking_pid;
+typedef enum
+{
+    PID_ROLE_CENTERING = 0,
+    PID_ROLE_TURN,
+    PID_ROLE_TURN_VELOCITY,
+    PID_ROLE_BRAKING,
+    PID_ROLE_COUNT
+} PID_Role_t;
+
+static PID_Config_t pid_configs[PID_ROLE_COUNT];
+static PID_Controller_t *const pid_instances[PID_ROLE_COUNT] = {
+    &centering_pid,
+    &turn_pid,
+    &turn_velocity_pid,
+    &braking_pid};
+
 uint16_t right_motor_base_speed = 3575;         // Velocidad base motor derecho
 uint16_t left_motor_base_speed = 4550;          // Velocidad base motor izquierdo
 uint16_t faster_motor_smooth_turn_speed = 6000; // Velocidad del motor más rápido en giro suave
@@ -166,10 +126,8 @@ uint8_t accel_motion_confirm_ticks;
 static bool kick_start_active = false;
 static uint8_t motion_confirm_counter = 0;
 
-/* --- Laberinto --- */
-// El mapa completo. Todo el laberinto entra en 225 Bytes de RAM
-uint8_t maze_map[MAZE_WIDTH][MAZE_HEIGHT];
-RobotPosition_t current_pos;
+// LABERINTO
+static bool pending_initial_cell_seed = false;
 
 //==============================================================================
 // PROTOTIPOS DE FUNCIONES PRIVADAS
@@ -216,6 +174,14 @@ static void Update_Display_Content(void);
 static int32_t ADC_To_Distance_mm(uint16_t adc_value);
 static void Handle_Straight_Drive(bool have_to_decide);
 static void Modes_State_Machine(void);
+static void Update_Navigation_Perception(void);
+static void Commit_Maze_State(int8_t heading_update, bool update_cell, bool send_update);
+static void Init_Pid_Configs(void);
+static void Apply_Pid_Config(PID_Role_t role, bool reset_state);
+static void Set_Pid_Gains_From_U16(PID_Role_t role, uint16_t kp_x100, uint16_t ki_x100, uint16_t kd_x100, bool reset_state);
+static void Write_Pid_Gains_To_Buffer(PID_Role_t role, uint8_t *buffer);
+static int32_t Gain_Hundredths_To_Fixed(uint16_t gain_x100);
+static uint16_t Fixed_To_Gain_Hundredths(int32_t gain_fixed);
 
 //==============================================================================
 // IMPLEMENTACIÓN DE WRAPPERS DE CALLBACKS HAL
@@ -231,7 +197,7 @@ void App_Core_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
             ON10MS = true;
             time_10ms = TIME_10MS_PERIOD_COUNT;
         }
-        HAL_ADC_Start_DMA(&hadc1, (uint32_t *)&buf_adc[adc_buf_write_idx], ADC_CHANNELS);
+        HAL_ADC_Start_DMA(&hadc1, (uint32_t *)App_Sensors_GetAdcDmaWriteBuffer(), ADC_CHANNELS);
 
         MPU_READ_TICKER--;
         if (!MPU_READ_TICKER)
@@ -244,7 +210,8 @@ void App_Core_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 
 void App_Core_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
 {
-    adc_buf_write_idx = (uint8_t)((adc_buf_write_idx + 1) & ADC_BUF_MASK);
+    (void)hadc;
+    App_Sensors_OnAdcDmaComplete();
 }
 
 void App_Core_UART_RxCpltCallback(UART_HandleTypeDef *huart)
@@ -294,6 +261,74 @@ void App_Core_USB_ReceiveData(uint8_t *buf, uint16_t len)
 //==============================================================================
 // IMPLEMENTACIÓN DE FUNCIONES DE LA APLICACIÓN
 //==============================================================================
+
+static int32_t Gain_Hundredths_To_Fixed(uint16_t gain_x100)
+{
+    return (int32_t)(((int64_t)gain_x100 << FIXED_POINT_SHIFT) / 100);
+}
+
+static uint16_t Fixed_To_Gain_Hundredths(int32_t gain_fixed)
+{
+    return (uint16_t)(((int64_t)gain_fixed * 100) >> FIXED_POINT_SHIFT);
+}
+
+static void Apply_Pid_Config(PID_Role_t role, bool reset_state)
+{
+    PID_ApplyConfig(pid_instances[role], &pid_configs[role], reset_state);
+}
+
+static void Set_Pid_Gains_From_U16(PID_Role_t role, uint16_t kp_x100, uint16_t ki_x100, uint16_t kd_x100, bool reset_state)
+{
+    pid_configs[role].kp = Gain_Hundredths_To_Fixed(kp_x100);
+    pid_configs[role].ki = Gain_Hundredths_To_Fixed(ki_x100);
+    pid_configs[role].kd = Gain_Hundredths_To_Fixed(kd_x100);
+    Apply_Pid_Config(role, reset_state);
+}
+
+static void Write_Pid_Gains_To_Buffer(PID_Role_t role, uint8_t *buffer)
+{
+    uint16_t kp_x100 = Fixed_To_Gain_Hundredths(pid_configs[role].kp);
+    uint16_t ki_x100 = Fixed_To_Gain_Hundredths(pid_configs[role].ki);
+    uint16_t kd_x100 = Fixed_To_Gain_Hundredths(pid_configs[role].kd);
+
+    buffer[0] = (uint8_t)(kp_x100 & 0xFF);
+    buffer[1] = (uint8_t)((kp_x100 >> 8) & 0xFF);
+    buffer[2] = (uint8_t)(ki_x100 & 0xFF);
+    buffer[3] = (uint8_t)((ki_x100 >> 8) & 0xFF);
+    buffer[4] = (uint8_t)(kd_x100 & 0xFF);
+    buffer[5] = (uint8_t)((kd_x100 >> 8) & 0xFF);
+}
+
+static void Init_Pid_Configs(void)
+{
+    pid_configs[PID_ROLE_CENTERING] = (PID_Config_t){
+        .kp = FLOAT_TO_FIXED(0.8f),
+        .ki = FLOAT_TO_FIXED(0.0f),
+        .kd = FLOAT_TO_FIXED(0.2f),
+        .out_min = INT_TO_FIXED(-max_pwm_correction),
+        .out_max = INT_TO_FIXED(max_pwm_correction)};
+
+    pid_configs[PID_ROLE_BRAKING] = (PID_Config_t){
+        .kp = FLOAT_TO_FIXED(BRAKING_PID_KP_DEFAULT),
+        .ki = FLOAT_TO_FIXED(BRAKING_PID_KI_DEFAULT),
+        .kd = FLOAT_TO_FIXED(BRAKING_PID_KD_DEFAULT),
+        .out_min = INT_TO_FIXED(-braking_max_pwm_offset),
+        .out_max = INT_TO_FIXED(braking_max_pwm_offset)};
+
+    pid_configs[PID_ROLE_TURN] = (PID_Config_t){
+        .kp = FLOAT_TO_FIXED(TURN_PID_KP_DEFAULT),
+        .ki = FLOAT_TO_FIXED(TURN_PID_KI_DEFAULT),
+        .kd = FLOAT_TO_FIXED(TURN_PID_KD_DEFAULT),
+        .out_min = INT_TO_FIXED(-turn_max_pwm),
+        .out_max = INT_TO_FIXED(turn_max_pwm)};
+
+    pid_configs[PID_ROLE_TURN_VELOCITY] = (PID_Config_t){
+        .kp = FLOAT_TO_FIXED(TURN_VELOCITY_PID_KP_DEFAULT),
+        .ki = FLOAT_TO_FIXED(TURN_VELOCITY_PID_KI_DEFAULT),
+        .kd = FLOAT_TO_FIXED(TURN_VELOCITY_PID_KD_DEFAULT),
+        .out_min = INT_TO_FIXED(-turn_max_pwm),
+        .out_max = INT_TO_FIXED(turn_max_pwm)};
+}
 
 void ESP01_SetChipEnable(uint8_t value)
 {
@@ -369,9 +404,8 @@ void DecodeCMD(struct UNERBUSHandle *aBus, uint8_t iStartData)
         // Obtener el valor filtrado (promedio móvil) para cada canal
         for (uint8_t i = 0; i < ADC_CHANNELS; i++)
         {
-            // Llamar a la función de filtrado para el canal actual
-            uint16_t filtered_value = (uint16_t)Get_Filtered_ADC_Value(i);
-            uint16_t distance_value = ADC_To_Distance_mm(filtered_value);
+            uint16_t distance_value =
+                App_Sensors_ConvertAdcToDistanceMm(App_Sensors_GetFilteredAdcValue(i));
 
             // Convertir el valor uint16_t a bytes (Little Endian)
             adc_buffer[idx++] = (uint8_t)(distance_value & 0xFF);        // Byte bajo
@@ -517,24 +551,13 @@ void DecodeCMD(struct UNERBUSHandle *aBus, uint8_t iStartData)
 
         // Convertir de entero a punto fijo (dividiendo por 100.0)
         // Se usa 100 para ampliar el rango de Kp hasta ~655
-        centering_pid.kp = (int32_t)(((int64_t)kp_int << FIXED_POINT_SHIFT) / 100);
-        centering_pid.ki = (int32_t)(((int64_t)ki_int << FIXED_POINT_SHIFT) / 100);
-        centering_pid.kd = (int32_t)(((int64_t)kd_int << FIXED_POINT_SHIFT) / 100);
+        Set_Pid_Gains_From_U16(PID_ROLE_CENTERING, kp_int, ki_int, kd_int, false);
         break;
     case CMD_GET_PID_GAINS: // Leer Kp, Ki, Kd
         uint8_t response_buffer[UNERBUS_PID_GAINS_SIZE];
 
         // Convertir de punto fijo a entero para enviar (multiplicando por 100)
-        kp_int = (uint16_t)(((int64_t)centering_pid.kp * 100) >> FIXED_POINT_SHIFT);
-        ki_int = (uint16_t)(((int64_t)centering_pid.ki * 100) >> FIXED_POINT_SHIFT);
-        kd_int = (uint16_t)(((int64_t)centering_pid.kd * 100) >> FIXED_POINT_SHIFT);
-
-        response_buffer[0] = (uint8_t)(kp_int & 0xFF);
-        response_buffer[1] = (uint8_t)((kp_int >> 8) & 0xFF);
-        response_buffer[2] = (uint8_t)(ki_int & 0xFF);
-        response_buffer[3] = (uint8_t)((ki_int >> 8) & 0xFF);
-        response_buffer[4] = (uint8_t)(kd_int & 0xFF);
-        response_buffer[5] = (uint8_t)((kd_int >> 8) & 0xFF);
+        Write_Pid_Gains_To_Buffer(PID_ROLE_CENTERING, response_buffer);
 
         UNERBUS_Write(aBus, response_buffer, UNERBUS_PID_GAINS_SIZE);
         length = UNERBUS_CMD_ID_SIZE + UNERBUS_PID_GAINS_SIZE;
@@ -544,7 +567,9 @@ void DecodeCMD(struct UNERBUSHandle *aBus, uint8_t iStartData)
         max_pwm_correction = UNERBUS_GetUInt16(aBus);
 
         // Actualizar la configuración del PID con los nuevos valores
-        PID_Set_Output_Limits(&centering_pid, INT_TO_FIXED(-max_pwm_correction), INT_TO_FIXED(max_pwm_correction));
+        pid_configs[PID_ROLE_CENTERING].out_min = INT_TO_FIXED(-max_pwm_correction);
+        pid_configs[PID_ROLE_CENTERING].out_max = INT_TO_FIXED(max_pwm_correction);
+        Apply_Pid_Config(PID_ROLE_CENTERING, false);
         break;
     case CMD_GET_MAX_PWM_CORRECTION: // Leer la corrección máxima del PWM
         uint8_t response_buffer_2[UNERBUS_CONTROL_PARAMS_SIZE];
@@ -594,24 +619,13 @@ void DecodeCMD(struct UNERBUSHandle *aBus, uint8_t iStartData)
         turn_kd_int = UNERBUS_GetUInt16(aBus);
 
         // Convertir de entero a punto fijo (dividiendo por 100.0)
-        turn_pid.kp = (int32_t)(((int64_t)turn_kp_int << FIXED_POINT_SHIFT) / 100);
-        turn_pid.ki = (int32_t)(((int64_t)turn_ki_int << FIXED_POINT_SHIFT) / 100);
-        turn_pid.kd = (int32_t)(((int64_t)turn_kd_int << FIXED_POINT_SHIFT) / 100);
+        Set_Pid_Gains_From_U16(PID_ROLE_TURN, turn_kp_int, turn_ki_int, turn_kd_int, false);
         break;
     case CMD_GET_TURN_PID_GAINS: // Leer Kp, Ki, Kd del PID de giro
         uint8_t turn_pid_buffer[UNERBUS_TURN_PID_GAINS_SIZE];
 
         // Convertir de punto fijo a entero para enviar (multiplicando por 100)
-        turn_kp_int = (uint16_t)(((int64_t)turn_pid.kp * 100) >> FIXED_POINT_SHIFT);
-        turn_ki_int = (uint16_t)(((int64_t)turn_pid.ki * 100) >> FIXED_POINT_SHIFT);
-        turn_kd_int = (uint16_t)(((int64_t)turn_pid.kd * 100) >> FIXED_POINT_SHIFT);
-
-        turn_pid_buffer[0] = (uint8_t)(turn_kp_int & 0xFF);
-        turn_pid_buffer[1] = (uint8_t)((turn_kp_int >> 8) & 0xFF);
-        turn_pid_buffer[2] = (uint8_t)(turn_ki_int & 0xFF);
-        turn_pid_buffer[3] = (uint8_t)((turn_ki_int >> 8) & 0xFF);
-        turn_pid_buffer[4] = (uint8_t)(turn_kd_int & 0xFF);
-        turn_pid_buffer[5] = (uint8_t)((turn_kd_int >> 8) & 0xFF);
+        Write_Pid_Gains_To_Buffer(PID_ROLE_TURN, turn_pid_buffer);
 
         UNERBUS_Write(aBus, turn_pid_buffer, UNERBUS_TURN_PID_GAINS_SIZE);
         length = UNERBUS_CMD_ID_SIZE + UNERBUS_TURN_PID_GAINS_SIZE;
@@ -619,8 +633,15 @@ void DecodeCMD(struct UNERBUSHandle *aBus, uint8_t iStartData)
     case CMD_SET_TURN_MAX_SPEED:
         turn_max_pwm = UNERBUS_GetUInt16(aBus);
         if (turn_max_pwm > pwm_max_value)
-            turn_max_pwm = pwm_max_value; // Limitar al máximo global
-        PID_Set_Output_Limits(&turn_pid, INT_TO_FIXED(-turn_max_pwm), INT_TO_FIXED(turn_max_pwm));
+            turn_max_pwm = pwm_max_value;
+
+        pid_configs[PID_ROLE_TURN].out_min = INT_TO_FIXED(-turn_max_pwm);
+        pid_configs[PID_ROLE_TURN].out_max = INT_TO_FIXED(turn_max_pwm);
+        Apply_Pid_Config(PID_ROLE_TURN, false);
+
+        pid_configs[PID_ROLE_TURN_VELOCITY].out_min = INT_TO_FIXED(-turn_max_pwm);
+        pid_configs[PID_ROLE_TURN_VELOCITY].out_max = INT_TO_FIXED(turn_max_pwm);
+        Apply_Pid_Config(PID_ROLE_TURN_VELOCITY, false);
         break;
     case CMD_GET_TURN_MAX_SPEED:
         uint8_t speed_buffer[UNERBUS_TURN_MAX_SPEED_SIZE];
@@ -757,22 +778,11 @@ void DecodeCMD(struct UNERBUSHandle *aBus, uint8_t iStartData)
         ki_int = UNERBUS_GetUInt16(aBus);
         kd_int = UNERBUS_GetUInt16(aBus);
         // Se usa 100 para ampliar el rango de Kp hasta ~655
-        braking_pid.kp = (int32_t)(((int64_t)kp_int << FIXED_POINT_SHIFT) / 100);
-        braking_pid.ki = (int32_t)(((int64_t)ki_int << FIXED_POINT_SHIFT) / 100);
-        braking_pid.kd = (int32_t)(((int64_t)kd_int << FIXED_POINT_SHIFT) / 100);
+        Set_Pid_Gains_From_U16(PID_ROLE_BRAKING, kp_int, ki_int, kd_int, false);
         break;
     case CMD_GET_BRAKING_PID_GAINS:
         uint8_t braking_pid_buffer[UNERBUS_BRAKING_PID_GAINS_SIZE];
-        // Se multiplica por 100 para coincidir con el SET
-        kp_int = (uint16_t)(((int64_t)braking_pid.kp * 100) >> FIXED_POINT_SHIFT);
-        ki_int = (uint16_t)(((int64_t)braking_pid.ki * 100) >> FIXED_POINT_SHIFT);
-        kd_int = (uint16_t)(((int64_t)braking_pid.kd * 100) >> FIXED_POINT_SHIFT);
-        braking_pid_buffer[0] = (uint8_t)(kp_int & 0xFF);
-        braking_pid_buffer[1] = (uint8_t)((kp_int >> 8) & 0xFF);
-        braking_pid_buffer[2] = (uint8_t)(ki_int & 0xFF);
-        braking_pid_buffer[3] = (uint8_t)((ki_int >> 8) & 0xFF);
-        braking_pid_buffer[4] = (uint8_t)(kd_int & 0xFF);
-        braking_pid_buffer[5] = (uint8_t)((kd_int >> 8) & 0xFF);
+        Write_Pid_Gains_To_Buffer(PID_ROLE_BRAKING, braking_pid_buffer);
         UNERBUS_Write(aBus, braking_pid_buffer, UNERBUS_BRAKING_PID_GAINS_SIZE);
         length = UNERBUS_CMD_ID_SIZE + UNERBUS_BRAKING_PID_GAINS_SIZE;
         break;
@@ -792,7 +802,9 @@ void DecodeCMD(struct UNERBUSHandle *aBus, uint8_t iStartData)
         break;
     case CMD_SET_BRAKING_MAX_SPEED:
         braking_max_pwm_offset = UNERBUS_GetUInt16(aBus);
-        PID_Set_Output_Limits(&braking_pid, INT_TO_FIXED(-braking_max_pwm_offset), INT_TO_FIXED(braking_max_pwm_offset));
+        pid_configs[PID_ROLE_BRAKING].out_min = INT_TO_FIXED(-braking_max_pwm_offset);
+        pid_configs[PID_ROLE_BRAKING].out_max = INT_TO_FIXED(braking_max_pwm_offset);
+        Apply_Pid_Config(PID_ROLE_BRAKING, false);
         break;
     case CMD_GET_BRAKING_MAX_SPEED:
         uint8_t braking_speed_buffer[UNERBUS_BRAKING_MAX_SPEED_SIZE];
@@ -856,26 +868,25 @@ void DecodeCMD(struct UNERBUSHandle *aBus, uint8_t iStartData)
         vel_kp_int = UNERBUS_GetUInt16(aBus);
         vel_ki_int = UNERBUS_GetUInt16(aBus);
         vel_kd_int = UNERBUS_GetUInt16(aBus);
-        turn_velocity_pid.kp = (int32_t)(((int64_t)vel_kp_int << FIXED_POINT_SHIFT) / 100);
-        turn_velocity_pid.ki = (int32_t)(((int64_t)vel_ki_int << FIXED_POINT_SHIFT) / 100);
-        turn_velocity_pid.kd = (int32_t)(((int64_t)vel_kd_int << FIXED_POINT_SHIFT) / 100);
+        Set_Pid_Gains_From_U16(PID_ROLE_TURN_VELOCITY, vel_kp_int, vel_ki_int, vel_kd_int, false);
         break;
     case CMD_GET_TURN_VELOCITY_PID_GAINS:
         uint8_t vel_pid_buffer[UNERBUS_TURN_VELOCITY_PID_GAINS_SIZE];
-        vel_kp_int = (uint16_t)(((int64_t)turn_velocity_pid.kp * 100) >> FIXED_POINT_SHIFT);
-        vel_ki_int = (uint16_t)(((int64_t)turn_velocity_pid.ki * 100) >> FIXED_POINT_SHIFT);
-        vel_kd_int = (uint16_t)(((int64_t)turn_velocity_pid.kd * 100) >> FIXED_POINT_SHIFT);
-        vel_pid_buffer[0] = (uint8_t)(vel_kp_int & 0xFF);
-        vel_pid_buffer[1] = (uint8_t)((vel_kp_int >> 8) & 0xFF);
-        vel_pid_buffer[2] = (uint8_t)(vel_ki_int & 0xFF);
-        vel_pid_buffer[3] = (uint8_t)((vel_ki_int >> 8) & 0xFF);
-        vel_pid_buffer[4] = (uint8_t)(vel_kd_int & 0xFF);
-        vel_pid_buffer[5] = (uint8_t)((vel_kd_int >> 8) & 0xFF);
+        Write_Pid_Gains_To_Buffer(PID_ROLE_TURN_VELOCITY, vel_pid_buffer);
         UNERBUS_Write(aBus, vel_pid_buffer, UNERBUS_TURN_VELOCITY_PID_GAINS_SIZE);
         length = UNERBUS_CMD_ID_SIZE + UNERBUS_TURN_VELOCITY_PID_GAINS_SIZE;
         break;
     case CMD_SET_TURN_TARGET_DPS:
         turn_target_dps = UNERBUS_GetUInt16(aBus);
+
+        if (robot_state == STATE_SMOOTH_TURN_LEFT)
+        {
+            PID_Set_Setpoint(&turn_velocity_pid, turn_target_dps);
+        }
+        else if (robot_state == STATE_SMOOTH_TURN_RIGHT)
+        {
+            PID_Set_Setpoint(&turn_velocity_pid, -turn_target_dps);
+        }
         break;
     case CMD_GET_TURN_TARGET_DPS:
         uint8_t dps_buffer[UNERBUS_TURN_TARGET_DPS_SIZE];
@@ -895,30 +906,18 @@ void DecodeCMD(struct UNERBUSHandle *aBus, uint8_t iStartData)
         wall_fade_ticks = UNERBUS_GetUInt8(aBus);
         break;
     case CMD_SYNC_MAZE_COLUMN:
+    {
         uint8_t requested_col = UNERBUS_GetUInt8(aBus);
-        
-        // Verificamos que la columna pedida esté dentro del rango (0 a 14)
-        if (requested_col < MAZE_WIDTH)
-        {
-            // Tamaño: 1 byte (col) + 15 bytes (datos) + 3 bytes (x, y, heading) = 19 bytes
-            uint8_t col_buffer[MAZE_HEIGHT + 4]; 
-            uint8_t p_idx = 0;
-            
-            col_buffer[p_idx++] = requested_col; // Columna que estamos enviando
-            
-            for(uint8_t i = 0; i < MAZE_HEIGHT; i++)
-            {
-                col_buffer[p_idx++] = maze_map[requested_col][i];
-            }
-            
-            col_buffer[p_idx++] = current_pos.x;
-            col_buffer[p_idx++] = current_pos.y;
-            col_buffer[p_idx++] = (uint8_t)current_pos.heading;
+        uint8_t col_buffer[APP_MAZE_COLUMN_SYNC_PAYLOAD_SIZE];
+        uint8_t payload_len = App_Maze_WriteColumnSyncPayload(requested_col, col_buffer);
 
-            UNERBUS_Write(aBus, col_buffer, p_idx);
-            length = UNERBUS_CMD_ID_SIZE + p_idx;
+        if (payload_len != 0U)
+        {
+            UNERBUS_Write(aBus, col_buffer, payload_len);
+            length = UNERBUS_CMD_ID_SIZE + payload_len;
         }
         break;
+    }
     default:
         // Comando desconocido, enviar ACK de error
         /*         UNERBUS_WriteByte(aBus, CMD_NACK);
@@ -930,6 +929,8 @@ void DecodeCMD(struct UNERBUSHandle *aBus, uint8_t iStartData)
     {
         UNERBUS_Send(aBus, id, length);
     }
+
+    UNERBUS_MoveIndexRead(aBus, iStartData);
 }
 
 void Do10ms()
@@ -1247,10 +1248,7 @@ static void ManageButtonEvents(void)
                         Reset_Robot_Position();
                     }
 
-                    // Mapeo primera celda buscando paredes
-                    Current_Cell_Mapping();
-                    // Publicamos el estado de la celda mapeada para sincronizar la HMI
-                    Send_Maze_Cell_Update();
+                    pending_initial_cell_seed = true;
                 }
                 if (menu_mode == MENU_MODE_DRIVE_STRAIGHT)
                 {
@@ -1330,6 +1328,9 @@ void App_Core_Init(void)
     unerbus_pc_handle.tx.buf = buf_tx_pc;
     unerbus_pc_handle.tx.maxIndexRingBuf = (USB_CDC_TX_BUFFER_SIZE - 1);
 
+    /* Sensores */
+    ADC_LUT_Precompute();
+
     /* Timers */
     HAL_TIM_Base_Start_IT(&htim1);
     __HAL_TIM_SET_AUTORELOAD(&htim4, pwm_max_value - 1);
@@ -1370,35 +1371,23 @@ void App_Core_Init(void)
     wall_braking_target_mm = WALL_BRAKING_TARGET_MM;
 
     /* --- INICIALIZACIÓN DEL PID DE SEGUIMIENTO DE PARED --- */
-    PID_Init(&centering_pid, FLOAT_TO_FIXED(0.8f), FLOAT_TO_FIXED(0.0f), FLOAT_TO_FIXED(0.2f)); // Kp, Ki, Kd
+    Init_Pid_Configs();
+    Apply_Pid_Config(PID_ROLE_CENTERING, true);
     PID_Set_Setpoint(&centering_pid, 0);                                                        // El setpoint se ajustará dinámicamente
-    PID_Set_Output_Limits(&centering_pid, INT_TO_FIXED(-max_pwm_correction), INT_TO_FIXED(max_pwm_correction));
 
     /* --- INICIALIZACIÓN DEL PID DE FRENADO --- */
     braking_max_pwm_offset = BRAKING_MAX_SPEED_DEFAULT;
-    PID_Init(&braking_pid,
-             FLOAT_TO_FIXED(BRAKING_PID_KP_DEFAULT),
-             FLOAT_TO_FIXED(BRAKING_PID_KI_DEFAULT),
-             FLOAT_TO_FIXED(BRAKING_PID_KD_DEFAULT));
+    Apply_Pid_Config(PID_ROLE_BRAKING, true);
     PID_Set_Setpoint(&braking_pid, wall_braking_target_mm);
     // La salida es la velocidad, así que el límite es el PWM máximo.
-    PID_Set_Output_Limits(&braking_pid, INT_TO_FIXED(-braking_max_pwm_offset), INT_TO_FIXED(braking_max_pwm_offset));
 
     /* --- INICIALIZACIÓN DEL PID DE GIRO --- */
-    PID_Init(&turn_pid,
-             FLOAT_TO_FIXED(TURN_PID_KP_DEFAULT),
-             FLOAT_TO_FIXED(TURN_PID_KI_DEFAULT),
-             FLOAT_TO_FIXED(TURN_PID_KD_DEFAULT));
-    PID_Set_Output_Limits(&turn_pid, INT_TO_FIXED(-turn_max_pwm), INT_TO_FIXED(turn_max_pwm));
+    Apply_Pid_Config(PID_ROLE_TURN, true);
 
     /* --- NUEVO: INICIALIZACIÓN DEL PID DE VELOCIDAD DE GIRO --- */
-    PID_Init(&turn_velocity_pid,
-             FLOAT_TO_FIXED(TURN_VELOCITY_PID_KP_DEFAULT),
-             FLOAT_TO_FIXED(TURN_VELOCITY_PID_KI_DEFAULT),
-             FLOAT_TO_FIXED(TURN_VELOCITY_PID_KD_DEFAULT));
+    Apply_Pid_Config(PID_ROLE_TURN_VELOCITY, true);
     // La salida de este PID ES la potencia del motor, así que sus límites son los límites de PWM.
-    PID_Set_Output_Limits(&turn_velocity_pid, INT_TO_FIXED(-turn_max_pwm), INT_TO_FIXED(turn_max_pwm));
-    PID_Set_Setpoint(&turn_velocity_pid, turn_target_dps); // Establecer el setpoint inicial
+    PID_Set_Setpoint(&turn_velocity_pid, turn_target_dps);
 
     srand(1); // Inicializa la semilla para rand()
 
@@ -1412,7 +1401,6 @@ void App_Core_Init(void)
     Update_Gyro_Scaler();
     SSD1306_UpdateScreen_DMA(&hssd);
     HAL_Delay(DEVICE_INIT_DELAY_MS);
-    ADC_LUT_Precompute();
 
     /* UART */
     HAL_UART_Receive_IT(&huart1, &data_rx_esp01, 1);
@@ -1444,11 +1432,23 @@ void App_Core_Loop(void)
 
     ADC_Filter_Task();
 
-    if (ON10MS)
-    {
-        Do10ms();
-        Modes_State_Machine();
-    }
+	if (ON10MS)
+	{
+		Do10ms();
+
+		if (app_state == APP_STATE_RUNNING && (menu_mode == MENU_MODE_FIND_CELLS || menu_mode == MENU_MODE_GO_TO_B || menu_mode == MENU_MODE_DRIVE_STRAIGHT))
+		{
+			Update_Navigation_Perception();
+
+	        if (pending_initial_cell_seed && robot_state == STATE_NAVIGATING)
+	        {
+	            Commit_Maze_State(0, true, true);
+	            pending_initial_cell_seed = false;
+	        }
+		}
+
+		Modes_State_Machine();
+	}
 
     ManageTransmission();
 
@@ -1603,8 +1603,7 @@ void Turn_Start(int16_t angle_degrees)
 // turn_direction: 1 (Giro Derecha), -1 (Giro Izquierda), 2 (Media Vuelta)
 static void Update_Robot_Heading(int8_t turn_direction)
 {
-    // Sumamos 4 antes de aplicar módulo 4 para evitar problemas matemáticos con números negativos en C
-    current_pos.heading = (HeadingTypeDef)((current_pos.heading + turn_direction + 4) % 4);
+    App_Maze_UpdateRobotHeading((TurnTypeDef)turn_direction);
 }
 
 /**
@@ -1652,8 +1651,7 @@ static void Manage_Turn(void)
 
         // El pivote se usa para giros de 180 grados: actualizamos heading y
         // publicamos la pose para que la HMI refleje el giro sin esperar avance.
-        Update_Robot_Heading(TURN_AROUND);
-        Send_Maze_Cell_Update();
+        Commit_Maze_State(TURN_AROUND, false, true);
 
         if (menu_mode == MENU_MODE_MANUAL_CONTROL)
         {
@@ -1776,51 +1774,7 @@ static void Handle_Idle(void)
  */
 static void ADC_Filter_Task(void)
 {
-    // Procesar todas las muestras pendientes entre adc_processed_idx y adc_buf_write_idx
-    while (adc_processed_idx != adc_buf_write_idx)
-    {
-        uint8_t idx_new = adc_processed_idx;
-        bool window_full = (adc_samples_accumulated >= ADC_MOVING_AVERAGE_SAMPLES);
-
-        if (!window_full)
-        {
-            // La ventana aún no está llena, solo agregamos y promediamos sobre el total actual
-            adc_samples_accumulated++;
-            for (uint8_t ch = 0; ch < ADC_CHANNELS; ch++)
-            {
-                adc_running_sum[ch] += buf_adc[idx_new][ch];
-                adc_filtered_avg[ch] = (uint16_t)(adc_running_sum[ch] / adc_samples_accumulated);
-            }
-        }
-        else // La ventana está llena, usamos el método eficiente de suma/resta
-        {
-            uint8_t idx_old = (uint8_t)((idx_new - ADC_MOVING_AVERAGE_SAMPLES) & ADC_BUF_MASK);
-            for (uint8_t ch = 0; ch < ADC_CHANNELS; ch++)
-            {
-                uint16_t new_val = buf_adc[idx_new][ch];
-                uint16_t old_val = buf_adc[idx_old][ch];
-
-                // Se previene el underflow en la resta. Si el valor a restar es anómalamente
-                // más grande que la suma acumulada (debido a un pico de ruido), la resta
-                // de enteros sin signo causaría un 'wrap-around' a un número muy grande.
-                // Para evitarlo, se resetea la suma. El filtro se recuperará en las siguientes muestras.
-                if (old_val > adc_running_sum[ch])
-                {
-                    adc_running_sum[ch] = 0;
-                }
-                else
-                {
-                    adc_running_sum[ch] -= old_val;
-                }
-
-                adc_running_sum[ch] += new_val;
-
-                adc_filtered_avg[ch] = (uint16_t)(adc_running_sum[ch] >> ADC_FILTER_SHIFT);
-            }
-        }
-
-        adc_processed_idx = (uint8_t)((adc_processed_idx + 1) & ADC_BUF_MASK);
-    }
+    App_Sensors_ProcessAdcSamples();
 }
 
 /**
@@ -1828,110 +1782,40 @@ static void ADC_Filter_Task(void)
  */
 static int32_t Get_Filtered_ADC_Value(uint8_t channel)
 {
-    if (channel >= ADC_CHANNELS)
-        return 0;
-    return (int32_t)adc_filtered_avg[channel];
+    return (int32_t)App_Sensors_GetFilteredAdcValue(channel);
 }
 
 // Actualiza la posición (x, y) asumiendo que el robot avanzó 1 celda hacia el frente
 static void Update_Robot_Position(void)
 {
-    switch (current_pos.heading)
-    {
-    case HEADING_NORTH:
-        if (current_pos.y < MAZE_HEIGHT - 1)
-            current_pos.y++;
-        break;
-    case HEADING_EAST:
-        if (current_pos.x < MAZE_WIDTH - 1)
-            current_pos.x++;
-        break;
-    case HEADING_SOUTH:
-        if (current_pos.y > 0)
-            current_pos.y--;
-        break;
-    case HEADING_WEST:
-        if (current_pos.x > 0)
-            current_pos.x--;
-        break;
-    }
+    App_Maze_AdvanceRobotPosition();
 }
 
 static void Current_Cell_Mapping(void)
 {
-    uint8_t cell_data = CELL_VISITED;
-
-    // Indexamos directamente el array en O(1)
-    if (front_wall_detected)
-        cell_data |= wall_lut[current_pos.heading][0];
-    if (right_wall_detected)
-        cell_data |= wall_lut[current_pos.heading][1];
-    if (left_wall_detected)
-        cell_data |= wall_lut[current_pos.heading][2];
-
-    // Volcamos al mapa la celda actual
-    maze_map[current_pos.x][current_pos.y] |= cell_data;
-
-    // --- LÓGICA AUXILIAR PARA CELDAS VECINAS ---
-    // IMPORTANTE: Asume que "Norte" es Y creciente (y+1) y "Este" es X creciente (x+1).
-    // Las condicionales evitan desbordar el arreglo de memoria (ej. x < MAZE_WIDTH-1).
-
-    if ((cell_data & WALL_NORTH) && (current_pos.y < MAZE_HEIGHT - 1))
-    {
-        maze_map[current_pos.x][current_pos.y + 1] |= WALL_SOUTH;
-    }
-    if ((cell_data & WALL_SOUTH) && (current_pos.y > 0))
-    {
-        maze_map[current_pos.x][current_pos.y - 1] |= WALL_NORTH;
-    }
-    if ((cell_data & WALL_EAST) && (current_pos.x < MAZE_WIDTH - 1))
-    {
-        maze_map[current_pos.x + 1][current_pos.y] |= WALL_WEST;
-    }
-    if ((cell_data & WALL_WEST) && (current_pos.x > 0))
-    {
-        maze_map[current_pos.x - 1][current_pos.y] |= WALL_EAST;
-    }
+    App_Maze_MapCurrentCell(front_wall_detected, right_wall_detected, left_wall_detected);
 }
 
 static void Send_Maze_Cell_Update(void)
 {
-    uint8_t cell_payload[UNERBUS_MAZE_CELL_UPDATE_SIZE] = {
-        current_pos.x,
-        current_pos.y,
-        maze_map[current_pos.x][current_pos.y],
-        (uint8_t)current_pos.heading};
-
-    UNERBUS_Write(&unerbus_esp01_handle, cell_payload, UNERBUS_MAZE_CELL_UPDATE_SIZE);
-    UNERBUS_Send(&unerbus_esp01_handle, CMD_UPDATE_MAZE_CELL,
-                 (uint8_t)(UNERBUS_CMD_ID_SIZE + UNERBUS_MAZE_CELL_UPDATE_SIZE));
+    App_Maze_SendCurrentCellUpdate(&unerbus_esp01_handle);
 }
 
 static void Reset_Robot_Position(void)
 {
-    current_pos.x = 7;
-    current_pos.y = 7;
-    current_pos.heading = HEADING_NORTH;
+    App_Maze_ResetRobotPosition();
 }
 
 static void Reset_Maze_State(void)
 {
-    memset(maze_map, 0, sizeof(maze_map));
-    Reset_Robot_Position();
+    App_Maze_ResetState();
 }
 
 static void Handle_Navigating(void)
 {
-    // Lectura de sensores
-    dist_diagonal_left_mm = (uint16_t)ADC_To_Distance_mm((uint16_t)Get_Filtered_ADC_Value(SENSOR_DIAGONAL_LEFT_CH));
-    dist_diagonal_right_mm = (uint16_t)ADC_To_Distance_mm((uint16_t)Get_Filtered_ADC_Value(SENSOR_DIAGONAL_RIGHT_CH));
-    dist_front_left_mm = (uint16_t)ADC_To_Distance_mm((uint16_t)Get_Filtered_ADC_Value(SENSOR_FRONT_LEFT_CH));
-    dist_front_right_mm = (uint16_t)ADC_To_Distance_mm((uint16_t)Get_Filtered_ADC_Value(SENSOR_FRONT_RIGHT_CH));
-    dist_left_lat_mm = (uint16_t)ADC_To_Distance_mm((uint16_t)Get_Filtered_ADC_Value(SENSOR_LEFT_LAT_CH));
-    dist_right_lat_mm = (uint16_t)ADC_To_Distance_mm((uint16_t)Get_Filtered_ADC_Value(SENSOR_RIGHT_LAT_CH));
-
     static uint8_t tape_debounce_counter = 0;
     adc_rear_floor = (uint16_t)Get_Filtered_ADC_Value(SENSOR_FLOOR_REAR_CH);
+
     if (adc_rear_floor < tape_detection_threshold_adc) // ¿Vemos negro?
     {
         if (!was_rear_tape_detected) // Si aún no hemos confirmado y "consumido" esta línea
@@ -1950,14 +1834,6 @@ static void Handle_Navigating(void)
         was_rear_tape_detected = false; // "Armamos" el gatillo para la próxima cinta
     }
     uint16_t front_avg_mm = (uint16_t)((dist_front_left_mm + dist_front_right_mm) / 2);
-
-    // Detección de paredes
-    left_diagonal_wall_detected = dist_diagonal_left_mm < wall_threshold_mm_diagonal;
-    right_diagonal_wall_detected = dist_diagonal_right_mm < wall_threshold_mm_diagonal;
-    left_wall_detected = dist_left_lat_mm < wall_threshold_mm_side;
-    right_wall_detected = dist_right_lat_mm < wall_threshold_mm_side;
-    front_wall_detected = (dist_front_left_mm < wall_threshold_mm_front) && 
-                      (dist_front_right_mm < wall_threshold_mm_front);
 
     if (front_avg_mm < wall_threshold_mm_braking_start)
     {
@@ -2001,12 +1877,8 @@ static void Handle_Navigating(void)
 
     if (rear_tape_detected)
     {
-        // 1. Llegué a una nueva celda, me muevo lógicamente
         Update_Robot_Position();
-        // 2. Ahora que ya pisé mi nueva (x,y), la mapeo buscando paredes
-        Current_Cell_Mapping();
-        // 3. Publicamos el estado de la celda mapeada para sincronizar la HMI
-        Send_Maze_Cell_Update();
+        Commit_Maze_State(false, true, true);
 
         // 4. Evaluamos si veníamos esperando esta línea para tomar una decisión
         if (wall_diagonal_faded)
@@ -2094,8 +1966,6 @@ static void Handle_Straight_Drive(bool have_to_decide)
 {
     if (menu_mode == MENU_MODE_DRIVE_STRAIGHT)
     {
-        dist_front_left_mm = (uint16_t)ADC_To_Distance_mm((uint16_t)Get_Filtered_ADC_Value(SENSOR_FRONT_LEFT_CH));
-        dist_front_right_mm = (uint16_t)ADC_To_Distance_mm((uint16_t)Get_Filtered_ADC_Value(SENSOR_FRONT_RIGHT_CH));
         front_wall_detected = (dist_front_left_mm < wall_threshold_mm_braking_start || dist_front_right_mm < wall_threshold_mm_braking_start);
         if (front_wall_detected)
         {
@@ -2123,9 +1993,8 @@ static void Handle_Straight_Drive(bool have_to_decide)
                 was_rear_tape_detected = true; // Bloqueamos para no volver a disparar en la misma cinta
 
                 Update_Robot_Position();
-                Current_Cell_Mapping();
-                Send_Maze_Cell_Update();
-                
+                Commit_Maze_State(0, true, true);
+
                 Handle_Deciding();
             }
             else
@@ -2161,17 +2030,8 @@ static void Handle_Deciding(void)
         IZQUIERDA
     };
 
-    // Lectura de sensores
-    dist_front_left_mm = (uint16_t)ADC_To_Distance_mm((uint16_t)Get_Filtered_ADC_Value(SENSOR_FRONT_LEFT_CH));
-    dist_front_right_mm = (uint16_t)ADC_To_Distance_mm((uint16_t)Get_Filtered_ADC_Value(SENSOR_FRONT_RIGHT_CH));
-    dist_left_lat_mm = (uint16_t)ADC_To_Distance_mm((uint16_t)Get_Filtered_ADC_Value(SENSOR_LEFT_LAT_CH));
-    dist_right_lat_mm = (uint16_t)ADC_To_Distance_mm((uint16_t)Get_Filtered_ADC_Value(SENSOR_RIGHT_LAT_CH));
-
-    // Detección de paredes
-    left_wall_detected = dist_left_lat_mm < wall_threshold_mm_side;
-    right_wall_detected = dist_right_lat_mm < wall_threshold_mm_side;
-    front_wall_detected = (dist_front_left_mm < wall_threshold_mm_front) && 
-                      (dist_front_right_mm < wall_threshold_mm_front);
+    // Las distancias y las banderas de pared ya vienen actualizadas por
+    // Update_Navigation_Perception() antes de entrar en la máquina de estados.
 
     // Analizar las opciones (asumiendo que 1 siempre es "atrás" y está libre)
     // Bit 0: Atrás (Siempre 1)
@@ -2368,30 +2228,7 @@ static void Update_Display_Content(void)
  */
 static void ADC_LUT_Precompute(void)
 {
-    for (uint8_t i = 0; i < ADC_SEG_COUNT; ++i)
-    {
-        const uint16_t x0 = sensor_lut[i].adc;
-        const uint16_t x1 = sensor_lut[i + 1].adc;
-        const int32_t y0 = (int32_t)sensor_lut[i].dist_mm;
-        const int32_t y1 = (int32_t)sensor_lut[i + 1].dist_mm;
-
-        adc_lut_segs[i].x0 = x0;
-        adc_lut_segs[i].x1 = x1;
-        adc_lut_segs[i].y0 = (uint16_t)y0;
-
-        const int32_t dx = (int32_t)x1 - (int32_t)x0;
-        const int32_t dy = y1 - y0;
-
-        // Calcula la pendiente en formato Q16.16, manejando la división por cero.
-        if (dx != 0)
-        {
-            adc_lut_segs[i].slope_q16 = ((dy << FIXED_POINT_SHIFT) / dx);
-        }
-        else
-        {
-            adc_lut_segs[i].slope_q16 = 0;
-        }
-    }
+    App_Sensors_Init();
 }
 
 /**
@@ -2402,51 +2239,7 @@ static void ADC_LUT_Precompute(void)
  */
 static int32_t ADC_To_Distance_mm(uint16_t adc_value)
 {
-    // 1. Manejo de casos extremos (saturación)
-    if (adc_value <= sensor_lut[0].adc)
-    {
-        return (int32_t)sensor_lut[0].dist_mm;
-    }
-    if (adc_value >= sensor_lut[ADC_LUT_SIZE - 1].adc)
-    {
-        return (int32_t)sensor_lut[ADC_LUT_SIZE - 1].dist_mm;
-    }
-
-    // 2. Búsqueda binaria para encontrar el segmento correcto [lo, lo+1]
-    uint8_t lo = 0;
-    uint8_t hi = (uint8_t)(ADC_LUT_SIZE - 1);
-    while ((uint8_t)(hi - lo) > 1U)
-    {
-        uint8_t mid = (uint8_t)((lo + hi) >> 1);
-        if (adc_value < sensor_lut[mid].adc)
-        {
-            hi = mid;
-        }
-        else
-        {
-            lo = mid;
-        }
-    }
-
-    // 3. Interpolación lineal usando el segmento precalculado 'lo'
-    const ADC_LutSeg_t *s = &adc_lut_segs[lo];
-
-    // y = y0 + slope * (x - x0)
-    int32_t dx = (int32_t)adc_value - (int32_t)s->x0;
-
-    // Multiplicación en 64 bits para evitar overflow (Q16.16 * Q16.0 -> Q32.16)
-    int64_t mul = (int64_t)s->slope_q16 * (int64_t)dx;
-
-    // Redondeo al entero más cercano y conversión de vuelta a entero
-    int32_t incr = (int32_t)((mul + (1LL << (FIXED_POINT_SHIFT - 1))) >> FIXED_POINT_SHIFT);
-
-    int32_t y = (int32_t)s->y0 + incr;
-
-    // 4. Seguridad final
-    if (y < 0)
-        return 0;
-
-    return y;
+    return (int32_t)App_Sensors_ConvertAdcToDistanceMm(adc_value);
 }
 
 /**
@@ -2475,14 +2268,12 @@ static void Handle_Smooth_Turn(void)
 
     if (robot_state == STATE_SMOOTH_TURN_LEFT)
     {
-        dist_diagonal_left_mm = (uint16_t)ADC_To_Distance_mm((uint16_t)Get_Filtered_ADC_Value(SENSOR_DIAGONAL_LEFT_CH));
         wall_detected = (dist_diagonal_left_mm < after_turn_wall_threshold_mm);
         base_right = (int16_t)faster_motor_smooth_turn_speed; // exterior
         base_left = (int16_t)slower_motor_smooth_turn_speed;  // interior
     }
     else if (robot_state == STATE_SMOOTH_TURN_RIGHT)
     {
-        dist_diagonal_right_mm = (uint16_t)ADC_To_Distance_mm((uint16_t)Get_Filtered_ADC_Value(SENSOR_DIAGONAL_RIGHT_CH));
         wall_detected = (dist_diagonal_right_mm < after_turn_wall_threshold_mm);
         base_right = (int16_t)slower_motor_smooth_turn_speed; // interior
         base_left = (int16_t)faster_motor_smooth_turn_speed;  // exterior
@@ -2492,31 +2283,26 @@ static void Handle_Smooth_Turn(void)
     {
         RobotStateTypeDef completed_turn_state = robot_state;
 
+        int8_t heading_update = 0;
+
         if (completed_turn_state == STATE_SMOOTH_TURN_LEFT)
-            Update_Robot_Heading(TURN_LEFT);
+            heading_update = TURN_LEFT;
         else if (completed_turn_state == STATE_SMOOTH_TURN_RIGHT)
-            Update_Robot_Heading(TURN_RIGHT);
+            heading_update = TURN_RIGHT;
 
         if (rear_tape_detected)
         {
-            // Releer sensores para mapear la nueva celda con datos frescos
-            dist_front_left_mm  = (uint16_t)ADC_To_Distance_mm((uint16_t)Get_Filtered_ADC_Value(SENSOR_FRONT_LEFT_CH));
-            dist_front_right_mm = (uint16_t)ADC_To_Distance_mm((uint16_t)Get_Filtered_ADC_Value(SENSOR_FRONT_RIGHT_CH));
-            dist_left_lat_mm    = (uint16_t)ADC_To_Distance_mm((uint16_t)Get_Filtered_ADC_Value(SENSOR_LEFT_LAT_CH));
-            dist_right_lat_mm   = (uint16_t)ADC_To_Distance_mm((uint16_t)Get_Filtered_ADC_Value(SENSOR_RIGHT_LAT_CH));
-
-            left_wall_detected  = (dist_left_lat_mm < wall_threshold_mm_side);
-            right_wall_detected = (dist_right_lat_mm < wall_threshold_mm_side);
-            front_wall_detected = (dist_front_left_mm < wall_threshold_mm_front) &&
-                                (dist_front_right_mm < wall_threshold_mm_front);
-
             Update_Robot_Position();
-            Current_Cell_Mapping();
-            Send_Maze_Cell_Update();
+            Commit_Maze_State(heading_update, true, true);
 
             rear_tape_detected = false;
             was_rear_tape_detected = true;
         }
+        else
+        {
+            Commit_Maze_State(heading_update, false, false);
+        }
+
 
         Set_Motor_Speeds(right_motor_base_speed, left_motor_base_speed);
         Set_Robot_State(STATE_NAVIGATING);
@@ -2541,6 +2327,42 @@ static void Handle_Smooth_Turn(void)
 
     Set_Motor_Speeds(right_speed, left_speed);
 }
+
+static void Update_Navigation_Perception(void)
+{
+    dist_diagonal_left_mm = (uint16_t)ADC_To_Distance_mm((uint16_t)Get_Filtered_ADC_Value(SENSOR_DIAGONAL_LEFT_CH));
+    dist_diagonal_right_mm = (uint16_t)ADC_To_Distance_mm((uint16_t)Get_Filtered_ADC_Value(SENSOR_DIAGONAL_RIGHT_CH));
+    dist_front_left_mm = (uint16_t)ADC_To_Distance_mm((uint16_t)Get_Filtered_ADC_Value(SENSOR_FRONT_LEFT_CH));
+    dist_front_right_mm = (uint16_t)ADC_To_Distance_mm((uint16_t)Get_Filtered_ADC_Value(SENSOR_FRONT_RIGHT_CH));
+    dist_left_lat_mm = (uint16_t)ADC_To_Distance_mm((uint16_t)Get_Filtered_ADC_Value(SENSOR_LEFT_LAT_CH));
+    dist_right_lat_mm = (uint16_t)ADC_To_Distance_mm((uint16_t)Get_Filtered_ADC_Value(SENSOR_RIGHT_LAT_CH));
+
+    left_diagonal_wall_detected = (dist_diagonal_left_mm < wall_threshold_mm_diagonal);
+    right_diagonal_wall_detected = (dist_diagonal_right_mm < wall_threshold_mm_diagonal);
+    left_wall_detected = (dist_left_lat_mm < wall_threshold_mm_side);
+    right_wall_detected = (dist_right_lat_mm < wall_threshold_mm_side);
+    front_wall_detected = (dist_front_left_mm < wall_threshold_mm_front) &&
+                          (dist_front_right_mm < wall_threshold_mm_front);
+}
+
+static void Commit_Maze_State(int8_t heading_update, bool update_cell, bool send_update)
+{
+    if (heading_update != 0)
+    {
+        Update_Robot_Heading(heading_update);
+    }
+
+    if (update_cell)
+    {
+        Current_Cell_Mapping();
+    }
+
+    if (send_update)
+    {
+        Send_Maze_Cell_Update();
+    }
+}
+
 
 static void Modes_State_Machine(void)
 {
