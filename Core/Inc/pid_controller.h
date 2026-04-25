@@ -11,7 +11,7 @@
 // Macros para conversiones y operaciones en punto fijo.
 #define INT_TO_FIXED(x) ((int32_t)((x) << FIXED_POINT_SHIFT))
 #define FIXED_TO_INT(x) ((int32_t)((x) >> FIXED_POINT_SHIFT))
-#define FLOAT_TO_FIXED(x) ((int32_t)((x) * (1 << FIXED_POINT_SHIFT)))
+#define HUNDREDTHS_TO_FIXED(x100) ((int32_t)(((int64_t)(x100) << FIXED_POINT_SHIFT) / 100))
 #define FIXED_MUL(a, b) ((int32_t)(((int64_t)(a) * (b)) >> FIXED_POINT_SHIFT))
 #define FIXED_DIV(a, b) ((int32_t)((((int64_t)(a)) << FIXED_POINT_SHIFT) / (b)))
 

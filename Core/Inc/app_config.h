@@ -194,10 +194,13 @@ typedef enum
 
 /* Flags del sistema (definidos en app_core.c) */
 extern SystemFlagTypeDef flags0;
-#define ON10MS flags0.bit.b0
-#define UART_BYPASS flags0.bit.b1
-#define MPU_READ_REQUEST flags0.bit.b2
-#define SSD_UPDATE_REQUEST flags0.bit.b3
+extern volatile uint8_t app_10ms_ticks_pending;
+extern volatile bool app_uart_bypass;
+extern volatile bool app_mpu_read_request;
+extern volatile bool app_ssd_update_request;
+#define UART_BYPASS app_uart_bypass
+#define MPU_READ_REQUEST app_mpu_read_request
+#define SSD_UPDATE_REQUEST app_ssd_update_request
 
 /* MPU6050 */
 #define MPU_DMA_BUFFER_SIZE 14
@@ -237,6 +240,12 @@ extern uint16_t pwm_max_value;
 #define TIME_100MS_PEDIOD_COUNT 10
 #define ALIVE_UDP_PERIOD_COUNT 50
 #define MPU_READ_PERIOD_COUNT 12 // 3ms
+#define TIM1_TICK_US 250U
+#define CONTROL_PERIOD_MS 10U
+#define APP_10MS_TICKS_MAX_PENDING 10U
+#define APP_TIMING_DIAGNOSTICS_ENABLED 1
+#define APP_TIMING_DISPLAY_ENABLED 1
+#define APP_TIMING_DISPLAY_PERIOD_100MS 5U
 
 /* Communication */
 #define IP_ADDRESS_STRING_LENGTH 16
@@ -318,16 +327,16 @@ extern uint16_t pwm_max_value;
 #define DEVICE_INIT_DELAY_MS 1000
 
 /* --- Turn PID Controller --- */
-#define TURN_PID_KP_DEFAULT 80.0f         // Ganancia Proporcional inicial
-#define TURN_PID_KI_DEFAULT 0.0f          // Ganancia Integral (iniciamos en 0)
-#define TURN_PID_KD_DEFAULT 150.0f        // Ganancia Derivativa inicial (NOTA: estos valores probablemente necesiten reajuste)
+#define TURN_PID_KP_DEFAULT_X100 8000     // Ganancia Proporcional inicial
+#define TURN_PID_KI_DEFAULT_X100 0        // Ganancia Integral (iniciamos en 0)
+#define TURN_PID_KD_DEFAULT_X100 15000    // Ganancia Derivativa inicial (NOTA: estos valores probablemente necesiten reajuste)
 #define TURN_COMPLETION_DEAD_ZONE 1       // Zona muerta en grados para considerar el giro completo
 #define TURN_MAX_SPEED_DEFAULT 6500       // Velocidad máxima de giro en PWM
 #define PIVOT_TURN_TARGET_DPS_DEFAULT 360 // Velocidad mínima de giro para vencer la inercia
 
-#define TURN_VELOCITY_PID_KP_DEFAULT 20.0f // Kp para el control de velocidad angular
-#define TURN_VELOCITY_PID_KI_DEFAULT 5.0f  // Ki para el control de velocidad angular
-#define TURN_VELOCITY_PID_KD_DEFAULT 2.0f  // Kd para el control de velocidad angular
+#define TURN_VELOCITY_PID_KP_DEFAULT_X100 2000 // Kp para el control de velocidad angular
+#define TURN_VELOCITY_PID_KI_DEFAULT_X100 500  // Ki para el control de velocidad angular
+#define TURN_VELOCITY_PID_KD_DEFAULT_X100 200  // Kd para el control de velocidad angular
 #define TURN_TARGET_DPS_DEFAULT 360        // Velocidad angular objetivo en grados/segundo
 
 /* --- Sensores --- */
@@ -354,9 +363,9 @@ extern uint16_t pwm_max_value;
 #define ACCEL_MOTION_CONFIRM_TICKS_DEFAULT 2 // Nº de ciclos de 10ms para confirmar movimiento
 
 /* --- Braking PID Controller --- */
-#define BRAKING_PID_KP_DEFAULT 10.0f
-#define BRAKING_PID_KI_DEFAULT 0.1f
-#define BRAKING_PID_KD_DEFAULT 5.0f
+#define BRAKING_PID_KP_DEFAULT_X100 1000
+#define BRAKING_PID_KI_DEFAULT_X100 10
+#define BRAKING_PID_KD_DEFAULT_X100 500
 #define BRAKING_DEAD_ZONE_DEFAULT 5              // Tolerancia en ADC para considerar la parada
 #define BRAKING_ACCEL_STOP_THRESHOLD_DEFAULT 400 // Umbral de acelerómetro para confirmar detención
 #define BRAKING_MAX_SPEED_DEFAULT 4000           // Velocidad máxima de frenado en PWM

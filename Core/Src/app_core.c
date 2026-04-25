@@ -15,8 +15,12 @@
 #include "SSD1306.h"
 #include "pid_controller.h"
 
-/* --- Smooth Turn --- */
-#define GYRO_SENSITIVITY FLOAT_TO_FIXED(65.5f)
+/* --- Gyro scaling --- */
+#define GYRO_SENSITIVITY_X10_250DPS 1310
+#define GYRO_SENSITIVITY_X10_500DPS 655
+#define GYRO_SENSITIVITY_X10_1000DPS 328
+#define GYRO_SENSITIVITY_X10_2000DPS 164
+#define GYRO_YAW_DEADBAND_DPS_X10 75
 
 //==============================================================================
 // DECLARACIONES EXTERN DE HANDLES DE PERIFÉRICOS (definidos en main.c)
@@ -35,6 +39,11 @@ extern DMA_HandleTypeDef hdma_i2c2_tx;
 //==============================================================================
 
 SystemFlagTypeDef flags0;
+volatile uint8_t app_10ms_ticks_pending = 0;
+volatile bool app_uart_bypass = false;
+volatile bool app_mpu_read_request = false;
+volatile bool app_ssd_update_request = false;
+static volatile uint32_t app_10ms_overflow_ticks = 0;
 uint16_t pwm_max_value = 10000; // Valor máximo del PWM
 
 _sESP01Handle esp01_handle;
@@ -59,6 +68,21 @@ static AppStateTypeDef app_state = APP_STATE_MENU;
 static MenuModeTypeDef menu_mode = MENU_MODE_IDLE;
 static uint32_t temporary_heartbeat = 0;
 static uint8_t temporary_heartbeat_ticks = 0;
+
+typedef struct
+{
+    volatile uint32_t loop_us;
+    volatile uint32_t loop_us_max;
+    volatile uint32_t control_us;
+    volatile uint32_t control_us_max;
+    volatile uint32_t missed_10ms_ticks;
+    volatile uint8_t pending_10ms_max;
+    volatile uint32_t mpu_comm_us;
+    volatile uint32_t mpu_comm_us_max;
+} TimingDiagnosticsTypeDef;
+
+static TimingDiagnosticsTypeDef timing_diag;
+static uint32_t timing_cycles_per_us = 1;
 
 // --- Variables de PID y Control del Robot ---
 PID_Controller_t centering_pid;
@@ -116,8 +140,11 @@ uint16_t adc_front_floor = 0;
 uint8_t wall_fade_counter = 0;
 uint8_t wall_fade_ticks = WALL_FADE_TICKS_DEFAULT;
 
-static int32_t current_yaw_fixed = 0; // Yaw angle in Q16.16 fixed-point (degrees)
-static int32_t gyro_z_scaler;         // Factor de escala dinámico para el giroscopio
+static volatile int32_t current_yaw_fixed = 0; // Yaw angle in Q16.16 fixed-point (degrees)
+static volatile uint16_t gyro_sensitivity_x10 = GYRO_SENSITIVITY_X10_500DPS;
+static volatile bool mpu_yaw_timing_initialized = false;
+static volatile uint32_t mpu_last_sample_cycle = 0;
+static volatile uint32_t mpu_read_start_cycle = 0;
 
 static volatile RobotStateTypeDef robot_state = STATE_IDLE;
 uint16_t motor_kick_start_speed;
@@ -151,7 +178,20 @@ int8_t I2C_DevicesInit(void);
 static void ManageI2CTransactions(void);
 uint8_t UART_TransmitByte(uint8_t value);
 
+static void Timing_Init(void);
+static uint32_t Timing_GetCycles(void);
+static uint32_t Timing_CyclesToUs(uint32_t cycles);
+static uint32_t Timing_ElapsedUs(uint32_t start_cycles, uint32_t end_cycles);
+static bool Consume_10ms_Tick(void);
+static void Timing_RecordLoop(uint32_t start_cycles);
+static void Timing_RecordControl(uint32_t start_cycles);
+static uint32_t Timing_GetMpuSampleAgeUs(void);
+static void Timing_RequestDisplayTick(void);
 static void Update_Gyro_Scaler(void);
+static int32_t GyroRaw_To_DpsX10(int16_t gyro_raw);
+static int16_t GyroRaw_To_Dps(int16_t gyro_raw);
+static void Reset_Yaw_Tracking(void);
+static void Integrate_Yaw_From_Gyro(int16_t gz_calibrated);
 static void Set_Motor_Speeds(int16_t right_speed, int16_t left_speed);
 
 static void Handle_Idle(void);
@@ -164,7 +204,6 @@ static void Handle_Navigating(void);
 static void Handle_Braking(void);
 static void Handle_Deciding();
 static void Manage_Turn(void);
-static void Update_Yaw(void);
 void Turn_Start(int16_t angle_degrees);
 static void ADC_Filter_Task(void);
 static void ADC_LUT_Precompute(void);
@@ -194,7 +233,14 @@ void App_Core_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
         time_10ms--;
         if (!time_10ms)
         {
-            ON10MS = true;
+            if (app_10ms_ticks_pending < APP_10MS_TICKS_MAX_PENDING)
+            {
+                app_10ms_ticks_pending++;
+            }
+            else
+            {
+                app_10ms_overflow_ticks++;
+            }
             time_10ms = TIME_10MS_PERIOD_COUNT;
         }
         HAL_ADC_Start_DMA(&hadc1, (uint32_t *)App_Sensors_GetAdcDmaWriteBuffer(), ADC_CHANNELS);
@@ -249,6 +295,20 @@ void App_Core_I2C_MemRxCpltCallback(I2C_HandleTypeDef *hi2c)
         hmpu.raw_data.gyro_x_raw = (int16_t)((hmpu.dma_buffer[MPU_DMA_BUF_GYRO_X_H] << 8) | hmpu.dma_buffer[MPU_DMA_BUF_GYRO_X_L]);
         hmpu.raw_data.gyro_y_raw = (int16_t)((hmpu.dma_buffer[MPU_DMA_BUF_GYRO_Y_H] << 8) | hmpu.dma_buffer[MPU_DMA_BUF_GYRO_Y_L]);
         hmpu.raw_data.gyro_z_raw = (int16_t)((hmpu.dma_buffer[MPU_DMA_BUF_GYRO_Z_H] << 8) | hmpu.dma_buffer[MPU_DMA_BUF_GYRO_Z_L]);
+
+#if APP_TIMING_DIAGNOSTICS_ENABLED
+        if (mpu_read_start_cycle != 0U)
+        {
+            uint32_t comm_us = Timing_ElapsedUs(mpu_read_start_cycle, Timing_GetCycles());
+            timing_diag.mpu_comm_us = comm_us;
+            if (comm_us > timing_diag.mpu_comm_us_max)
+            {
+                timing_diag.mpu_comm_us_max = comm_us;
+            }
+        }
+#endif
+
+        Integrate_Yaw_From_Gyro((int16_t)(hmpu.raw_data.gyro_z_raw - hmpu.gyro_offset_z));
         i2c_bus_state = I2C_BUS_IDLE;
     }
 }
@@ -258,18 +318,221 @@ void App_Core_USB_ReceiveData(uint8_t *buf, uint16_t len)
     UNERBUS_ReceiveBuf(&unerbus_pc_handle, buf, len);
 }
 
+static void Timing_Init(void)
+{
+#if APP_TIMING_DIAGNOSTICS_ENABLED
+    CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+    DWT->CYCCNT = 0;
+    DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+    timing_cycles_per_us = SystemCoreClock / 1000000U;
+    if (timing_cycles_per_us == 0U)
+    {
+        timing_cycles_per_us = 1U;
+    }
+    timing_diag.loop_us = 0;
+    timing_diag.loop_us_max = 0;
+    timing_diag.control_us = 0;
+    timing_diag.control_us_max = 0;
+    timing_diag.missed_10ms_ticks = 0;
+    timing_diag.pending_10ms_max = 0;
+    timing_diag.mpu_comm_us = 0;
+    timing_diag.mpu_comm_us_max = 0;
+#endif
+}
+
+static uint32_t Timing_GetCycles(void)
+{
+#if APP_TIMING_DIAGNOSTICS_ENABLED
+    return DWT->CYCCNT;
+#else
+    return 0U;
+#endif
+}
+
+static uint32_t Timing_CyclesToUs(uint32_t cycles)
+{
+#if APP_TIMING_DIAGNOSTICS_ENABLED
+    return cycles / timing_cycles_per_us;
+#else
+    (void)cycles;
+    return 0U;
+#endif
+}
+
+static uint32_t Timing_ElapsedUs(uint32_t start_cycles, uint32_t end_cycles)
+{
+    return Timing_CyclesToUs(end_cycles - start_cycles);
+}
+
+static bool Consume_10ms_Tick(void)
+{
+    uint8_t pending_ticks;
+    uint32_t overflow_ticks;
+
+    __disable_irq();
+    pending_ticks = app_10ms_ticks_pending;
+    overflow_ticks = app_10ms_overflow_ticks;
+    app_10ms_ticks_pending = 0;
+    app_10ms_overflow_ticks = 0;
+    __enable_irq();
+
+    if (pending_ticks > timing_diag.pending_10ms_max)
+    {
+        timing_diag.pending_10ms_max = pending_ticks;
+    }
+
+    if (pending_ticks > 1U)
+    {
+        timing_diag.missed_10ms_ticks += (uint32_t)(pending_ticks - 1U);
+    }
+    timing_diag.missed_10ms_ticks += overflow_ticks;
+
+    return (pending_ticks > 0U);
+}
+
+static void Timing_RecordLoop(uint32_t start_cycles)
+{
+#if APP_TIMING_DIAGNOSTICS_ENABLED
+    uint32_t loop_us = Timing_ElapsedUs(start_cycles, Timing_GetCycles());
+    timing_diag.loop_us = loop_us;
+    if (loop_us > timing_diag.loop_us_max)
+    {
+        timing_diag.loop_us_max = loop_us;
+    }
+#else
+    (void)start_cycles;
+#endif
+}
+
+static void Timing_RecordControl(uint32_t start_cycles)
+{
+#if APP_TIMING_DIAGNOSTICS_ENABLED
+    uint32_t control_us = Timing_ElapsedUs(start_cycles, Timing_GetCycles());
+    timing_diag.control_us = control_us;
+    if (control_us > timing_diag.control_us_max)
+    {
+        timing_diag.control_us_max = control_us;
+    }
+#else
+    (void)start_cycles;
+#endif
+}
+
+static uint32_t Timing_GetMpuSampleAgeUs(void)
+{
+#if APP_TIMING_DIAGNOSTICS_ENABLED
+    if (!mpu_yaw_timing_initialized)
+    {
+        return 0U;
+    }
+    return Timing_ElapsedUs(mpu_last_sample_cycle, Timing_GetCycles());
+#else
+    return 0U;
+#endif
+}
+
+static void Timing_RequestDisplayTick(void)
+{
+#if APP_TIMING_DIAGNOSTICS_ENABLED && APP_TIMING_DISPLAY_ENABLED
+    static uint8_t display_tick_counter = 0;
+
+    display_tick_counter++;
+    if (display_tick_counter >= APP_TIMING_DISPLAY_PERIOD_100MS)
+    {
+        display_tick_counter = 0;
+        if ((app_state == APP_STATE_RUNNING) &&
+            ((menu_mode == MENU_MODE_IDLE) ||
+             ((menu_mode == MENU_MODE_MANUAL_CONTROL) && (robot_state == STATE_IDLE))))
+        {
+            Update_Display_Content();
+            SSD_UPDATE_REQUEST = true;
+        }
+    }
+#endif
+}
+
 //==============================================================================
 // IMPLEMENTACIÓN DE FUNCIONES DE LA APLICACIÓN
 //==============================================================================
 
 static int32_t Gain_Hundredths_To_Fixed(uint16_t gain_x100)
 {
-    return (int32_t)(((int64_t)gain_x100 << FIXED_POINT_SHIFT) / 100);
+    return HUNDREDTHS_TO_FIXED(gain_x100);
 }
 
 static uint16_t Fixed_To_Gain_Hundredths(int32_t gain_fixed)
 {
     return (uint16_t)(((int64_t)gain_fixed * 100) >> FIXED_POINT_SHIFT);
+}
+
+static int32_t GyroRaw_To_DpsX10(int16_t gyro_raw)
+{
+    uint16_t sensitivity_x10 = gyro_sensitivity_x10;
+    int32_t scaled_raw = (int32_t)gyro_raw * 100;
+
+    if (sensitivity_x10 == 0U)
+    {
+        sensitivity_x10 = GYRO_SENSITIVITY_X10_500DPS;
+    }
+
+    if (scaled_raw >= 0)
+    {
+        return (scaled_raw + ((int32_t)sensitivity_x10 / 2)) / (int32_t)sensitivity_x10;
+    }
+    return (scaled_raw - ((int32_t)sensitivity_x10 / 2)) / (int32_t)sensitivity_x10;
+}
+
+static int16_t GyroRaw_To_Dps(int16_t gyro_raw)
+{
+    int32_t dps_x10 = GyroRaw_To_DpsX10(gyro_raw);
+    if (dps_x10 >= 0)
+    {
+        return (int16_t)((dps_x10 + 5) / 10);
+    }
+    return (int16_t)((dps_x10 - 5) / 10);
+}
+
+static void Reset_Yaw_Tracking(void)
+{
+    uint32_t primask = __get_PRIMASK();
+
+    __disable_irq();
+    current_yaw_fixed = 0;
+    mpu_yaw_timing_initialized = false;
+    if (primask == 0U)
+    {
+        __enable_irq();
+    }
+}
+
+static void Integrate_Yaw_From_Gyro(int16_t gz_calibrated)
+{
+    uint32_t now_cycles = Timing_GetCycles();
+
+    if (!mpu_yaw_timing_initialized)
+    {
+        mpu_yaw_timing_initialized = true;
+        mpu_last_sample_cycle = now_cycles;
+        return;
+    }
+
+    uint32_t dt_us = Timing_ElapsedUs(mpu_last_sample_cycle, now_cycles);
+    mpu_last_sample_cycle = now_cycles;
+
+    if ((dt_us == 0U) || (dt_us > 50000U))
+    {
+        dt_us = MPU_READ_PERIOD_COUNT * TIM1_TICK_US;
+    }
+
+    int32_t dps_x10 = GyroRaw_To_DpsX10(gz_calibrated);
+    if ((dps_x10 <= GYRO_YAW_DEADBAND_DPS_X10) && (dps_x10 >= -GYRO_YAW_DEADBAND_DPS_X10))
+    {
+        return;
+    }
+
+    int32_t dt_q16 = (int32_t)(((uint32_t)dt_us << FIXED_POINT_SHIFT) / 1000000U);
+    int32_t yaw_delta_q16 = (dps_x10 * dt_q16) / 10;
+    current_yaw_fixed -= yaw_delta_q16;
 }
 
 static void Apply_Pid_Config(PID_Role_t role, bool reset_state)
@@ -302,30 +565,30 @@ static void Write_Pid_Gains_To_Buffer(PID_Role_t role, uint8_t *buffer)
 static void Init_Pid_Configs(void)
 {
     pid_configs[PID_ROLE_CENTERING] = (PID_Config_t){
-        .kp = FLOAT_TO_FIXED(0.8f),
-        .ki = FLOAT_TO_FIXED(0.0f),
-        .kd = FLOAT_TO_FIXED(0.2f),
+        .kp = Gain_Hundredths_To_Fixed(80),
+        .ki = Gain_Hundredths_To_Fixed(0),
+        .kd = Gain_Hundredths_To_Fixed(20),
         .out_min = INT_TO_FIXED(-max_pwm_correction),
         .out_max = INT_TO_FIXED(max_pwm_correction)};
 
     pid_configs[PID_ROLE_BRAKING] = (PID_Config_t){
-        .kp = FLOAT_TO_FIXED(BRAKING_PID_KP_DEFAULT),
-        .ki = FLOAT_TO_FIXED(BRAKING_PID_KI_DEFAULT),
-        .kd = FLOAT_TO_FIXED(BRAKING_PID_KD_DEFAULT),
+        .kp = Gain_Hundredths_To_Fixed(BRAKING_PID_KP_DEFAULT_X100),
+        .ki = Gain_Hundredths_To_Fixed(BRAKING_PID_KI_DEFAULT_X100),
+        .kd = Gain_Hundredths_To_Fixed(BRAKING_PID_KD_DEFAULT_X100),
         .out_min = INT_TO_FIXED(-braking_max_pwm_offset),
         .out_max = INT_TO_FIXED(braking_max_pwm_offset)};
 
     pid_configs[PID_ROLE_TURN] = (PID_Config_t){
-        .kp = FLOAT_TO_FIXED(TURN_PID_KP_DEFAULT),
-        .ki = FLOAT_TO_FIXED(TURN_PID_KI_DEFAULT),
-        .kd = FLOAT_TO_FIXED(TURN_PID_KD_DEFAULT),
+        .kp = Gain_Hundredths_To_Fixed(TURN_PID_KP_DEFAULT_X100),
+        .ki = Gain_Hundredths_To_Fixed(TURN_PID_KI_DEFAULT_X100),
+        .kd = Gain_Hundredths_To_Fixed(TURN_PID_KD_DEFAULT_X100),
         .out_min = INT_TO_FIXED(-turn_max_pwm),
         .out_max = INT_TO_FIXED(turn_max_pwm)};
 
     pid_configs[PID_ROLE_TURN_VELOCITY] = (PID_Config_t){
-        .kp = FLOAT_TO_FIXED(TURN_VELOCITY_PID_KP_DEFAULT),
-        .ki = FLOAT_TO_FIXED(TURN_VELOCITY_PID_KI_DEFAULT),
-        .kd = FLOAT_TO_FIXED(TURN_VELOCITY_PID_KD_DEFAULT),
+        .kp = Gain_Hundredths_To_Fixed(TURN_VELOCITY_PID_KP_DEFAULT_X100),
+        .ki = Gain_Hundredths_To_Fixed(TURN_VELOCITY_PID_KI_DEFAULT_X100),
+        .kd = Gain_Hundredths_To_Fixed(TURN_VELOCITY_PID_KD_DEFAULT_X100),
         .out_min = INT_TO_FIXED(-turn_max_pwm),
         .out_max = INT_TO_FIXED(turn_max_pwm)};
 }
@@ -417,6 +680,7 @@ void DecodeCMD(struct UNERBUSHandle *aBus, uint8_t iStartData)
         break;
     case CMD_CALIBRATE_MPU:            // Calibrar el MPU6050
         MPU6050_Calibrate(&hmpu, 200); // Calibrar con 200 muestras (ajustable)
+        Reset_Yaw_Tracking();
                                        /*         UNERBUS_WriteByte(aBus, CMD_ACK); // Confirmar calibración
                                                length = UNERBUS_CMD_ID_SIZE + UNERBUS_ACK_SIZE; */
         break;
@@ -549,7 +813,7 @@ void DecodeCMD(struct UNERBUSHandle *aBus, uint8_t iStartData)
         ki_int = UNERBUS_GetUInt16(aBus);
         kd_int = UNERBUS_GetUInt16(aBus);
 
-        // Convertir de entero a punto fijo (dividiendo por 100.0)
+        // Convertir de entero x100 a punto fijo.
         // Se usa 100 para ampliar el rango de Kp hasta ~655
         Set_Pid_Gains_From_U16(PID_ROLE_CENTERING, kp_int, ki_int, kd_int, false);
         break;
@@ -618,7 +882,7 @@ void DecodeCMD(struct UNERBUSHandle *aBus, uint8_t iStartData)
         turn_ki_int = UNERBUS_GetUInt16(aBus);
         turn_kd_int = UNERBUS_GetUInt16(aBus);
 
-        // Convertir de entero a punto fijo (dividiendo por 100.0)
+        // Convertir de entero x100 a punto fijo.
         Set_Pid_Gains_From_U16(PID_ROLE_TURN, turn_kp_int, turn_ki_int, turn_kd_int, false);
         break;
     case CMD_GET_TURN_PID_GAINS: // Leer Kp, Ki, Kd del PID de giro
@@ -703,7 +967,7 @@ void DecodeCMD(struct UNERBUSHandle *aBus, uint8_t iStartData)
             // Resetear PIDs y Yaw para un inicio limpio
             PID_Reset(&centering_pid);
             PID_Reset(&turn_pid);
-            current_yaw_fixed = 0;
+            Reset_Yaw_Tracking();
             // Iniciar la máquina de estados del robot si el modo es activo.
             // Esto replica el comportamiento del botón físico.
             if (menu_mode == MENU_MODE_FIND_CELLS || menu_mode == MENU_MODE_GO_TO_B)
@@ -935,14 +1199,10 @@ void DecodeCMD(struct UNERBUSHandle *aBus, uint8_t iStartData)
 
 void Do10ms()
 {
-    ON10MS = false;
-
     Button_Tick(&h_user_button);
 
     if (time_100ms)
         time_100ms--;
-
-    Update_Yaw();
 
     ESP01_Timeout10ms();
     UNERBUS_Timeout(&unerbus_esp01_handle);
@@ -1016,6 +1276,8 @@ void Do100ms()
 
     if (timeout_alive_udp)
         timeout_alive_udp--;
+
+    Timing_RequestDisplayTick();
 }
 
 uint8_t UART_TransmitByte(uint8_t value)
@@ -1176,6 +1438,7 @@ static void ManageI2CTransactions(void)
     {
         MPU_READ_REQUEST = false;         // Atender la solicitud
         i2c_bus_state = I2C_BUS_BUSY_MPU; // Marcar el bus como ocupado por el MPU
+        mpu_read_start_cycle = Timing_GetCycles();
         if (MPU6050_ReadRawDataDMA(&hmpu) != MPU6050_OK)
         {
             // Si falla el inicio, liberar el bus y manejar el error
@@ -1221,7 +1484,7 @@ static void ManageButtonEvents(void)
             case EVENT_PRESS_RELEASED: // Pulsación corta: ciclar menú
                 menu_mode = (MenuModeTypeDef)((menu_mode + 1) % MENU_MODE_COUNT);
                 temporary_heartbeat = HEARTBEAT_BTN_SHORT_PRESS;
-                temporary_heartbeat_ticks = 5; // Duración del feedback (5 * 100ms = 0.5s)
+                temporary_heartbeat_ticks = 5; // Duracion del feedback: 5 ticks de 100 ms.
                 Update_Display_Content();
                 SSD_UPDATE_REQUEST = true;
                 break;
@@ -1233,6 +1496,7 @@ static void ManageButtonEvents(void)
                 PID_Reset(&centering_pid);
                 PID_Reset(&turn_pid);
                 PID_Reset(&braking_pid);
+                Reset_Yaw_Tracking();
                 Set_Robot_State((menu_mode == MENU_MODE_FIND_CELLS) ? STATE_NAVIGATING : STATE_IDLE);
                 if (robot_state == STATE_NAVIGATING)
                 {
@@ -1303,6 +1567,7 @@ void App_Core_Init(void)
     heartbeat_mask = 0x80000000;
 
     /* Time */
+    Timing_Init();
     time_10ms = TIME_10MS_PERIOD_COUNT;
     time_100ms = TIME_100MS_PEDIOD_COUNT;
     timeout_alive_udp = ALIVE_UDP_PERIOD_COUNT;
@@ -1332,7 +1597,6 @@ void App_Core_Init(void)
     ADC_LUT_Precompute();
 
     /* Timers */
-    HAL_TIM_Base_Start_IT(&htim1);
     __HAL_TIM_SET_AUTORELOAD(&htim4, pwm_max_value - 1);
     __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_1, 0);
     __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_2, 0);
@@ -1406,16 +1670,23 @@ void App_Core_Init(void)
     HAL_UART_Receive_IT(&huart1, &data_rx_esp01, 1);
 
     /* Flags */
-    ON10MS = false;
+    app_10ms_ticks_pending = 0;
+    app_10ms_overflow_ticks = 0;
+    MPU_READ_REQUEST = false;
+    SSD_UPDATE_REQUEST = false;
     UART_BYPASS = false;
 
     /* Estados de la aplicación */
     app_state = APP_STATE_MENU;
     menu_mode = MENU_MODE_IDLE;
+
+    HAL_TIM_Base_Start_IT(&htim1);
 }
 
 void App_Core_Loop(void)
 {
+    uint32_t loop_start_cycles = Timing_GetCycles();
+
     ManageButtonEvents();
 
     if (!timeout_alive_udp && !UART_BYPASS)
@@ -1432,23 +1703,26 @@ void App_Core_Loop(void)
 
     ADC_Filter_Task();
 
-	if (ON10MS)
-	{
-		Do10ms();
+    if (Consume_10ms_Tick())
+    {
+        uint32_t control_start_cycles = Timing_GetCycles();
 
-		if (app_state == APP_STATE_RUNNING && (menu_mode == MENU_MODE_FIND_CELLS || menu_mode == MENU_MODE_GO_TO_B || menu_mode == MENU_MODE_DRIVE_STRAIGHT))
-		{
-			Update_Navigation_Perception();
+        Do10ms();
 
-	        if (pending_initial_cell_seed && robot_state == STATE_NAVIGATING)
-	        {
-	            Commit_Maze_State(0, true, true);
-	            pending_initial_cell_seed = false;
-	        }
-		}
+        if (app_state == APP_STATE_RUNNING && (menu_mode == MENU_MODE_FIND_CELLS || menu_mode == MENU_MODE_GO_TO_B || menu_mode == MENU_MODE_DRIVE_STRAIGHT))
+        {
+            Update_Navigation_Perception();
 
-		Modes_State_Machine();
-	}
+            if (pending_initial_cell_seed && robot_state == STATE_NAVIGATING)
+            {
+                Commit_Maze_State(0, true, true);
+                pending_initial_cell_seed = false;
+            }
+        }
+
+        Modes_State_Machine();
+        Timing_RecordControl(control_start_cycles);
+    }
 
     ManageTransmission();
 
@@ -1456,24 +1730,8 @@ void App_Core_Loop(void)
 
     UNERBUS_Task(&unerbus_esp01_handle);
     UNERBUS_Task(&unerbus_pc_handle);
-}
 
-/**
- * @brief Actualiza el ángulo de Yaw integrando la velocidad del giroscopio.
- *        Se llama cada 10ms.
- */
-static void Update_Yaw(void)
-{
-    int16_t gz;
-    // Obtener solo el dato calibrado del giroscopio en Z
-    MPU6050_GetCalibratedData(&hmpu, NULL, NULL, NULL, NULL, NULL, &gz);
-
-    // Integrar para obtener el ángulo en punto fijo (Q16.16)
-    // El escalador convierte el valor raw del giroscopio a un cambio de ángulo en grados (formato Q16.16) para un dt de 10ms.
-    if (abs(gz) > 500)
-    {
-        current_yaw_fixed -= (int32_t)gz * gyro_z_scaler;
-    }
+    Timing_RecordLoop(loop_start_cycles);
 }
 
 /**
@@ -1487,7 +1745,7 @@ void Turn_Start(int16_t angle_degrees)
     {
         // Reseteamos el PID que usaremos para el control de velocidad y el ángulo acumulado.
         PID_Reset(&turn_pid);
-        current_yaw_fixed = 0; // Reseteamos la medición de ángulo para un giro relativo.
+        Reset_Yaw_Tracking(); // Reseteamos la medición de ángulo para un giro relativo.
 
         // Asignar el estado de giro correcto
         if (angle_degrees == 90)
@@ -1547,7 +1805,7 @@ void Turn_Start(int16_t angle_degrees)
     int32_t pid_output_fixed = PID_Update(&turn_pid, current_yaw_degrees, 10);
     int16_t correction_pwm = (int16_t)FIXED_TO_INT(pid_output_fixed);
 
-    // 2. Calcular un ratio de giro de [-1.0, 1.0]
+    // 2. Calcular un ratio de giro normalizado.
     int32_t turn_ratio_fixed = 0;
     if (turn_max_pwm != 0)
     {
@@ -1676,8 +1934,7 @@ static void Manage_Turn(void)
     MPU6050_GetCalibratedData(&hmpu, NULL, NULL, NULL, NULL, NULL, &gz);
 
     // Convertir el valor raw del giroscopio (gz) a grados por segundo (dps).
-    int32_t angular_velocity_fixed = FIXED_DIV(INT_TO_FIXED(gz), GYRO_SENSITIVITY);
-    int16_t angular_velocity_dps = (int16_t)FIXED_TO_INT(angular_velocity_fixed);
+    int16_t angular_velocity_dps = GyroRaw_To_Dps(gz);
 
     // 4. Establecer el setpoint del PID de giro a la velocidad angular deseada.
     PID_Set_Setpoint(&turn_pid, target_dps);
@@ -1735,31 +1992,36 @@ static void Set_Motor_Speeds(int16_t right_speed, int16_t left_speed)
  */
 static void Update_Gyro_Scaler(void)
 {
-    // La fórmula es: (dt_s * (1 << 16)) / LSB_per_dps
-    // dt_s = 0.01s (10ms), (1 << 16) = 65536
-    // El resultado es (655.36 / LSB_per_dps)
+    uint16_t new_sensitivity_x10;
+    uint32_t primask;
+
     switch (hmpu.gyro_range)
     {
     case MPU6050_GYRO_RANGE_250DPS:
-        // LSB/dps = 131
-        gyro_z_scaler = 5; // 655.36 / 131 = 4.995...
+        new_sensitivity_x10 = GYRO_SENSITIVITY_X10_250DPS;
         break;
     case MPU6050_GYRO_RANGE_500DPS:
-        // LSB/dps = 65.5
-        gyro_z_scaler = 10; // 655.36 / 65.5 = 9.99...
+        new_sensitivity_x10 = GYRO_SENSITIVITY_X10_500DPS;
         break;
     case MPU6050_GYRO_RANGE_1000DPS:
-        // LSB/dps = 32.8
-        gyro_z_scaler = 20; // 655.36 / 32.8 = 19.98...
+        new_sensitivity_x10 = GYRO_SENSITIVITY_X10_1000DPS;
         break;
     case MPU6050_GYRO_RANGE_2000DPS:
-        // LSB/dps = 16.4
-        gyro_z_scaler = 40; // 655.36 / 16.4 = 39.96...
+        new_sensitivity_x10 = GYRO_SENSITIVITY_X10_2000DPS;
         break;
     default:
         // Caso por defecto seguro
-        gyro_z_scaler = 10;
+        new_sensitivity_x10 = GYRO_SENSITIVITY_X10_500DPS;
         break;
+    }
+
+    primask = __get_PRIMASK();
+    __disable_irq();
+    gyro_sensitivity_x10 = new_sensitivity_x10;
+    mpu_yaw_timing_initialized = false;
+    if (primask == 0U)
+    {
+        __enable_irq();
     }
 }
 
@@ -2066,14 +2328,14 @@ static void Handle_Deciding(void)
     if (choice == IZQUIERDA)
     {
         Set_Robot_State(STATE_SMOOTH_TURN_LEFT); // Prioridad a la izquierda
-        current_yaw_fixed = 0;
+        Reset_Yaw_Tracking();
         PID_Reset(&turn_velocity_pid);
         PID_Set_Setpoint(&turn_velocity_pid, turn_target_dps); // Valores positivos de gz para giro a la izquierda
     }
     else if (choice == DERECHA)
     {
         Set_Robot_State(STATE_SMOOTH_TURN_RIGHT);
-        current_yaw_fixed = 0;
+        Reset_Yaw_Tracking();
         PID_Reset(&turn_velocity_pid);
         PID_Set_Setpoint(&turn_velocity_pid, -turn_target_dps); // Valores negativos de gz para giro a la derecha
     }
@@ -2175,6 +2437,32 @@ static void Update_Display_Content(void)
         SSD1306_DrawText(&hssd, 0, 40, text_line4, SSD1306_TEXT_ALIGN_LEFT);
         SSD1306_DrawText(&hssd, 0, 50, text_line5, SSD1306_TEXT_ALIGN_LEFT);
     }
+#if APP_TIMING_DIAGNOSTICS_ENABLED && APP_TIMING_DISPLAY_ENABLED
+    else
+    {
+        snprintf(text_line1, sizeof(text_line1), "Loop %lu/%lu",
+                 (unsigned long)timing_diag.loop_us,
+                 (unsigned long)timing_diag.loop_us_max);
+        snprintf(text_line2, sizeof(text_line2), "Ctrl %lu/%lu",
+                 (unsigned long)timing_diag.control_us,
+                 (unsigned long)timing_diag.control_us_max);
+        snprintf(text_line3, sizeof(text_line3), "Miss %lu P%u",
+                 (unsigned long)timing_diag.missed_10ms_ticks,
+                 (unsigned int)timing_diag.pending_10ms_max);
+        snprintf(text_line4, sizeof(text_line4), "MPU age %lu",
+                 (unsigned long)Timing_GetMpuSampleAgeUs());
+        snprintf(text_line5, sizeof(text_line5), "I2C %lu/%lu",
+                 (unsigned long)timing_diag.mpu_comm_us,
+                 (unsigned long)timing_diag.mpu_comm_us_max);
+
+        SSD1306_DrawText(&hssd, 0, 0, "--- TIMING ---", SSD1306_TEXT_ALIGN_LEFT);
+        SSD1306_DrawText(&hssd, 0, 10, text_line1, SSD1306_TEXT_ALIGN_LEFT);
+        SSD1306_DrawText(&hssd, 0, 20, text_line2, SSD1306_TEXT_ALIGN_LEFT);
+        SSD1306_DrawText(&hssd, 0, 30, text_line3, SSD1306_TEXT_ALIGN_LEFT);
+        SSD1306_DrawText(&hssd, 0, 40, text_line4, SSD1306_TEXT_ALIGN_LEFT);
+        SSD1306_DrawText(&hssd, 0, 50, text_line5, SSD1306_TEXT_ALIGN_LEFT);
+    }
+#endif
     /*     else // APP_STATE_RUNNING
         {
             const char *current_mode_str = "Unknown";
@@ -2316,8 +2604,7 @@ static void Handle_Smooth_Turn(void)
     int16_t gz;
     MPU6050_GetCalibratedData(&hmpu, NULL, NULL, NULL, NULL, NULL, &gz);
 
-    int32_t angular_velocity_fixed = FIXED_DIV(INT_TO_FIXED(gz), GYRO_SENSITIVITY);
-    int16_t angular_velocity_dps = (int16_t)FIXED_TO_INT(angular_velocity_fixed);
+    int16_t angular_velocity_dps = GyroRaw_To_Dps(gz);
 
     int32_t pid_output_fixed = PID_Update(&turn_velocity_pid, angular_velocity_dps, 10);
     int16_t correction = (int16_t)FIXED_TO_INT(pid_output_fixed);
