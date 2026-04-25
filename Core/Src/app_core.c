@@ -83,6 +83,7 @@ typedef struct
 
 static TimingDiagnosticsTypeDef timing_diag;
 static uint32_t timing_cycles_per_us = 1;
+static bool timing_diag_reset_request = false;
 
 // --- Variables de PID y Control del Robot ---
 PID_Controller_t centering_pid;
@@ -179,6 +180,9 @@ static void ManageI2CTransactions(void);
 uint8_t UART_TransmitByte(uint8_t value);
 
 static void Timing_Init(void);
+static void Timing_ResetDiagnostics(void);
+static void Timing_RequestDiagnosticsReset(void);
+static void Timing_ResetDiagnosticsIfRequested(void);
 static uint32_t Timing_GetCycles(void);
 static uint32_t Timing_CyclesToUs(uint32_t cycles);
 static uint32_t Timing_ElapsedUs(uint32_t start_cycles, uint32_t end_cycles);
@@ -329,6 +333,18 @@ static void Timing_Init(void)
     {
         timing_cycles_per_us = 1U;
     }
+    Timing_ResetDiagnostics();
+#endif
+}
+
+static void Timing_ResetDiagnostics(void)
+{
+#if APP_TIMING_DIAGNOSTICS_ENABLED
+    uint32_t primask = __get_PRIMASK();
+
+    __disable_irq();
+    app_10ms_ticks_pending = 0;
+    app_10ms_overflow_ticks = 0;
     timing_diag.loop_us = 0;
     timing_diag.loop_us_max = 0;
     timing_diag.control_us = 0;
@@ -337,6 +353,28 @@ static void Timing_Init(void)
     timing_diag.pending_10ms_max = 0;
     timing_diag.mpu_comm_us = 0;
     timing_diag.mpu_comm_us_max = 0;
+    if (primask == 0U)
+    {
+        __enable_irq();
+    }
+#endif
+}
+
+static void Timing_RequestDiagnosticsReset(void)
+{
+#if APP_TIMING_DIAGNOSTICS_ENABLED
+    timing_diag_reset_request = true;
+#endif
+}
+
+static void Timing_ResetDiagnosticsIfRequested(void)
+{
+#if APP_TIMING_DIAGNOSTICS_ENABLED
+    if (timing_diag_reset_request)
+    {
+        timing_diag_reset_request = false;
+        Timing_ResetDiagnostics();
+    }
 #endif
 }
 
@@ -681,6 +719,7 @@ void DecodeCMD(struct UNERBUSHandle *aBus, uint8_t iStartData)
     case CMD_CALIBRATE_MPU:            // Calibrar el MPU6050
         MPU6050_Calibrate(&hmpu, 200); // Calibrar con 200 muestras (ajustable)
         Reset_Yaw_Tracking();
+        Timing_RequestDiagnosticsReset();
                                        /*         UNERBUS_WriteByte(aBus, CMD_ACK); // Confirmar calibración
                                                length = UNERBUS_CMD_ID_SIZE + UNERBUS_ACK_SIZE; */
         break;
@@ -796,6 +835,7 @@ void DecodeCMD(struct UNERBUSHandle *aBus, uint8_t iStartData)
 
             // Actualizar el escalador del giroscopio con la nueva configuración
             Update_Gyro_Scaler();
+            Timing_RequestDiagnosticsReset();
         }
     }
     break;
@@ -1732,6 +1772,7 @@ void App_Core_Loop(void)
     UNERBUS_Task(&unerbus_pc_handle);
 
     Timing_RecordLoop(loop_start_cycles);
+    Timing_ResetDiagnosticsIfRequested();
 }
 
 /**
