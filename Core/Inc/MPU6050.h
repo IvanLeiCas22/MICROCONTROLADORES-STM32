@@ -31,6 +31,7 @@
 #define MPU6050_ERROR_I2C_FUNCS_NOT_ASSIGNED -7
 #define MPU6050_ERROR_RESET_FAILED -8
 #define MPU6050_ERROR_WHO_AM_I_READ_FAILED -9
+#define MPU6050_ERROR_NO_VALID_CALIBRATION_DATA -10
 
 typedef enum
 {
@@ -114,5 +115,5 @@ int8_t MPU6050_Init(MPU6050_HandleTypeDef *hmpu);
 int8_t MPU6050_ReadRawDataDMA(MPU6050_HandleTypeDef *hmpu);
 
 // Calibración y lectura calibrada
-void MPU6050_Calibrate(MPU6050_HandleTypeDef *hmpu, uint16_t samples);
+int8_t MPU6050_Calibrate(MPU6050_HandleTypeDef *hmpu, uint16_t samples);
 void MPU6050_GetCalibratedData(MPU6050_HandleTypeDef *hmpu, int16_t *ax, int16_t *ay, int16_t *az, int16_t *gx, int16_t *gy, int16_t *gz);

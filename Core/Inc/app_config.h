@@ -75,7 +75,7 @@ typedef enum
     CMD_FIRMWARE = 0xF1,
     CMD_GET_BUTTON_STATE = 0x12,
     CMD_GET_MPU_DATA = 0xA2,
-    CMD_GET_LAST_ADC_VALUES = 0xA0,
+    CMD_GET_IR_SENSOR_SNAPSHOT = 0xA0,
     CMD_TEST_MOTORS = 0xA1,
     CMD_GET_MOTOR_SPEEDS = 0xA4,
     CMD_SET_MOTOR_PWM = 0xA5,
@@ -226,7 +226,8 @@ extern volatile bool app_ssd_update_request;
 #define ADC_BUFFER_SIZE 32
 #define ADC_CHANNELS 8
 #define ADC_DATA_BYTES (ADC_CHANNELS * 2)
-#define ADC_MOVING_AVERAGE_SAMPLES 16 // Número de muestras a promediar (10ms / 250us)
+#define IR_SENSOR_SNAPSHOT_BYTES (ADC_DATA_BYTES + 1U)
+#define ADC_MOVING_AVERAGE_SAMPLES 16 // Ventana de 16 muestras (aprox. 4ms a 250us)
 #define ADC_FILTER_SHIFT 4            // Corresponde a log2(16)
 #define ADC_BUF_MASK (ADC_BUFFER_SIZE - 1)
 
@@ -348,6 +349,17 @@ extern uint16_t pwm_max_value;
 #define SENSOR_DIAGONAL_LEFT_CH 5
 #define SENSOR_LEFT_LAT_CH 6
 #define SENSOR_FLOOR_REAR_CH 7
+
+#define SENSOR_DET_WALL_FRONT 0x01
+#define SENSOR_DET_WALL_LEFT 0x02
+#define SENSOR_DET_WALL_RIGHT 0x04
+#define SENSOR_DET_WALL_DIAG_LEFT 0x08
+#define SENSOR_DET_WALL_DIAG_RIGHT 0x10
+#define SENSOR_DET_FLOOR_FRONT 0x20
+#define SENSOR_DET_FLOOR_REAR 0x40
+
+#define WALL_HYSTERESIS_MM 15
+#define TAPE_HYSTERESIS_ADC 200
 
 #define WALL_PRESENCE_THRESHOLD_MM_SIDE 100         // Distancia (mm) para detectar una pared lateral.
 #define WALL_PRESENCE_THRESHOLD_MM_DIAGONAL 140     // Distancia (mm) para detectar una pared diagonal derecha.

@@ -85,9 +85,36 @@ int8_t MPU6050_ReadRawDataDMA(MPU6050_HandleTypeDef *hmpu)
 }
 
 // Calibración: promedia N lecturas en reposo y guarda los offsets
-void MPU6050_Calibrate(MPU6050_HandleTypeDef *hmpu, uint16_t samples)
+int8_t MPU6050_Calibrate(MPU6050_HandleTypeDef *hmpu, uint16_t samples)
 {
     int32_t ax = 0, ay = 0, az = 0, gx = 0, gy = 0, gz = 0;
+    uint16_t valid_samples = 0;
+    int16_t accel_1g_raw = 16384;
+
+    if (samples == 0U)
+    {
+        return MPU6050_ERROR_NO_VALID_CALIBRATION_DATA;
+    }
+
+    switch (hmpu->accel_range)
+    {
+    case MPU6050_ACCEL_RANGE_2G:
+        accel_1g_raw = 16384;
+        break;
+    case MPU6050_ACCEL_RANGE_4G:
+        accel_1g_raw = 8192;
+        break;
+    case MPU6050_ACCEL_RANGE_8G:
+        accel_1g_raw = 4096;
+        break;
+    case MPU6050_ACCEL_RANGE_16G:
+        accel_1g_raw = 2048;
+        break;
+    default:
+        accel_1g_raw = 16384;
+        break;
+    }
+
     for (uint16_t i = 0; i < samples; i++)
     {
         // Leer datos crudos (blocking)
@@ -106,17 +133,24 @@ void MPU6050_Calibrate(MPU6050_HandleTypeDef *hmpu, uint16_t samples)
             gx += gyro_x;
             gy += gyro_y;
             gz += gyro_z;
+            valid_samples++;
         }
         if (hmpu->delay_ms)
             hmpu->delay_ms(2);
     }
-    hmpu->accel_offset_x = (int16_t)(ax / samples);
-    hmpu->accel_offset_y = (int16_t)(ay / samples);
-    // Para Z, restar 1g (depende del rango, para 2g: 16384)
-    hmpu->accel_offset_z = (int16_t)((az / samples) - 16384);
-    hmpu->gyro_offset_x = (int16_t)(gx / samples);
-    hmpu->gyro_offset_y = (int16_t)(gy / samples);
-    hmpu->gyro_offset_z = (int16_t)(gz / samples);
+    if (valid_samples == 0U)
+    {
+        return MPU6050_ERROR_NO_VALID_CALIBRATION_DATA;
+    }
+
+    hmpu->accel_offset_x = (int16_t)(ax / valid_samples);
+    hmpu->accel_offset_y = (int16_t)(ay / valid_samples);
+    hmpu->accel_offset_z = (int16_t)((az / valid_samples) - accel_1g_raw);
+    hmpu->gyro_offset_x = (int16_t)(gx / valid_samples);
+    hmpu->gyro_offset_y = (int16_t)(gy / valid_samples);
+    hmpu->gyro_offset_z = (int16_t)(gz / valid_samples);
+
+    return MPU6050_OK;
 }
 
 // Devuelve los datos calibrados (resta los offsets)

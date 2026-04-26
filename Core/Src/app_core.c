@@ -106,6 +106,25 @@ static PID_Controller_t *const pid_instances[PID_ROLE_COUNT] = {
     &turn_velocity_pid,
     &braking_pid};
 
+typedef struct
+{
+    uint16_t adc_filtered[ADC_CHANNELS];
+    uint16_t dist_diagonal_left_mm;
+    uint16_t dist_diagonal_right_mm;
+    uint16_t dist_front_left_mm;
+    uint16_t dist_front_right_mm;
+    uint16_t dist_left_lat_mm;
+    uint16_t dist_right_lat_mm;
+    uint8_t detection_flags;
+    int16_t ax;
+    int16_t ay;
+    int16_t az;
+    int16_t gx;
+    int16_t gy;
+    int16_t gz;
+    int32_t yaw_fixed;
+} SensorSnapshotTypeDef;
+
 uint16_t right_motor_base_speed = 3575;         // Velocidad base motor derecho
 uint16_t left_motor_base_speed = 4550;          // Velocidad base motor izquierdo
 uint16_t faster_motor_smooth_turn_speed = 6000; // Velocidad del motor más rápido en giro suave
@@ -138,8 +157,8 @@ uint16_t dist_left_lat_mm = 0;
 uint16_t dist_right_lat_mm = 0;
 uint16_t adc_rear_floor = 0;
 uint16_t adc_front_floor = 0;
-uint8_t wall_fade_counter = 0;
 uint8_t wall_fade_ticks = WALL_FADE_TICKS_DEFAULT;
+static SensorSnapshotTypeDef sensor_snapshot;
 
 static volatile int32_t current_yaw_fixed = 0; // Yaw angle in Q16.16 fixed-point (degrees)
 static volatile uint16_t gyro_sensitivity_x10 = GYRO_SENSITIVITY_X10_500DPS;
@@ -177,6 +196,7 @@ static void ManageButtonEvents(void);
 void IndicateError(uint8_t blinks, uint32_t delay_ms);
 int8_t I2C_DevicesInit(void);
 static void ManageI2CTransactions(void);
+static void Prepare_MPU_BlockingTransaction(void);
 uint8_t UART_TransmitByte(uint8_t value);
 
 static void Timing_Init(void);
@@ -215,6 +235,9 @@ static int32_t Get_Filtered_ADC_Value(uint8_t channel);
 static void Set_Robot_State(RobotStateTypeDef new_state);
 static void Update_Display_Content(void);
 static int32_t ADC_To_Distance_mm(uint16_t adc_value);
+static bool Detect_Low_With_Hysteresis(uint16_t value, uint16_t threshold, uint16_t hysteresis, bool was_detected);
+static bool Detect_Front_Wall_With_Hysteresis(uint16_t left_value, uint16_t right_value, uint16_t threshold, uint16_t hysteresis, bool was_detected);
+static void Sync_Legacy_Perception_From_Snapshot(void);
 static void Handle_Straight_Drive(bool have_to_decide);
 static void Modes_State_Machine(void);
 static void Update_Navigation_Perception(void);
@@ -699,26 +722,39 @@ void DecodeCMD(struct UNERBUSHandle *aBus, uint8_t iStartData)
         UNERBUS_WriteByte(aBus, CMD_ACK);
         length = UNERBUS_CMD_ID_SIZE + UNERBUS_ACK_SIZE; //
         break;
-    case CMD_GET_LAST_ADC_VALUES:           // LAST_ADC - Enviar datos del ADC
-        uint8_t adc_buffer[ADC_DATA_BYTES]; // Buffer temporal para los datos del ADC
+    case CMD_GET_IR_SENSOR_SNAPSHOT:
+    {
+        uint8_t ir_buffer[IR_SENSOR_SNAPSHOT_BYTES];
+        uint16_t ir_values[ADC_CHANNELS] = {
+            sensor_snapshot.dist_right_lat_mm,
+            sensor_snapshot.dist_diagonal_right_mm,
+            sensor_snapshot.dist_front_right_mm,
+            sensor_snapshot.adc_filtered[SENSOR_FLOOR_FRONT_CH],
+            sensor_snapshot.dist_front_left_mm,
+            sensor_snapshot.dist_diagonal_left_mm,
+            sensor_snapshot.dist_left_lat_mm,
+            sensor_snapshot.adc_filtered[SENSOR_FLOOR_REAR_CH]};
 
-        // Obtener el valor filtrado (promedio móvil) para cada canal
         for (uint8_t i = 0; i < ADC_CHANNELS; i++)
         {
-            uint16_t distance_value =
-                App_Sensors_ConvertAdcToDistanceMm(App_Sensors_GetFilteredAdcValue(i));
-
-            // Convertir el valor uint16_t a bytes (Little Endian)
-            adc_buffer[idx++] = (uint8_t)(distance_value & 0xFF);        // Byte bajo
-            adc_buffer[idx++] = (uint8_t)((distance_value >> 8) & 0xFF); // Byte alto
+            ir_buffer[idx++] = (uint8_t)(ir_values[i] & 0xFF);
+            ir_buffer[idx++] = (uint8_t)((ir_values[i] >> 8) & 0xFF);
         }
 
-        UNERBUS_Write(aBus, adc_buffer, ADC_DATA_BYTES);
-        length = UNERBUS_CMD_ID_SIZE + ADC_DATA_BYTES; // 1 (CMD) + 16 (datos)
+        ir_buffer[idx++] = sensor_snapshot.detection_flags;
+
+        UNERBUS_Write(aBus, ir_buffer, IR_SENSOR_SNAPSHOT_BYTES);
+        length = UNERBUS_CMD_ID_SIZE + IR_SENSOR_SNAPSHOT_BYTES;
+    }
         break;
     case CMD_CALIBRATE_MPU:            // Calibrar el MPU6050
-        MPU6050_Calibrate(&hmpu, 200); // Calibrar con 200 muestras (ajustable)
+        Prepare_MPU_BlockingTransaction();
+        if (MPU6050_Calibrate(&hmpu, 200) != MPU6050_OK) // Calibrar con 200 muestras (ajustable)
+        {
+            Error_Handler();
+        }
         Reset_Yaw_Tracking();
+        MPU_READ_REQUEST = false;
         Timing_RequestDiagnosticsReset();
                                        /*         UNERBUS_WriteByte(aBus, CMD_ACK); // Confirmar calibración
                                                length = UNERBUS_CMD_ID_SIZE + UNERBUS_ACK_SIZE; */
@@ -826,15 +862,21 @@ void DecodeCMD(struct UNERBUSHandle *aBus, uint8_t iStartData)
 
         if (is_valid)
         {
+            Prepare_MPU_BlockingTransaction();
             hmpu.accel_range = new_accel_range;
             hmpu.gyro_range = new_gyro_range;
             hmpu.dlpf_config = new_dlpf_config;
 
             // Re-inicializar el MPU para aplicar la nueva configuración
-            MPU6050_Init(&hmpu);
+            if (MPU6050_Init(&hmpu) != MPU6050_OK)
+            {
+                Error_Handler();
+            }
 
             // Actualizar el escalador del giroscopio con la nueva configuración
             Update_Gyro_Scaler();
+            Reset_Yaw_Tracking();
+            MPU_READ_REQUEST = false;
             Timing_RequestDiagnosticsReset();
         }
     }
@@ -1502,6 +1544,17 @@ static void ManageI2CTransactions(void)
     }
 }
 
+static void Prepare_MPU_BlockingTransaction(void)
+{
+    MPU_READ_REQUEST = false;
+
+    while (i2c_bus_state != I2C_BUS_IDLE)
+    {
+    }
+
+    MPU_READ_REQUEST = false;
+}
+
 uint8_t Read_User_Button(void *context)
 {
     // We ignore context for this simple case, but it's good practice to have it.
@@ -1748,11 +1801,10 @@ void App_Core_Loop(void)
         uint32_t control_start_cycles = Timing_GetCycles();
 
         Do10ms();
+        Update_Navigation_Perception();
 
         if (app_state == APP_STATE_RUNNING && (menu_mode == MENU_MODE_FIND_CELLS || menu_mode == MENU_MODE_GO_TO_B || menu_mode == MENU_MODE_DRIVE_STRAIGHT))
         {
-            Update_Navigation_Perception();
-
             if (pending_initial_cell_seed && robot_state == STATE_NAVIGATING)
             {
                 Commit_Maze_State(0, true, true);
@@ -1971,8 +2023,7 @@ static void Manage_Turn(void)
     // --- Lógica del PID de velocidad angular ---
 
     // 3. Obtener la velocidad angular actual del giroscopio.
-    int16_t gz;
-    MPU6050_GetCalibratedData(&hmpu, NULL, NULL, NULL, NULL, NULL, &gz);
+    int16_t gz = sensor_snapshot.gz;
 
     // Convertir el valor raw del giroscopio (gz) a grados por segundo (dps).
     int16_t angular_velocity_dps = GyroRaw_To_Dps(gz);
@@ -2116,26 +2167,19 @@ static void Reset_Maze_State(void)
 
 static void Handle_Navigating(void)
 {
-    static uint8_t tape_debounce_counter = 0;
-    adc_rear_floor = (uint16_t)Get_Filtered_ADC_Value(SENSOR_FLOOR_REAR_CH);
+    adc_rear_floor = sensor_snapshot.adc_filtered[SENSOR_FLOOR_REAR_CH];
+    bool current_rear_tape = ((sensor_snapshot.detection_flags & SENSOR_DET_FLOOR_REAR) != 0U);
 
-    if (adc_rear_floor < tape_detection_threshold_adc) // ¿Vemos negro?
+    if (current_rear_tape && !was_rear_tape_detected)
     {
-        if (!was_rear_tape_detected) // Si aún no hemos confirmado y "consumido" esta línea
-        {
-            tape_debounce_counter++;
-            if (tape_debounce_counter >= wall_fade_ticks) 
-            {
-                rear_tape_detected = true;     // Disparamos la bandera (Avanza la celda)
-                was_rear_tape_detected = true; // Bloqueamos para no volver a disparar en la misma cinta
-            }
-        }
+        rear_tape_detected = true;
+        was_rear_tape_detected = true;
     }
-    else // Vemos blanco (piso normal)
+    else if (!current_rear_tape)
     {
-        tape_debounce_counter = 0;      // Reseteamos el contador de ruido
-        was_rear_tape_detected = false; // "Armamos" el gatillo para la próxima cinta
+        was_rear_tape_detected = false;
     }
+
     uint16_t front_avg_mm = (uint16_t)((dist_front_left_mm + dist_front_right_mm) / 2);
 
     if (front_avg_mm < wall_threshold_mm_braking_start)
@@ -2150,32 +2194,26 @@ static void Handle_Navigating(void)
 
     if (!left_diagonal_wall_detected || !right_diagonal_wall_detected)
     {
-        wall_fade_counter++;
-        if (wall_fade_counter >= wall_fade_ticks)
+        if (!left_diagonal_wall_detected && !right_diagonal_wall_detected)
         {
-            if (!left_diagonal_wall_detected && !right_diagonal_wall_detected)
-            {
-                wall_fade_counter = 0;
-                wall_diagonal_faded = NO_WALL_FADED;
-                Set_Robot_State(STATE_STRAIGHT_DRIVE_DESIDING);
-                PID_Reset(&centering_pid);
-                PID_Set_Setpoint(&centering_pid, FIXED_TO_INT(current_yaw_fixed));
-                return;
-            }
-            else if (!left_diagonal_wall_detected)
-            {
-                wall_diagonal_faded = LEFT_WALL_FADED;
-            }
-            else
-            {
-                wall_diagonal_faded = RIGHT_WALL_FADED;
-            }
+            wall_diagonal_faded = NO_WALL_FADED;
+            Set_Robot_State(STATE_STRAIGHT_DRIVE_DESIDING);
+            PID_Reset(&centering_pid);
+            PID_Set_Setpoint(&centering_pid, FIXED_TO_INT(current_yaw_fixed));
+            return;
+        }
+        else if (!left_diagonal_wall_detected)
+        {
+            wall_diagonal_faded = LEFT_WALL_FADED;
+        }
+        else
+        {
+            wall_diagonal_faded = RIGHT_WALL_FADED;
         }
     }
     else
     {
-        wall_fade_counter = 0;   // Resetear contador si hay paredes detectadas
-        wall_diagonal_faded = 0; // Resetear estado de pared desvanecida
+        wall_diagonal_faded = NO_WALL_FADED;
     }
 
     if (rear_tape_detected)
@@ -2188,7 +2226,6 @@ static void Handle_Navigating(void)
         {
             rear_tape_detected = false;
             wall_diagonal_faded = NO_WALL_FADED;
-            wall_fade_counter = 0;
             Handle_Deciding();
             return;
         }
@@ -2203,8 +2240,7 @@ static void Handle_Navigating(void)
     // (Lógica de kick-start)
     if (kick_start_active)
     {
-        int16_t ax;
-        MPU6050_GetCalibratedData(&hmpu, &ax, NULL, NULL, NULL, NULL, NULL);
+        int16_t ax = sensor_snapshot.ax;
         if (abs(ax) > accel_motion_threshold)
             motion_confirm_counter++;
         else
@@ -2280,8 +2316,8 @@ static void Handle_Straight_Drive(bool have_to_decide)
     }
     else
     {
-        adc_rear_floor = (uint16_t)Get_Filtered_ADC_Value(SENSOR_FLOOR_REAR_CH);
-        bool current_rear_tape = (adc_rear_floor < tape_detection_threshold_adc);
+        adc_rear_floor = sensor_snapshot.adc_filtered[SENSOR_FLOOR_REAR_CH];
+        bool current_rear_tape = ((sensor_snapshot.detection_flags & SENSOR_DET_FLOOR_REAR) != 0U);
         if (current_rear_tape && !was_rear_tape_detected)
         {
             rear_tape_detected = true;
@@ -2401,13 +2437,12 @@ static void Handle_Deciding(void)
 static void Handle_Braking(void)
 {
     // 1. Leer y convertir sensores frontales a mm
-    uint16_t dist_front_avg_mm = ((uint16_t)ADC_To_Distance_mm((uint16_t)Get_Filtered_ADC_Value(SENSOR_FRONT_LEFT_CH)) +
-                                  (uint16_t)ADC_To_Distance_mm((uint16_t)Get_Filtered_ADC_Value(SENSOR_FRONT_RIGHT_CH))) /
-                                 2;
+    uint16_t dist_front_avg_mm = (uint16_t)((sensor_snapshot.dist_front_left_mm +
+                                             sensor_snapshot.dist_front_right_mm) /
+                                            2U);
 
     // 2. Comprobar si el frenado ha terminado
-    int16_t ax;
-    MPU6050_GetCalibratedData(&hmpu, &ax, NULL, NULL, NULL, NULL, NULL);
+    int16_t ax = sensor_snapshot.ax;
 
     // La condición de parada usa el error absoluto en mm y la aceleración
     if (abs(dist_front_avg_mm - wall_braking_target_mm) < braking_dead_zone && abs(ax) < braking_accel_stop_threshold)
@@ -2571,6 +2606,51 @@ static int32_t ADC_To_Distance_mm(uint16_t adc_value)
     return (int32_t)App_Sensors_ConvertAdcToDistanceMm(adc_value);
 }
 
+static bool Detect_Low_With_Hysteresis(uint16_t value, uint16_t threshold, uint16_t hysteresis, bool was_detected)
+{
+    uint32_t release_threshold = (uint32_t)threshold + (uint32_t)hysteresis;
+
+    if (was_detected)
+    {
+        return ((uint32_t)value < release_threshold);
+    }
+
+    return (value < threshold);
+}
+
+static bool Detect_Front_Wall_With_Hysteresis(uint16_t left_value, uint16_t right_value, uint16_t threshold, uint16_t hysteresis, bool was_detected)
+{
+    uint32_t release_threshold = (uint32_t)threshold + (uint32_t)hysteresis;
+
+    if (was_detected)
+    {
+        return (((uint32_t)left_value < release_threshold) && ((uint32_t)right_value < release_threshold));
+    }
+
+    return ((left_value < threshold) && (right_value < threshold));
+}
+
+static void Sync_Legacy_Perception_From_Snapshot(void)
+{
+    uint8_t flags = sensor_snapshot.detection_flags;
+
+    dist_diagonal_left_mm = sensor_snapshot.dist_diagonal_left_mm;
+    dist_diagonal_right_mm = sensor_snapshot.dist_diagonal_right_mm;
+    dist_front_left_mm = sensor_snapshot.dist_front_left_mm;
+    dist_front_right_mm = sensor_snapshot.dist_front_right_mm;
+    dist_left_lat_mm = sensor_snapshot.dist_left_lat_mm;
+    dist_right_lat_mm = sensor_snapshot.dist_right_lat_mm;
+    adc_front_floor = sensor_snapshot.adc_filtered[SENSOR_FLOOR_FRONT_CH];
+    adc_rear_floor = sensor_snapshot.adc_filtered[SENSOR_FLOOR_REAR_CH];
+
+    front_wall_detected = ((flags & SENSOR_DET_WALL_FRONT) != 0U);
+    left_wall_detected = ((flags & SENSOR_DET_WALL_LEFT) != 0U);
+    right_wall_detected = ((flags & SENSOR_DET_WALL_RIGHT) != 0U);
+    left_diagonal_wall_detected = ((flags & SENSOR_DET_WALL_DIAG_LEFT) != 0U);
+    right_diagonal_wall_detected = ((flags & SENSOR_DET_WALL_DIAG_RIGHT) != 0U);
+    front_tape_detected = ((flags & SENSOR_DET_FLOOR_FRONT) != 0U);
+}
+
 /**
  * @brief Maneja el estado de giro suave en intersecciones.
  *
@@ -2580,8 +2660,8 @@ static void Handle_Smooth_Turn(void)
     bool wall_detected = false;
     int16_t base_right = 0, base_left = 0;
 
-    adc_rear_floor = (uint16_t)Get_Filtered_ADC_Value(SENSOR_FLOOR_REAR_CH);
-    bool current_rear_tape = (adc_rear_floor < tape_detection_threshold_adc);
+    adc_rear_floor = sensor_snapshot.adc_filtered[SENSOR_FLOOR_REAR_CH];
+    bool current_rear_tape = ((sensor_snapshot.detection_flags & SENSOR_DET_FLOOR_REAR) != 0U);
 
     // Si vemos blanco, el robot ha salido completamente de cualquier cinta previa
     if (!current_rear_tape) 
@@ -2642,8 +2722,7 @@ static void Handle_Smooth_Turn(void)
         return;
     }
 
-    int16_t gz;
-    MPU6050_GetCalibratedData(&hmpu, NULL, NULL, NULL, NULL, NULL, &gz);
+    int16_t gz = sensor_snapshot.gz;
 
     int16_t angular_velocity_dps = GyroRaw_To_Dps(gz);
 
@@ -2658,19 +2737,83 @@ static void Handle_Smooth_Turn(void)
 
 static void Update_Navigation_Perception(void)
 {
-    dist_diagonal_left_mm = (uint16_t)ADC_To_Distance_mm((uint16_t)Get_Filtered_ADC_Value(SENSOR_DIAGONAL_LEFT_CH));
-    dist_diagonal_right_mm = (uint16_t)ADC_To_Distance_mm((uint16_t)Get_Filtered_ADC_Value(SENSOR_DIAGONAL_RIGHT_CH));
-    dist_front_left_mm = (uint16_t)ADC_To_Distance_mm((uint16_t)Get_Filtered_ADC_Value(SENSOR_FRONT_LEFT_CH));
-    dist_front_right_mm = (uint16_t)ADC_To_Distance_mm((uint16_t)Get_Filtered_ADC_Value(SENSOR_FRONT_RIGHT_CH));
-    dist_left_lat_mm = (uint16_t)ADC_To_Distance_mm((uint16_t)Get_Filtered_ADC_Value(SENSOR_LEFT_LAT_CH));
-    dist_right_lat_mm = (uint16_t)ADC_To_Distance_mm((uint16_t)Get_Filtered_ADC_Value(SENSOR_RIGHT_LAT_CH));
+    uint8_t previous_flags = sensor_snapshot.detection_flags;
+    uint8_t new_flags = 0;
 
-    left_diagonal_wall_detected = (dist_diagonal_left_mm < wall_threshold_mm_diagonal);
-    right_diagonal_wall_detected = (dist_diagonal_right_mm < wall_threshold_mm_diagonal);
-    left_wall_detected = (dist_left_lat_mm < wall_threshold_mm_side);
-    right_wall_detected = (dist_right_lat_mm < wall_threshold_mm_side);
-    front_wall_detected = (dist_front_left_mm < wall_threshold_mm_front) &&
-                          (dist_front_right_mm < wall_threshold_mm_front);
+    for (uint8_t ch = 0; ch < ADC_CHANNELS; ch++)
+    {
+        sensor_snapshot.adc_filtered[ch] = (uint16_t)Get_Filtered_ADC_Value(ch);
+    }
+
+    sensor_snapshot.dist_diagonal_left_mm = (uint16_t)ADC_To_Distance_mm(sensor_snapshot.adc_filtered[SENSOR_DIAGONAL_LEFT_CH]);
+    sensor_snapshot.dist_diagonal_right_mm = (uint16_t)ADC_To_Distance_mm(sensor_snapshot.adc_filtered[SENSOR_DIAGONAL_RIGHT_CH]);
+    sensor_snapshot.dist_front_left_mm = (uint16_t)ADC_To_Distance_mm(sensor_snapshot.adc_filtered[SENSOR_FRONT_LEFT_CH]);
+    sensor_snapshot.dist_front_right_mm = (uint16_t)ADC_To_Distance_mm(sensor_snapshot.adc_filtered[SENSOR_FRONT_RIGHT_CH]);
+    sensor_snapshot.dist_left_lat_mm = (uint16_t)ADC_To_Distance_mm(sensor_snapshot.adc_filtered[SENSOR_LEFT_LAT_CH]);
+    sensor_snapshot.dist_right_lat_mm = (uint16_t)ADC_To_Distance_mm(sensor_snapshot.adc_filtered[SENSOR_RIGHT_LAT_CH]);
+
+    MPU6050_GetCalibratedData(&hmpu, &sensor_snapshot.ax, &sensor_snapshot.ay, &sensor_snapshot.az, &sensor_snapshot.gx, &sensor_snapshot.gy, &sensor_snapshot.gz);
+    sensor_snapshot.yaw_fixed = current_yaw_fixed;
+
+    if (Detect_Front_Wall_With_Hysteresis(sensor_snapshot.dist_front_left_mm,
+                                          sensor_snapshot.dist_front_right_mm,
+                                          wall_threshold_mm_front,
+                                          WALL_HYSTERESIS_MM,
+                                          ((previous_flags & SENSOR_DET_WALL_FRONT) != 0U)))
+    {
+        new_flags |= SENSOR_DET_WALL_FRONT;
+    }
+
+    if (Detect_Low_With_Hysteresis(sensor_snapshot.dist_left_lat_mm,
+                                   wall_threshold_mm_side,
+                                   WALL_HYSTERESIS_MM,
+                                   ((previous_flags & SENSOR_DET_WALL_LEFT) != 0U)))
+    {
+        new_flags |= SENSOR_DET_WALL_LEFT;
+    }
+
+    if (Detect_Low_With_Hysteresis(sensor_snapshot.dist_right_lat_mm,
+                                   wall_threshold_mm_side,
+                                   WALL_HYSTERESIS_MM,
+                                   ((previous_flags & SENSOR_DET_WALL_RIGHT) != 0U)))
+    {
+        new_flags |= SENSOR_DET_WALL_RIGHT;
+    }
+
+    if (Detect_Low_With_Hysteresis(sensor_snapshot.dist_diagonal_left_mm,
+                                   wall_threshold_mm_diagonal,
+                                   WALL_HYSTERESIS_MM,
+                                   ((previous_flags & SENSOR_DET_WALL_DIAG_LEFT) != 0U)))
+    {
+        new_flags |= SENSOR_DET_WALL_DIAG_LEFT;
+    }
+
+    if (Detect_Low_With_Hysteresis(sensor_snapshot.dist_diagonal_right_mm,
+                                   wall_threshold_mm_diagonal,
+                                   WALL_HYSTERESIS_MM,
+                                   ((previous_flags & SENSOR_DET_WALL_DIAG_RIGHT) != 0U)))
+    {
+        new_flags |= SENSOR_DET_WALL_DIAG_RIGHT;
+    }
+
+    if (Detect_Low_With_Hysteresis(sensor_snapshot.adc_filtered[SENSOR_FLOOR_FRONT_CH],
+                                   tape_detection_threshold_adc,
+                                   TAPE_HYSTERESIS_ADC,
+                                   ((previous_flags & SENSOR_DET_FLOOR_FRONT) != 0U)))
+    {
+        new_flags |= SENSOR_DET_FLOOR_FRONT;
+    }
+
+    if (Detect_Low_With_Hysteresis(sensor_snapshot.adc_filtered[SENSOR_FLOOR_REAR_CH],
+                                   tape_detection_threshold_adc,
+                                   TAPE_HYSTERESIS_ADC,
+                                   ((previous_flags & SENSOR_DET_FLOOR_REAR) != 0U)))
+    {
+        new_flags |= SENSOR_DET_FLOOR_REAR;
+    }
+
+    sensor_snapshot.detection_flags = new_flags;
+    Sync_Legacy_Perception_From_Snapshot();
 }
 
 static void Commit_Maze_State(int8_t heading_update, bool update_cell, bool send_update)
