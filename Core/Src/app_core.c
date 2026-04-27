@@ -91,7 +91,7 @@ typedef enum
 {
     PID_ROLE_CENTERING = 0,
     PID_ROLE_TURN,
-    PID_ROLE_TURN_VELOCITY,
+    PID_ROLE_SMOOTH_TURN,
     PID_ROLE_BRAKING,
     PID_ROLE_COUNT
 } PID_Role_t;
@@ -151,6 +151,15 @@ typedef enum
     MOTION_RESULT_TIMEOUT
 } MotionResult;
 
+typedef enum
+{
+    STRAIGHT_REF_NONE = 0,
+    STRAIGHT_REF_BOTH_WALLS,
+    STRAIGHT_REF_LEFT_WALL,
+    STRAIGHT_REF_RIGHT_WALL,
+    STRAIGHT_REF_YAW
+} StraightReference;
+
 typedef struct
 {
     MotionAction active_action;
@@ -165,7 +174,12 @@ typedef struct
 
     uint8_t line_detector_armed;
     uint8_t waiting_leave_current_line;
+
+    StraightReference straight_ref;
 } MotionContext;
+
+static MotionContext navigation_motion;
+static bool navigation_first_execution = true;
 
 uint16_t right_motor_base_speed = 3575;         // Velocidad base motor derecho
 uint16_t left_motor_base_speed = 4550;          // Velocidad base motor izquierdo
@@ -283,6 +297,17 @@ static void Set_Pid_Gains_From_U16(PID_Role_t role, uint16_t kp_x100, uint16_t k
 static void Write_Pid_Gains_To_Buffer(PID_Role_t role, uint8_t *buffer);
 static int32_t Gain_Hundredths_To_Fixed(uint16_t gain_x100);
 static uint16_t Fixed_To_Gain_Hundredths(int32_t gain_fixed);
+
+// --- FUNCIONES DE REWORK DE NAVEGACIÓN ---
+static void Navigation_DecideMovement(MotionContext *motion);
+static MotionAction Navigation_SelectNextAction(void);
+uint8_t Motion_StartAction(MotionContext *motion, MotionAction action);
+static uint8_t Motion_SetPID(MotionContext *motion, PID_Role_t role, int32_t setpoint);
+static void Motion_ExecuteAction(MotionContext *motion);
+static void Motion_Complete(MotionContext *motion, MotionResult result);
+static bool Motion_DetectedNewCellTape(MotionContext *motion);
+static StraightReference Motion_SelectStraightReference(void);
+static void Motion_ControlStraightAdvance(MotionContext *motion);
 
 //==============================================================================
 // IMPLEMENTACIÓN DE WRAPPERS DE CALLBACKS HAL
@@ -520,7 +545,7 @@ static void Init_Pid_Configs(void)
         .out_min = INT_TO_FIXED(-turn_max_pwm),
         .out_max = INT_TO_FIXED(turn_max_pwm)};
 
-    pid_configs[PID_ROLE_TURN_VELOCITY] = (PID_Config_t){
+    pid_configs[PID_ROLE_SMOOTH_TURN] = (PID_Config_t){
         .kp = Gain_Hundredths_To_Fixed(TURN_VELOCITY_PID_KP_DEFAULT_X100),
         .ki = Gain_Hundredths_To_Fixed(TURN_VELOCITY_PID_KI_DEFAULT_X100),
         .kd = Gain_Hundredths_To_Fixed(TURN_VELOCITY_PID_KD_DEFAULT_X100),
@@ -857,9 +882,9 @@ void DecodeCMD(struct UNERBUSHandle *aBus, uint8_t iStartData)
         pid_configs[PID_ROLE_TURN].out_max = INT_TO_FIXED(turn_max_pwm);
         Apply_Pid_Config(PID_ROLE_TURN, false);
 
-        pid_configs[PID_ROLE_TURN_VELOCITY].out_min = INT_TO_FIXED(-turn_max_pwm);
-        pid_configs[PID_ROLE_TURN_VELOCITY].out_max = INT_TO_FIXED(turn_max_pwm);
-        Apply_Pid_Config(PID_ROLE_TURN_VELOCITY, false);
+        pid_configs[PID_ROLE_SMOOTH_TURN].out_min = INT_TO_FIXED(-turn_max_pwm);
+        pid_configs[PID_ROLE_SMOOTH_TURN].out_max = INT_TO_FIXED(turn_max_pwm);
+        Apply_Pid_Config(PID_ROLE_SMOOTH_TURN, false);
         break;
     case CMD_GET_TURN_MAX_SPEED:
         uint8_t speed_buffer[UNERBUS_TURN_MAX_SPEED_SIZE];
@@ -1086,11 +1111,11 @@ void DecodeCMD(struct UNERBUSHandle *aBus, uint8_t iStartData)
         vel_kp_int = UNERBUS_GetUInt16(aBus);
         vel_ki_int = UNERBUS_GetUInt16(aBus);
         vel_kd_int = UNERBUS_GetUInt16(aBus);
-        Set_Pid_Gains_From_U16(PID_ROLE_TURN_VELOCITY, vel_kp_int, vel_ki_int, vel_kd_int, false);
+        Set_Pid_Gains_From_U16(PID_ROLE_SMOOTH_TURN, vel_kp_int, vel_ki_int, vel_kd_int, false);
         break;
     case CMD_GET_TURN_VELOCITY_PID_GAINS:
         uint8_t vel_pid_buffer[UNERBUS_TURN_VELOCITY_PID_GAINS_SIZE];
-        Write_Pid_Gains_To_Buffer(PID_ROLE_TURN_VELOCITY, vel_pid_buffer);
+        Write_Pid_Gains_To_Buffer(PID_ROLE_SMOOTH_TURN, vel_pid_buffer);
         UNERBUS_Write(aBus, vel_pid_buffer, UNERBUS_TURN_VELOCITY_PID_GAINS_SIZE);
         length = UNERBUS_CMD_ID_SIZE + UNERBUS_TURN_VELOCITY_PID_GAINS_SIZE;
         break;
@@ -1611,7 +1636,7 @@ void App_Core_Init(void)
     Apply_Pid_Config(PID_ROLE_TURN, true);
 
     /* --- NUEVO: INICIALIZACIÓN DEL PID DE VELOCIDAD DE GIRO --- */
-    Apply_Pid_Config(PID_ROLE_TURN_VELOCITY, true);
+    Apply_Pid_Config(PID_ROLE_SMOOTH_TURN, true);
     // La salida de este PID ES la potencia del motor, así que sus límites son los límites de PWM.
     PID_Set_Setpoint(&turn_velocity_pid, turn_target_dps);
 
@@ -1649,15 +1674,6 @@ static void Run_Control_Step(uint32_t dt_ms)
     control_step_dt_ms = dt_ms;
     ADC_Filter_Task();
     Update_Navigation_Perception();
-
-    if (app_state == APP_STATE_RUNNING && (menu_mode == MENU_MODE_FIND_CELLS || menu_mode == MENU_MODE_GO_TO_B || menu_mode == MENU_MODE_DRIVE_STRAIGHT))
-    {
-        if (pending_initial_cell_seed && robot_state == STATE_NAVIGATING)
-        {
-            Commit_Maze_State(0, true, true);
-            pending_initial_cell_seed = false;
-        }
-    }
 
     Modes_State_Machine();
 }
@@ -2156,7 +2172,7 @@ static void Handle_Straight_Drive(bool have_to_decide)
 
 static void Handle_Deciding(void)
 {
-    uint8_t posibleOptions = 0;
+    uint8_t available_Options = 0;
     uint8_t validOptions[4] = {0, 0, 0, 0};
     uint8_t validOptionsCounter = 0;
     enum Direcciones
@@ -2175,13 +2191,13 @@ static void Handle_Deciding(void)
     // Bit 1: Adelante
     // Bit 2: Derecha
     // Bit 3: Izquierda
-    posibleOptions = ((!left_wall_detected) << 3) |
+    available_Options = ((!left_wall_detected) << 3) |
                      ((!right_wall_detected) << 2) |
                      ((!front_wall_detected) << 1) |
                      (1 << 0); // El camino de atrás siempre suele estar libre
 
     // Si solo está disponible el camino hacia atrás
-    if (posibleOptions == 1)
+    if (available_Options == 1)
     {
         Turn_Start(180); // Callejón sin salida
         return;
@@ -2190,7 +2206,7 @@ static void Handle_Deciding(void)
     for (uint8_t i = 1; i < 4; i++)
     {
         // Verificamos si el bit 'i' está encendido
-        if (posibleOptions & (1 << i))
+        if (available_Options & (1 << i))
         {
             validOptions[validOptionsCounter] = i;
             validOptionsCounter++;
@@ -2572,41 +2588,43 @@ static void Modes_State_Machine(void)
         switch (menu_mode)
         {
         case MENU_MODE_FIND_CELLS:
-            // Ejecutar la lógica de resolución de laberintos
-            switch (robot_state)
-            {
-            case STATE_NAVIGATING:
-                Handle_Navigating();
-                break;
-            case STATE_BRAKING:
-                Handle_Braking();
-                break;
-            case STATE_DECIDING:
-                Handle_Deciding();
-                break;
-            case STATE_LEFT_WALL_FADE:
-            case STATE_RIGHT_WALL_FADE:
-            case STATE_STRAIGHT_DRIVE:
-                Handle_Straight_Drive(false);
-                break;
-            case STATE_STRAIGHT_DRIVE_DESIDING:
-                Handle_Straight_Drive(true);
-                break;
-            case STATE_TURNING_LEFT:
-            case STATE_TURNING_RIGHT:
-            case STATE_TURN_AROUND_LEFT:
-            case STATE_TURN_AROUND_RIGHT:
-                Manage_Turn();
-                break;
-            case STATE_SMOOTH_TURN_LEFT:
-            case STATE_SMOOTH_TURN_RIGHT:
-                Handle_Smooth_Turn();
-                break;
-            default:
-                Handle_Idle();
-                break;
-            }
-            break;
+        	Motion_ExecuteAction(&navigation_motion);
+        	Navigation_DecideMovement(&navigation_motion);
+//            // Ejecutar la lógica de resolución de laberintos
+//            switch (robot_state)
+//            {
+//            case STATE_NAVIGATING:
+//                Handle_Navigating();
+//                break;
+//            case STATE_BRAKING:
+//                Handle_Braking();
+//                break;
+//            case STATE_DECIDING:
+//                Handle_Deciding();
+//                break;
+//            case STATE_LEFT_WALL_FADE:
+//            case STATE_RIGHT_WALL_FADE:
+//            case STATE_STRAIGHT_DRIVE:
+//                Handle_Straight_Drive(false);
+//                break;
+//            case STATE_STRAIGHT_DRIVE_DESIDING:
+//                Handle_Straight_Drive(true);
+//                break;
+//            case STATE_TURNING_LEFT:
+//            case STATE_TURNING_RIGHT:
+//            case STATE_TURN_AROUND_LEFT:
+//            case STATE_TURN_AROUND_RIGHT:
+//                Manage_Turn();
+//                break;
+//            case STATE_SMOOTH_TURN_LEFT:
+//            case STATE_SMOOTH_TURN_RIGHT:
+//                Handle_Smooth_Turn();
+//                break;
+//            default:
+//                Handle_Idle();
+//                break;
+//            }
+        	break;
         case MENU_MODE_MANUAL_CONTROL:
             // En modo manual, solo gestionamos los giros.
             // El control de motores se hace directamente por comandos.
@@ -2655,21 +2673,103 @@ static void Modes_State_Machine(void)
     }
 }
 
-static uint8_t Motion_SetPID(MotionContext *motion, PID_Role_t role, int32_t setpoint)
+static void Navigation_DecideMovement(MotionContext *motion)
 {
-    if (motion == NULL || role >= PID_ROLE_COUNT)
+    if (motion->action_active)
     {
-        return 0;
+        return;
     }
 
-    PID_Controller_t *pid = pid_instances[role];
+    if (!navigation_first_execution)
+    {
+        if (!motion->result_pending)
+        {
+            return;
+        }
 
-    PID_Reset(pid);
-    PID_Set_Setpoint(pid, setpoint);
+        if (motion->result != MOTION_RESULT_NEW_CELL_REACHED)
+        {
+            Set_Motor_Speeds(0, 0);
+            Set_Robot_State(STATE_IDLE);
+            return;
+        }
 
-    motion->active_pid = pid;
+        motion->result_pending = false;
+        motion->result = MOTION_RESULT_NONE;
 
-    return 1;
+        Update_Robot_Position();
+        Commit_Maze_State(false, true, true);
+    }
+    else
+    {
+        navigation_first_execution = false;
+        Commit_Maze_State(false, true, true);
+    }
+
+    MotionAction next_action = Navigation_SelectNextAction();
+    Motion_StartAction(motion, next_action);
+}
+
+static MotionAction Navigation_SelectNextAction(void)
+{
+    uint8_t available_Options = 0;
+	uint8_t validOptions[4] = {0, 0, 0, 0};
+	uint8_t validOptionsCounter = 0;
+	enum Direcciones
+	{
+		ATRAS,
+		ADELANTE,
+		DERECHA,
+		IZQUIERDA
+	};
+
+	// Las distancias y las banderas de pared ya vienen actualizadas por
+	// Update_Navigation_Perception() antes de entrar en la máquina de estados.
+
+	// Analizar las opciones (asumiendo que 1 siempre es "atrás" y está libre)
+	// Bit 0: Atrás (Siempre 1)
+	// Bit 1: Adelante
+	// Bit 2: Derecha
+	// Bit 3: Izquierda
+	available_Options = ((!left_wall_detected) << 3) |
+					 ((!right_wall_detected) << 2) |
+					 ((!front_wall_detected) << 1) |
+					 (1 << 0); // El camino de atrás siempre suele estar libre
+
+	// Si solo está disponible el camino hacia atrás
+	if (available_Options == 1)
+	{
+		// Callejón sin salida, desarrollar que hacer
+		return ACTION_GO_BACK;
+	}
+
+	for (uint8_t i = 1; i < 4; i++)
+	{
+		// Verificamos si el bit 'i' está encendido
+		if (available_Options & (1 << i))
+		{
+			validOptions[validOptionsCounter] = i;
+			validOptionsCounter++;
+		}
+	}
+
+	// Elegimos una opción al azar:
+	uint8_t choice = validOptions[rand() % validOptionsCounter];
+
+	if (choice == IZQUIERDA)
+	{
+		return ACTION_GO_LEFT_SMOOTH;
+	}
+	else if (choice == DERECHA)
+	{
+		return ACTION_GO_RIGHT_SMOOTH;
+	}
+	else if (choice == ADELANTE)
+	{
+		return ACTION_GO_FRONT;
+	}
+
+	return ACTION_NONE;
 }
 
 uint8_t Motion_StartAction(MotionContext *motion, MotionAction action)
@@ -2697,42 +2797,200 @@ uint8_t Motion_StartAction(MotionContext *motion, MotionAction action)
 
     switch (action)
     {
-    case ACTION_GO_FRONT:
-        motion->phase = MOTION_STRAIGHT_ADVANCE;
+		case ACTION_GO_FRONT:
+			motion->phase = MOTION_STRAIGHT_ADVANCE;
+			motion->straight_ref = STRAIGHT_REF_NONE;
+			Reset_Yaw_Tracking(); // Por las dudas
 
-        // Si el PID corrige diferencia lateral, el setpoint es 0.
-        return Motion_SetPID(motion, PID_ROLE_CENTERING, 0);
+			// Si el PID corrige diferencia lateral, el setpoint es 0.
+			return Motion_SetPID(motion, PID_ROLE_CENTERING, 0);
 
-    case ACTION_GO_LEFT_SMOOTH:
-        motion->phase = MOTION_SMOOTH_TURN;
-        Reset_Yaw_Tracking();
+		case ACTION_GO_LEFT_SMOOTH:
+			motion->phase = MOTION_SMOOTH_TURN;
+			Reset_Yaw_Tracking();
 
-        return Motion_SetPID(motion,
-                             PID_ROLE_TURN_VELOCITY,
-                             turn_target_dps);
+			return Motion_SetPID(motion, PID_ROLE_SMOOTH_TURN, turn_target_dps);
 
-    case ACTION_GO_RIGHT_SMOOTH:
-        motion->phase = MOTION_SMOOTH_TURN;
-        Reset_Yaw_Tracking();
+		case ACTION_GO_RIGHT_SMOOTH:
+			motion->phase = MOTION_SMOOTH_TURN;
+			Reset_Yaw_Tracking();
 
-        return Motion_SetPID(motion,
-                             PID_ROLE_TURN_VELOCITY,
-                             -((int32_t)turn_target_dps));
+			return Motion_SetPID(motion, PID_ROLE_SMOOTH_TURN, -((int32_t)turn_target_dps));
 
-    case ACTION_GO_BACK:
-        motion->phase = MOTION_PIVOT_TURN;
-        Reset_Yaw_Tracking();
+		case ACTION_GO_BACK:
+			motion->phase = MOTION_PIVOT_TURN;
+			Reset_Yaw_Tracking();
 
-        return Motion_SetPID(motion,
-                             PID_ROLE_TURN,
-                             pivot_turn_target_dps);
+			return Motion_SetPID(motion, PID_ROLE_TURN, pivot_turn_target_dps);
 
-    case ACTION_NONE:
-    default:
-        motion->active_action = ACTION_NONE;
-        motion->action_active = false;
-        motion->phase = MOTION_IDLE;
-        motion->active_pid = NULL;
+		case ACTION_NONE:
+		default:
+			motion->active_action = ACTION_NONE;
+			motion->action_active = false;
+			motion->phase = MOTION_IDLE;
+			motion->active_pid = NULL;
+			return 0;
+    }
+}
+
+static uint8_t Motion_SetPID(MotionContext *motion, PID_Role_t role, int32_t setpoint)
+{
+    if (motion == NULL || role >= PID_ROLE_COUNT)
+    {
         return 0;
     }
+
+    PID_Controller_t *pid = pid_instances[role];
+
+    PID_Reset(pid);
+    PID_Set_Setpoint(pid, setpoint);
+
+    motion->active_pid = pid;
+
+    return 1;
+}
+
+static void Motion_ExecuteAction(MotionContext *motion)
+{
+    if (!motion->action_active)
+    {
+        Set_Motor_Speeds(0, 0);
+        return;
+    }
+
+    switch (motion->phase)
+    {
+    case MOTION_SMOOTH_TURN:
+        // Controlar giro suave con gyro/sensores.
+        // Si termina:
+        //   Update_Robot_Heading(TURN_LEFT o TURN_RIGHT);
+        //   motion->phase = MOTION_STRAIGHT_ADVANCE;
+        break;
+
+    case MOTION_PIVOT_TURN:
+        // Controlar giro 180 con gyro.
+        // Si termina:
+        //   Update_Robot_Heading(TURN_AROUND);
+        //   motion->phase = MOTION_STRAIGHT_ADVANCE;
+        break;
+
+    case MOTION_STRAIGHT_ADVANCE:
+        // Controlar avance segun paredes/gyro.
+    	Motion_ControlStraightAdvance(motion);
+        break;
+
+    case MOTION_BRAKING:
+        // Reusar la logica de Handle_Braking().
+        // Si el robot esta detenido:
+        Motion_Complete(motion, MOTION_RESULT_NEW_CELL_REACHED);
+        break;
+
+    case MOTION_ERROR:
+        Motion_Complete(motion, MOTION_RESULT_ERROR);
+        break;
+
+    default:
+        Motion_Complete(motion, MOTION_RESULT_ERROR);
+        break;
+    }
+}
+
+static void Motion_Complete(MotionContext *motion, MotionResult result)
+{
+    Set_Motor_Speeds(0, 0);
+
+    motion->result = result;
+    motion->result_pending = true;
+    motion->action_active = false;
+    motion->phase = MOTION_DONE;
+}
+
+static bool Motion_DetectedNewCellTape(MotionContext *motion)
+{
+    bool rear_tape = ((sensor_snapshot.detection_flags & SENSOR_DET_FLOOR_REAR) != 0U);
+
+    if (motion->waiting_leave_current_line)
+    {
+        if (!rear_tape)
+        {
+            motion->waiting_leave_current_line = false;
+            motion->line_detector_armed = true;
+        }
+
+        return false;
+    }
+
+    return motion->line_detector_armed && rear_tape;
+}
+
+static void Motion_ControlStraightAdvance(MotionContext *motion)
+{
+    if (Motion_DetectedNewCellTape(motion))
+    {
+        PID_Reset(&braking_pid);
+        motion->phase = MOTION_BRAKING;
+        return;
+    }
+
+    StraightReference ref = Motion_SelectStraightReference();
+
+    if (motion->straight_ref != ref)
+    {
+        motion->straight_ref = ref;
+        Reset_Yaw_Tracking();
+        PID_Reset(&centering_pid);
+    }
+
+    int32_t measured_error = 0;
+
+    switch (ref)
+    {
+    case STRAIGHT_REF_BOTH_WALLS:
+        measured_error = (int32_t)sensor_snapshot.dist_left_lat_mm -
+                         (int32_t)sensor_snapshot.dist_right_lat_mm;
+        break;
+
+    case STRAIGHT_REF_LEFT_WALL:
+        measured_error = (int32_t)sensor_snapshot.dist_left_lat_mm -
+                         (int32_t)wall_target_mm;
+        break;
+
+    case STRAIGHT_REF_RIGHT_WALL:
+        measured_error = (int32_t)wall_target_mm -
+                         (int32_t)sensor_snapshot.dist_right_lat_mm;
+        break;
+
+    case STRAIGHT_REF_YAW:
+    default:
+        measured_error = FIXED_TO_INT(current_yaw_fixed);
+        break;
+    }
+
+    int32_t pid_output_fixed = PID_Update(&centering_pid,
+                                          measured_error,
+                                          control_step_dt_ms);
+
+    int16_t correction = (int16_t)FIXED_TO_INT(pid_output_fixed);
+
+    Set_Motor_Speeds((int16_t)right_motor_base_speed - correction,
+                     (int16_t)left_motor_base_speed + correction);
+}
+
+static StraightReference Motion_SelectStraightReference(void)
+{
+    uint8_t flags = sensor_snapshot.detection_flags;
+
+    bool left_wall = ((flags & SENSOR_DET_WALL_LEFT) != 0U);
+    bool right_wall = ((flags & SENSOR_DET_WALL_RIGHT) != 0U);
+
+    if (left_wall && right_wall)
+        return STRAIGHT_REF_BOTH_WALLS;
+
+    if (left_wall)
+        return STRAIGHT_REF_LEFT_WALL;
+
+    if (right_wall)
+        return STRAIGHT_REF_RIGHT_WALL;
+
+    return STRAIGHT_REF_YAW;
 }
