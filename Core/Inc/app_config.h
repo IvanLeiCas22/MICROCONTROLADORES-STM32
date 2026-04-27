@@ -192,9 +192,8 @@ typedef enum
 // DEFINICIONES Y MACROS
 //==============================================================================
 
-/* Flags del sistema (definidos en app_core.c) */
+/* Flags del sistema (definidos en modulos de la aplicacion) */
 extern SystemFlagTypeDef flags0;
-extern volatile uint8_t app_10ms_ticks_pending;
 extern volatile bool app_uart_bypass;
 extern volatile bool app_mpu_read_request;
 extern volatile bool app_ssd_update_request;
@@ -237,16 +236,17 @@ extern uint16_t pwm_max_value;
 #define PWM_DATA_BYTES (PWM_CHANNELS * 2)
 
 /* Timers */
-#define TIME_10MS_PERIOD_COUNT 40
-#define TIME_100MS_PEDIOD_COUNT 10
 #define ALIVE_UDP_PERIOD_COUNT 50
-#define MPU_READ_PERIOD_COUNT 12 // 3ms
 #define TIM1_TICK_US 250U
+#define APP_TIMEBASE_1MS_TICKS (1000U / TIM1_TICK_US)
+#define APP_TIMEBASE_10MS_TICKS 40U
+#define APP_TIMEBASE_100MS_TICKS 400U
+#define APP_TIMEBASE_IR_SAMPLE_TICKS 1U
+#define APP_TIMEBASE_MPU_SAMPLE_TICKS 12U
+#define APP_TIMEBASE_CONTROL_TICKS APP_TIMEBASE_10MS_TICKS
+#define APP_TIMEBASE_MAX_PENDING_EVENTS 10U
 #define CONTROL_PERIOD_MS 10U
-#define APP_10MS_TICKS_MAX_PENDING 10U
-#define APP_TIMING_DIAGNOSTICS_ENABLED 1
-#define APP_TIMING_DISPLAY_ENABLED 1
-#define APP_TIMING_DISPLAY_PERIOD_100MS 5U
+#define MPU_SAMPLE_PERIOD_US (APP_TIMEBASE_MPU_SAMPLE_TICKS * TIM1_TICK_US)
 
 /* Communication */
 #define IP_ADDRESS_STRING_LENGTH 16
