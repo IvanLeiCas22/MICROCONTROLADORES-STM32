@@ -2927,7 +2927,13 @@ static void Motion_ControlStraightAdvance(MotionContext *motion)
 {
     if (Motion_DetectedNewCellTape(motion))
     {
-        PID_Reset(&braking_pid);
+    	Motion_Complete(motion, MOTION_RESULT_NEW_CELL_REACHED);
+        return;
+    }
+
+    if ((uint16_t)((sensor_snapshot.dist_front_left_mm + sensor_snapshot.dist_front_right_mm) / 2))
+    {
+        Motion_SetPID(motion, PID_ROLE_BRAKING, wall_braking_target_mm);
         motion->phase = MOTION_BRAKING;
         return;
     }
@@ -2938,7 +2944,7 @@ static void Motion_ControlStraightAdvance(MotionContext *motion)
     {
         motion->straight_ref = ref;
         Reset_Yaw_Tracking();
-        PID_Reset(&centering_pid);
+        PID_Reset(motion->active_pid);
     }
 
     int32_t measured_error = 0;
@@ -2966,22 +2972,19 @@ static void Motion_ControlStraightAdvance(MotionContext *motion)
         break;
     }
 
-    int32_t pid_output_fixed = PID_Update(&centering_pid,
-                                          measured_error,
-                                          control_step_dt_ms);
+    int32_t pid_output_fixed = PID_Update(motion->active_pid, measured_error, control_step_dt_ms);
 
     int16_t correction = (int16_t)FIXED_TO_INT(pid_output_fixed);
 
-    Set_Motor_Speeds((int16_t)right_motor_base_speed - correction,
-                     (int16_t)left_motor_base_speed + correction);
+    Set_Motor_Speeds((int16_t)right_motor_base_speed - correction, (int16_t)left_motor_base_speed + correction);
 }
 
 static StraightReference Motion_SelectStraightReference(void)
 {
     uint8_t flags = sensor_snapshot.detection_flags;
 
-    bool left_wall = ((flags & SENSOR_DET_WALL_LEFT) != 0U);
-    bool right_wall = ((flags & SENSOR_DET_WALL_RIGHT) != 0U);
+    bool left_wall = (flags & SENSOR_DET_WALL_LEFT) && (flags & SENSOR_DET_WALL_DIAG_LEFT);
+    bool right_wall = (flags & SENSOR_DET_WALL_RIGHT) && (flags & SENSOR_DET_WALL_DIAG_RIGHT);
 
     if (left_wall && right_wall)
         return STRAIGHT_REF_BOTH_WALLS;
