@@ -30,8 +30,12 @@ void PID_ApplyConfig(PID_Controller_t *pid, const PID_Config_t *cfg, bool reset_
 
 void PID_Set_Setpoint(PID_Controller_t *pid, int32_t setpoint)
 {
-    // El setpoint se almacena en punto fijo para compararlo directamente con el error.
-    pid->setpoint = INT_TO_FIXED(setpoint);
+    PID_Set_Setpoint_Fixed(pid, INT_TO_FIXED(setpoint));
+}
+
+void PID_Set_Setpoint_Fixed(PID_Controller_t *pid, int32_t setpoint_q16)
+{
+    pid->setpoint = setpoint_q16;
 }
 
 void PID_Set_Output_Limits(PID_Controller_t *pid, int32_t min, int32_t max)
@@ -48,11 +52,13 @@ void PID_Reset(PID_Controller_t *pid)
 
 int32_t PID_Update(PID_Controller_t *pid, int32_t current_value, uint32_t dt_ms)
 {
-    // Convertir el valor actual a punto fijo para los calculos.
-    int32_t current_fixed = INT_TO_FIXED(current_value);
+    return PID_Update_Fixed(pid, INT_TO_FIXED(current_value), dt_ms);
+}
 
+int32_t PID_Update_Fixed(PID_Controller_t *pid, int32_t current_value_q16, uint32_t dt_ms)
+{
     // 1. Calcular el error.
-    int32_t error = pid->setpoint - current_fixed;
+    int32_t error = pid->setpoint - current_value_q16;
 
     // 2. Calcular el termino proporcional.
     int32_t p_term = FIXED_MUL(pid->kp, error);

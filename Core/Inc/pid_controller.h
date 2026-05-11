@@ -79,6 +79,13 @@ void PID_ApplyConfig(PID_Controller_t *pid, const PID_Config_t *cfg, bool reset_
 void PID_Set_Setpoint(PID_Controller_t *pid, int32_t setpoint);
 
 /**
+ * @brief Establece el setpoint usando un valor Q16.16 directo.
+ * @param pid Puntero a la estructura del controlador.
+ * @param setpoint_q16 Valor deseado ya expresado en Q16.16.
+ */
+void PID_Set_Setpoint_Fixed(PID_Controller_t *pid, int32_t setpoint_q16);
+
+/**
  * @brief Calcula la salida del controlador PID basándose en la medición actual.
  * @param pid Puntero a la estructura del controlador.
  * @param current_value El valor actual medido por el sensor.
@@ -86,6 +93,15 @@ void PID_Set_Setpoint(PID_Controller_t *pid, int32_t setpoint);
  * @return La salida del controlador (corrección) en formato de punto fijo.
  */
 int32_t PID_Update(PID_Controller_t *pid, int32_t current_value, uint32_t dt_ms);
+
+/**
+ * @brief Calcula la salida usando una medicion Q16.16 directa.
+ * @param pid Puntero a la estructura del controlador.
+ * @param current_value_q16 Valor actual ya expresado en Q16.16.
+ * @param dt_ms El intervalo de tiempo en milisegundos desde la ultima llamada.
+ * @return La salida del controlador en formato Q16.16.
+ */
+int32_t PID_Update_Fixed(PID_Controller_t *pid, int32_t current_value_q16, uint32_t dt_ms);
 
 /**
  * @brief Establece los límites mínimo y máximo de la salida del PID.
